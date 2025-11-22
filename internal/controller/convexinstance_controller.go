@@ -50,6 +50,8 @@ const (
 	instanceSecretKey      = "instanceSecret"
 	defaultBackendPortName = "http"
 	defaultBackendPort     = 3210
+	actionPortName         = "http-action"
+	actionPort             = 3211
 	configMapKey           = "convex.conf"
 	conditionReady         = "Ready"
 	conditionConfigMap     = "ConfigMapReady"
@@ -441,12 +443,20 @@ func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instanc
 	svc := &corev1.Service{}
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
 	err := r.Get(ctx, key, svc)
-	ports := []corev1.ServicePort{{
-		Name:       defaultBackendPortName,
-		Port:       defaultBackendPort,
-		Protocol:   corev1.ProtocolTCP,
-		TargetPort: intstr.FromInt(defaultBackendPort),
-	}}
+	ports := []corev1.ServicePort{
+		{
+			Name:       defaultBackendPortName,
+			Port:       defaultBackendPort,
+			Protocol:   corev1.ProtocolTCP,
+			TargetPort: intstr.FromInt(defaultBackendPort),
+		},
+		{
+			Name:       actionPortName,
+			Port:       actionPort,
+			Protocol:   corev1.ProtocolTCP,
+			TargetPort: intstr.FromInt(actionPort),
+		},
+	}
 	selector := map[string]string{
 		"app.kubernetes.io/name":      "convex-backend",
 		"app.kubernetes.io/instance":  instance.Name,
@@ -612,6 +622,9 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 					Ports: []corev1.ContainerPort{{
 						Name:          defaultBackendPortName,
 						ContainerPort: defaultBackendPort,
+					}, {
+						Name:          actionPortName,
+						ContainerPort: actionPort,
 					}},
 					Env:       env,
 					Resources: instance.Spec.Backend.Resources,
@@ -671,6 +684,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 	if err != nil {
 		return err
 	}
+	alignStatefulSetDefaults(&sts.Spec, &stsSpec)
 	if ownerChanged || !statefulSetSpecEqual(sts.Spec, stsSpec) {
 		sts.Spec = stsSpec
 		return r.Update(ctx, sts)
@@ -767,6 +781,19 @@ func selectorsEqual(a, b map[string]string) bool {
 
 func statefulSetSpecEqual(a, b appsv1.StatefulSetSpec) bool {
 	return reflect.DeepEqual(a, b)
+}
+
+// alignStatefulSetDefaults copies defaults from the current spec into the desired spec to avoid spurious updates.
+func alignStatefulSetDefaults(current, desired *appsv1.StatefulSetSpec) {
+	if desired.RevisionHistoryLimit == nil && current.RevisionHistoryLimit != nil {
+		desired.RevisionHistoryLimit = ptr.To(*current.RevisionHistoryLimit)
+	}
+	if desired.PodManagementPolicy == "" && current.PodManagementPolicy != "" {
+		desired.PodManagementPolicy = current.PodManagementPolicy
+	}
+	if desired.UpdateStrategy.Type == "" && current.UpdateStrategy.Type != "" {
+		desired.UpdateStrategy = *current.UpdateStrategy.DeepCopy()
+	}
 }
 
 func randomString(length int) (string, error) {

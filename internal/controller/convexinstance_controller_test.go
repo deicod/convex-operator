@@ -128,7 +128,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			service := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, service)).To(Succeed())
-			Expect(service.Spec.Ports).NotTo(BeEmpty())
+			Expect(service.Spec.Ports).To(HaveLen(2))
 
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
