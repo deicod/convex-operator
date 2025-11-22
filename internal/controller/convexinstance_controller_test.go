@@ -224,6 +224,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 					Name:      gatewayv1.ObjectName("test-resource-gateway"),
 					Namespace: ptr.To(gatewayv1.Namespace("default")),
 				},
+				ControllerName: gatewayv1.GatewayController("test.example/controller"),
 				Conditions: []metav1.Condition{{
 					Type:               string(gatewayv1.RouteConditionAccepted),
 					Status:             metav1.ConditionTrue,
