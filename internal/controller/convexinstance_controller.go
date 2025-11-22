@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	convexv1alpha1 "github.com/deicod/convex-operator/api/v1alpha1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 const (
@@ -64,10 +65,14 @@ const (
 	conditionService         = "ServiceReady"
 	conditionStatefulSet     = "StatefulSetReady"
 	conditionDashboard       = "DashboardReady"
+	conditionDashboardSvc    = "DashboardServiceReady"
+	conditionGateway         = "GatewayReady"
+	conditionHTTPRoute       = "HTTPRouteReady"
 	phasePending             = "Pending"
 	phaseReady               = "Ready"
 	phaseError               = "Error"
 	storageModeExternal      = "external"
+	defaultGatewayClassName  = "nginx"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -83,6 +88,8 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;services;persistentvolumeclaims;events,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -154,6 +161,13 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
 
+	dashboardServiceName, dashboardSvcCond, err := r.reconcileDashboardService(ctx, instance)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardServiceError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardServiceError", err, conditionFalse(conditionDashboardSvc, "DashboardServiceError", err.Error()))
+	}
+	conds = append(conds, dashboardSvcCond)
+
 	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, generatedSecretRV)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardError", err.Error())
@@ -166,8 +180,22 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
 	}
 
-	phase, conditionReason, statusMsg, conds, readyEvent := r.calculateReadiness(ctx, instance, dashboardReady, conds, oldPhase)
-	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, conds...); err != nil {
+	gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "GatewayError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "GatewayError", err, conditionFalse(conditionGateway, "GatewayError", err.Error()))
+	}
+	conds = append(conds, gatewayCond)
+
+	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashboardServiceName)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "HTTPRouteError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "HTTPRouteError", err, conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()))
+	}
+	conds = append(conds, routeCond)
+
+	phase, conditionReason, statusMsg, conds, readyEvent := r.calculateReadiness(ctx, instance, dashboardReady, gatewayReady, routeReady, conds, oldPhase)
+	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, gatewayReady && routeReady, conds...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
 			return ctrl.Result{Requeue: true}, nil
@@ -178,7 +206,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
-	if phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) {
+	if phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) || !gatewayReady || !routeReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -195,6 +223,8 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&gatewayv1.Gateway{}).
+		Owns(&gatewayv1.HTTPRoute{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			secret, ok := obj.(*corev1.Secret)
 			if !ok {
@@ -206,7 +236,10 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			var requests []reconcile.Request
 			for _, inst := range instances.Items {
-				if inst.Spec.Backend.DB.SecretRef == secret.Name || inst.Spec.Backend.S3.SecretRef == secret.Name || generatedSecretName(&inst) == secret.Name {
+				if inst.Spec.Backend.DB.SecretRef == secret.Name ||
+					inst.Spec.Backend.S3.SecretRef == secret.Name ||
+					inst.Spec.Networking.TLSSecretRef == secret.Name ||
+					generatedSecretName(&inst) == secret.Name {
 					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
 				}
 			}
@@ -217,8 +250,9 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 type externalSecretVersions struct {
-	dbResourceVersion string
-	s3ResourceVersion string
+	dbResourceVersion  string
+	s3ResourceVersion  string
+	tlsResourceVersion string
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
@@ -278,6 +312,13 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 			}
 			result.s3ResourceVersion = secret.ResourceVersion
 		}
+	}
+	if ref := instance.Spec.Networking.TLSSecretRef; ref != "" {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
+			return result, fmt.Errorf("tls secret %q: %w", ref, err)
+		}
+		result.tlsResourceVersion = secret.ResourceVersion
 	}
 	return result, nil
 }
@@ -548,6 +589,76 @@ func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instanc
 		return name, r.Update(ctx, svc)
 	}
 	return name, nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileDashboardService(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, metav1.Condition, error) {
+	name := dashboardServiceName(instance)
+	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
+
+	if !instance.Spec.Dashboard.Enabled {
+		svc := &corev1.Service{}
+		if err := r.Get(ctx, key, svc); err == nil {
+			if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
+				return "", metav1.Condition{}, err
+			}
+		} else if !errors.IsNotFound(err) {
+			return "", metav1.Condition{}, err
+		}
+		return "", conditionTrue(conditionDashboardSvc, "Disabled", "Dashboard disabled"), nil
+	}
+
+	ports := []corev1.ServicePort{
+		{
+			Name:       defaultDashboardPortName,
+			Port:       defaultDashboardPort,
+			Protocol:   corev1.ProtocolTCP,
+			TargetPort: intstr.FromInt(defaultDashboardPort),
+		},
+	}
+	selector := map[string]string{
+		"app.kubernetes.io/name":      "convex-dashboard",
+		"app.kubernetes.io/instance":  instance.Name,
+		"app.kubernetes.io/component": "dashboard",
+	}
+
+	svc := &corev1.Service{}
+	err := r.Get(ctx, key, svc)
+	if errors.IsNotFound(err) {
+		svc = &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: instance.Namespace,
+			},
+			Spec: corev1.ServiceSpec{
+				Ports:    ports,
+				Selector: selector,
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, svc, r.Scheme); err != nil {
+			return name, metav1.Condition{}, err
+		}
+		if err := r.Create(ctx, svc); err != nil {
+			return name, metav1.Condition{}, err
+		}
+		return name, conditionFalse(conditionDashboardSvc, "Provisioning", "Dashboard service created"), nil
+	}
+	if err != nil {
+		return name, metav1.Condition{}, err
+	}
+
+	ownerChanged, err := ensureOwner(instance, svc, r.Scheme)
+	if err != nil {
+		return name, metav1.Condition{}, err
+	}
+	if ownerChanged || !servicePortsEqual(svc.Spec.Ports, ports) || !selectorsEqual(svc.Spec.Selector, selector) {
+		svc.Spec.Ports = ports
+		svc.Spec.Selector = selector
+		if err := r.Update(ctx, svc); err != nil {
+			return name, metav1.Condition{}, err
+		}
+		return name, conditionFalse(conditionDashboardSvc, "Provisioning", "Dashboard service updated"), nil
+	}
+	return name, conditionTrue(conditionDashboardSvc, "Available", "Dashboard service ready"), nil
 }
 
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, secretName, generatedSecretRV string) (bool, metav1.Condition, error) {
@@ -876,11 +987,240 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 	return nil
 }
 
-func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason, serviceName, message string, conds ...metav1.Condition) error {
+func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
+	gw := &gatewayv1.Gateway{}
+	key := client.ObjectKey{Name: gatewayName(instance), Namespace: instance.Namespace}
+	spec := gatewayv1.GatewaySpec{
+		GatewayClassName: gatewayv1.ObjectName(gatewayClassName(instance)),
+		Listeners:        gatewayListeners(instance),
+	}
+
+	err := r.Get(ctx, key, gw)
+	if errors.IsNotFound(err) {
+		gw = &gatewayv1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      gatewayName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: spec,
+		}
+		if err := controllerutil.SetControllerReference(instance, gw, r.Scheme); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		if err := r.Create(ctx, gw); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionGateway, "Provisioning", "Gateway created"), nil
+	}
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+
+	ownerChanged, err := ensureOwner(instance, gw, r.Scheme)
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+	if ownerChanged || !gatewaySpecEqual(gw.Spec, spec) {
+		gw.Spec = spec
+		if err := r.Update(ctx, gw); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionGateway, "Provisioning", "Gateway updated"), nil
+	}
+
+	if gatewayIsReady(gw) {
+		return true, conditionTrue(conditionGateway, "Ready", "Gateway ready"), nil
+	}
+	return false, conditionFalse(conditionGateway, "Provisioning", "Waiting for Gateway readiness"), nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string) (bool, metav1.Condition, error) {
+	route := &gatewayv1.HTTPRoute{}
+	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
+	spec := gatewayv1.HTTPRouteSpec{
+		CommonRouteSpec: gatewayv1.CommonRouteSpec{
+			ParentRefs: []gatewayv1.ParentReference{{
+				Name:      gatewayv1.ObjectName(gatewayName(instance)),
+				Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+			}},
+		},
+		Hostnames: []gatewayv1.Hostname{gatewayv1.Hostname(instance.Spec.Networking.Host)},
+		Rules:     httpRouteRules(instance, backendServiceName, dashboardServiceName),
+	}
+
+	err := r.Get(ctx, key, route)
+	if errors.IsNotFound(err) {
+		route = &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      httpRouteName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: spec,
+		}
+		if err := controllerutil.SetControllerReference(instance, route, r.Scheme); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		if err := r.Create(ctx, route); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionHTTPRoute, "Provisioning", "HTTPRoute created"), nil
+	}
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+
+	ownerChanged, err := ensureOwner(instance, route, r.Scheme)
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+	if ownerChanged || !httpRouteSpecEqual(route.Spec, spec) {
+		route.Spec = spec
+		if err := r.Update(ctx, route); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionHTTPRoute, "Provisioning", "HTTPRoute updated"), nil
+	}
+
+	readyCond := routeAccepted(route)
+	if readyCond != nil && readyCond.Status == metav1.ConditionTrue {
+		return true, conditionTrue(conditionHTTPRoute, "Ready", readyCond.Message), nil
+	}
+
+	msg := "Waiting for HTTPRoute acceptance"
+	if readyCond != nil && readyCond.Message != "" {
+		msg = readyCond.Message
+	}
+	return false, conditionFalse(conditionHTTPRoute, "Provisioning", msg), nil
+}
+
+func gatewayClassName(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Networking.GatewayClassName != "" {
+		return instance.Spec.Networking.GatewayClassName
+	}
+	return defaultGatewayClassName
+}
+
+func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
+	hostname := gatewayv1.Hostname(instance.Spec.Networking.Host)
+	allowedRoutes := &gatewayv1.AllowedRoutes{
+		Namespaces: &gatewayv1.RouteNamespaces{
+			From: ptr.To(gatewayv1.NamespacesFromSame),
+		},
+	}
+	if instance.Spec.Networking.TLSSecretRef != "" {
+		return []gatewayv1.Listener{{
+			Name:     "https",
+			Protocol: gatewayv1.HTTPSProtocolType,
+			Port:     gatewayv1.PortNumber(443),
+			Hostname: ptr.To(hostname),
+			TLS: &gatewayv1.GatewayTLSConfig{
+				CertificateRefs: []gatewayv1.SecretObjectReference{{
+					Kind:      ptr.To(gatewayv1.Kind("Secret")),
+					Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
+					Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+				}},
+			},
+			AllowedRoutes: allowedRoutes,
+		}}
+	}
+	return []gatewayv1.Listener{{
+		Name:          "http",
+		Protocol:      gatewayv1.HTTPProtocolType,
+		Port:          gatewayv1.PortNumber(80),
+		Hostname:      ptr.To(hostname),
+		AllowedRoutes: allowedRoutes,
+	}}
+}
+
+func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string) []gatewayv1.HTTPRouteRule {
+	var rules []gatewayv1.HTTPRouteRule
+	if instance.Spec.Dashboard.Enabled && dashboardServiceName != "" {
+		rules = append(rules, gatewayv1.HTTPRouteRule{
+			Matches: []gatewayv1.HTTPRouteMatch{
+				{
+					Path: &gatewayv1.HTTPPathMatch{
+						Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+						Value: ptr.To("/dashboard"),
+					},
+				},
+			},
+			BackendRefs: []gatewayv1.HTTPBackendRef{{
+				BackendRef: gatewayv1.BackendRef{
+					BackendObjectReference: gatewayv1.BackendObjectReference{
+						Name: gatewayv1.ObjectName(dashboardServiceName),
+						Port: ptr.To(gatewayv1.PortNumber(defaultDashboardPort)),
+					},
+				},
+			}},
+		})
+	}
+
+	backendMatches := []gatewayv1.HTTPRouteMatch{
+		{
+			Path: &gatewayv1.HTTPPathMatch{
+				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+				Value: ptr.To("/api/"),
+			},
+		},
+		{
+			Path: &gatewayv1.HTTPPathMatch{
+				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+				Value: ptr.To("/sync"),
+			},
+		},
+		{
+			Path: &gatewayv1.HTTPPathMatch{
+				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+				Value: ptr.To("/http_action/"),
+			},
+		},
+		{
+			Path: &gatewayv1.HTTPPathMatch{
+				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+				Value: ptr.To("/"),
+			},
+		},
+	}
+
+	rules = append(rules, gatewayv1.HTTPRouteRule{
+		Matches: backendMatches,
+		BackendRefs: []gatewayv1.HTTPBackendRef{{
+			BackendRef: gatewayv1.BackendRef{
+				BackendObjectReference: gatewayv1.BackendObjectReference{
+					Name: gatewayv1.ObjectName(backendServiceName),
+					Port: ptr.To(gatewayv1.PortNumber(defaultBackendPort)),
+				},
+			},
+		}},
+	})
+	return rules
+}
+
+func gatewayIsReady(gw *gatewayv1.Gateway) bool {
+	readyCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionReady))
+	return readyCond != nil && readyCond.Status == metav1.ConditionTrue
+}
+
+func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
+	for _, parent := range route.Status.Parents {
+		cond := meta.FindStatusCondition(parent.Conditions, string(gatewayv1.RouteConditionAccepted))
+		if cond != nil {
+			return cond
+		}
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason, serviceName, message string, routeReady bool, conds ...metav1.Condition) error {
 	current := instance.DeepCopy()
 	current.Status.ObservedGeneration = instance.GetGeneration()
 	current.Status.Phase = phase
-	current.Status.Endpoints.APIURL = backendServiceURL(instance, serviceName)
+	current.Status.Endpoints.APIURL = apiEndpoint(instance, serviceName, routeReady)
+	if instance.Spec.Dashboard.Enabled {
+		current.Status.Endpoints.DashboardURL = dashboardEndpoint(instance, routeReady)
+	} else {
+		current.Status.Endpoints.DashboardURL = ""
+	}
 	conditionStatus := metav1.ConditionFalse
 	if phase == phaseReady {
 		conditionStatus = metav1.ConditionTrue
@@ -904,7 +1244,7 @@ func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instan
 	if originalErr != nil {
 		msg = originalErr.Error()
 	}
-	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, conds...); err != nil {
+	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, conds...); err != nil {
 		return err
 	}
 	return originalErr
@@ -934,11 +1274,44 @@ func dashboardDeploymentName(instance *convexv1alpha1.ConvexInstance) string {
 	return fmt.Sprintf("%s-dashboard", instance.Name)
 }
 
+func dashboardServiceName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-dashboard", instance.Name)
+}
+
+func gatewayName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-gateway", instance.Name)
+}
+
+func httpRouteName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-route", instance.Name)
+}
+
 func backendServiceURL(instance *convexv1alpha1.ConvexInstance, serviceName string) string {
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, defaultBackendPort)
 }
 
-func (r *ConvexInstanceReconciler) calculateReadiness(ctx context.Context, instance *convexv1alpha1.ConvexInstance, dashboardReady bool, conds []metav1.Condition, oldPhase string) (string, string, string, []metav1.Condition, bool) {
+func apiEndpoint(instance *convexv1alpha1.ConvexInstance, serviceName string, routeReady bool) string {
+	if routeReady && instance.Spec.Networking.Host != "" {
+		return fmt.Sprintf("%s://%s", externalScheme(instance), instance.Spec.Networking.Host)
+	}
+	return backendServiceURL(instance, serviceName)
+}
+
+func dashboardEndpoint(instance *convexv1alpha1.ConvexInstance, routeReady bool) string {
+	if routeReady && instance.Spec.Dashboard.Enabled && instance.Spec.Networking.Host != "" {
+		return fmt.Sprintf("%s://%s/dashboard", externalScheme(instance), instance.Spec.Networking.Host)
+	}
+	return ""
+}
+
+func externalScheme(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Networking.TLSSecretRef != "" {
+		return "https"
+	}
+	return "http"
+}
+
+func (r *ConvexInstanceReconciler) calculateReadiness(ctx context.Context, instance *convexv1alpha1.ConvexInstance, dashboardReady, gatewayReady, routeReady bool, conds []metav1.Condition, oldPhase string) (string, string, string, []metav1.Condition, bool) {
 	phase := phasePending
 	conditionReason := "WaitingForBackend"
 	sts := &appsv1.StatefulSet{}
@@ -965,6 +1338,11 @@ func (r *ConvexInstanceReconciler) calculateReadiness(ctx context.Context, insta
 			conditionReason = "WaitingForDashboard"
 			statusMsg = "Waiting for dashboard readiness"
 		}
+	}
+	if phase == phaseReady && (!gatewayReady || !routeReady) {
+		phase = phasePending
+		conditionReason = "WaitingForGateway"
+		statusMsg = "Waiting for Gateway/HTTPRoute readiness"
 	}
 	readyEvent := phase == phaseReady && oldPhase != phaseReady
 	return phase, conditionReason, statusMsg, conds, readyEvent
@@ -1008,6 +1386,14 @@ func statefulSetSpecEqual(a, b appsv1.StatefulSetSpec) bool {
 }
 
 func deploymentSpecEqual(a, b appsv1.DeploymentSpec) bool {
+	return apiequality.Semantic.DeepEqual(a, b)
+}
+
+func gatewaySpecEqual(a, b gatewayv1.GatewaySpec) bool {
+	return apiequality.Semantic.DeepEqual(a, b)
+}
+
+func httpRouteSpecEqual(a, b gatewayv1.HTTPRouteSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
 }
 

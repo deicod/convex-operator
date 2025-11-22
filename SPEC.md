@@ -180,13 +180,14 @@
   ### M3: Dashboard & Gateway API Integration
 
   - [x] Implement dashboard Deployment reconciliation gated by dashboard.enabled, wiring image, replicas, resources, and env pointing to backend Service URL and admin key usage per Convex dashboard requirements.
-  - [ ] Implement dashboard Service reconciliation for HTTP access, ensuring port alignment with dashboard defaults.
-  - [ ] Create Gateway API integration: reconcile Gateway bound to configurable gatewayClassName (example "nginx") in instance namespace or shared (document choice), referencing TLS Secret provided.
-  - [ ] Create HTTPRoute with host from spec.networking.host, TLS termination, and path rules routing /, /api/*, /sync, /http_action/* to backend Service and /dashboard* to dashboard Service, ensuring backend-
+  - [x] Implement dashboard Service reconciliation for HTTP access, ensuring port alignment with dashboard defaults.
+  - [x] Create Gateway API integration: reconcile Gateway bound to configurable gatewayClassName (example "nginx") in instance namespace or shared (document choice), referencing TLS Secret provided.
+  - [x] Create HTTPRoute with host from spec.networking.host, TLS termination, and path rules routing /, /api/*, /sync, /http_action/* to backend Service and /dashboard* to dashboard Service, ensuring backend-
     only routing when dashboard disabled.
-  - [ ] Update status endpoints.dashboardUrl using host + dashboard path and ensure status conditions reflect route attachment health (e.g., Accepted condition from HTTPRoute if available).
-  - [ ] Add annotations/labels required by NGINX Gateway Fabric (if any) after reviewing its docs; document assumptions for other Gateway classes.
-  - [ ] Extend envtest/integration tests to cover dashboard enabled/disabled and Gateway/HTTPRoute creation with correct backend/dash bindings.
+  - [x] Update status endpoints.dashboardUrl using host + dashboard path and ensure status conditions reflect route attachment health (e.g., Accepted condition from HTTPRoute if available).
+  - [x] Add annotations/labels required by NGINX Gateway Fabric (if any) after reviewing its docs; document assumptions for other Gateway classes.
+  - [x] Extend envtest/integration tests to cover dashboard enabled/disabled flows.
+  - [x] Add envtest/integration tests for Gateway/HTTPRoute creation with correct backend/dashboard bindings.
 
   ### M4: Upgrade Strategies & Maintenance
 

@@ -37,6 +37,7 @@ spec:
     replicas: 2
   networking:
     host: convex.example.com
+    gatewayClassName: nginx
     tlsSecretRef: convex-prod-tls
   scale:
     backend:

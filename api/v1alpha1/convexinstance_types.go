@@ -155,6 +155,11 @@ type NetworkingSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Host string `json:"host"`
 
+	// GatewayClassName selects the GatewayClass for the generated Gateway.
+	// +kubebuilder:default:=nginx
+	// +optional
+	GatewayClassName string `json:"gatewayClassName,omitempty"`
+
 	// TLSSecretRef names the TLS secret used by Gateway/Ingress.
 	// +optional
 	TLSSecretRef string `json:"tlsSecretRef,omitempty"`

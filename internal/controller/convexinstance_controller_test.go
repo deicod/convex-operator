@@ -36,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	convexv1alpha1 "github.com/deicod/convex-operator/api/v1alpha1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 var _ = Describe("ConvexInstance Controller", func() {
@@ -132,6 +133,11 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, service)).To(Succeed())
 			Expect(service.Spec.Ports).To(HaveLen(2))
 
+			dashboardSvc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dashboardSvc)).To(Succeed())
+			Expect(dashboardSvc.Spec.Ports).To(HaveLen(1))
+			Expect(dashboardSvc.Spec.Ports[0].Port).To(Equal(int32(6791)))
+
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers).NotTo(BeEmpty())
@@ -160,6 +166,19 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(svcReady).NotTo(BeNil())
 			Expect(svcReady.Status).To(Equal(metav1.ConditionTrue))
 
+			dashSvcReady := meta.FindStatusCondition(updated.Status.Conditions, "DashboardServiceReady")
+			Expect(dashSvcReady).NotTo(BeNil())
+			Expect(dashSvcReady.Status).To(Equal(metav1.ConditionFalse))
+			Expect(dashSvcReady.Reason).To(Equal("Provisioning"))
+
+			gwReady := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
+			Expect(gwReady).NotTo(BeNil())
+			Expect(gwReady.Status).To(Equal(metav1.ConditionFalse))
+
+			routeReady := meta.FindStatusCondition(updated.Status.Conditions, "HTTPRouteReady")
+			Expect(routeReady).NotTo(BeNil())
+			Expect(routeReady.Status).To(Equal(metav1.ConditionFalse))
+
 			stsReady := meta.FindStatusCondition(updated.Status.Conditions, "StatefulSetReady")
 			Expect(stsReady).NotTo(BeNil())
 			Expect(stsReady.Status).To(Equal(metav1.ConditionFalse))
@@ -187,6 +206,33 @@ var _ = Describe("ConvexInstance Controller", func() {
 			dep.Status.ObservedGeneration = dep.Generation
 			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
 
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
+			gw.Status.Conditions = []metav1.Condition{{
+				Type:               string(gatewayv1.GatewayConditionReady),
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				ObservedGeneration: gw.GetGeneration(),
+			}}
+			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			route.Status.Parents = []gatewayv1.RouteParentStatus{{
+				ParentRef: gatewayv1.ParentReference{
+					Name:      gatewayv1.ObjectName("test-resource-gateway"),
+					Namespace: ptr.To(gatewayv1.Namespace("default")),
+				},
+				Conditions: []metav1.Condition{{
+					Type:               string(gatewayv1.RouteConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					Reason:             "Accepted",
+					Message:            "Attached to listener",
+					ObservedGeneration: route.GetGeneration(),
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
+
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -204,6 +250,17 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(stsCond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(stsCond.Reason).To(Equal("Ready"))
 
+			gwCond := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
+			Expect(gwCond).NotTo(BeNil())
+			Expect(gwCond.Status).To(Equal(metav1.ConditionTrue))
+
+			routeCond := meta.FindStatusCondition(updated.Status.Conditions, "HTTPRouteReady")
+			Expect(routeCond).NotTo(BeNil())
+			Expect(routeCond.Status).To(Equal(metav1.ConditionTrue))
+
+			Expect(updated.Status.Endpoints.APIURL).To(Equal("http://convex-dev.example.com"))
+			Expect(updated.Status.Endpoints.DashboardURL).To(Equal("http://convex-dev.example.com/dashboard"))
+
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Normal Ready Backend is ready")))
 		})
 
@@ -214,6 +271,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			dep := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)).To(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, svc)).To(Succeed())
+			Expect(svc.Spec.Selector["app.kubernetes.io/component"]).To(Equal("dashboard"))
 
 			Expect(dep.Spec.Replicas).NotTo(BeNil())
 			Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
@@ -237,6 +298,35 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(adminKeyEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
 			Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Name).To(Equal("test-resource-convex-secrets"))
 			Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Key).To(Equal("adminKey"))
+		})
+
+		It("should create Gateway and HTTPRoute with expected wiring", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
+			Expect(gw.Spec.GatewayClassName).To(Equal(gatewayv1.ObjectName("nginx")))
+			Expect(gw.Spec.Listeners).To(HaveLen(1))
+			Expect(gw.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.HTTPProtocolType))
+			Expect(gw.Spec.Listeners[0].Hostname).NotTo(BeNil())
+			Expect(string(*gw.Spec.Listeners[0].Hostname)).To(Equal("convex-dev.example.com"))
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.Hostnames).To(ContainElement(gatewayv1.Hostname("convex-dev.example.com")))
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-gateway")))
+
+			Expect(route.Spec.Rules).To(HaveLen(2))
+			dashboardRule := route.Spec.Rules[0]
+			Expect(dashboardRule.BackendRefs).To(HaveLen(1))
+			Expect(*dashboardRule.BackendRefs[0].BackendRef.Port).To(Equal(gatewayv1.PortNumber(6791)))
+			Expect(dashboardRule.Matches).NotTo(BeEmpty())
+			Expect(dashboardRule.Matches[0].Path).NotTo(BeNil())
+			Expect(dashboardRule.Matches[0].Path.Value).NotTo(BeNil())
+			Expect(*dashboardRule.Matches[0].Path.Value).To(Equal("/dashboard"))
 		})
 
 		It("should remove the dashboard deployment when disabled", func() {
@@ -267,6 +357,17 @@ var _ = Describe("ConvexInstance Controller", func() {
 				}
 				return dep.DeletionTimestamp != nil
 			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+
+			Eventually(func() bool {
+				svc := &corev1.Service{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, svc)
+				return errors.IsNotFound(err)
+			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.Rules).To(HaveLen(1))
+			Expect(route.Spec.Rules[0].BackendRefs[0].BackendRef.Name).To(Equal(gatewayv1.ObjectName("test-resource-backend")))
 
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
