@@ -67,7 +67,7 @@ var _ = BeforeSuite(func() {
 	var err error
 	err = convexv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
-	Expect(gatewayv1.AddToScheme(scheme.Scheme)).To(Succeed())
+	Expect(gatewayv1.Install(scheme.Scheme)).To(Succeed())
 
 	// +kubebuilder:scaffold:scheme
 

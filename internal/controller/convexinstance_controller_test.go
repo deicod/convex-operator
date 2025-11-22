@@ -212,6 +212,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 				Type:               string(gatewayv1.GatewayConditionReady),
 				Status:             metav1.ConditionTrue,
 				Reason:             "Ready",
+				LastTransitionTime: metav1.Now(),
 				ObservedGeneration: gw.GetGeneration(),
 			}}
 			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
@@ -228,6 +229,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 					Status:             metav1.ConditionTrue,
 					Reason:             "Accepted",
 					Message:            "Attached to listener",
+					LastTransitionTime: metav1.Now(),
 					ObservedGeneration: route.GetGeneration(),
 				}},
 			}}
@@ -374,7 +376,11 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			route := &gatewayv1.HTTPRoute{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
-			Expect(route.Spec.Rules).To(HaveLen(3))
+			Expect(route.Spec.Rules).To(HaveLen(2))
+			Expect(route.Spec.Rules[0].Matches).NotTo(BeEmpty())
+			Expect(route.Spec.Rules[0].Matches[0].Path).NotTo(BeNil())
+			Expect(route.Spec.Rules[0].Matches[0].Path.Value).NotTo(BeNil())
+			Expect(*route.Spec.Rules[0].Matches[0].Path.Value).To(Equal("/http_action/"))
 			Expect(route.Spec.Rules[0].BackendRefs[0].BackendRef.Name).To(Equal(gatewayv1.ObjectName("test-resource-backend")))
 
 			updated := &convexv1alpha1.ConvexInstance{}
