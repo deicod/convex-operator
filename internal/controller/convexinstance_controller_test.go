@@ -223,6 +223,126 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
 		})
 
+		It("should fail validation when DB secret is missing the urlKey", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.SecretRef = "pg-secret-missing-key"
+			instance.Spec.Backend.DB.URLKey = "url"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pg-secret-missing-key",
+					Namespace: typeNamespacedName.Namespace,
+				},
+				Data: map[string][]byte{},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("missing key \"url\""))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when DB engine is postgres and urlKey is missing", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.SecretRef = "pg-secret"
+			instance.Spec.Backend.DB.URLKey = ""
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("db urlKey is required"))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when S3 is enabled without required keys", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.S3.Enabled = true
+			instance.Spec.Backend.S3.SecretRef = "s3-secret"
+			instance.Spec.Backend.S3.EndpointKey = ""
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("s3"))
+			Expect(readyCond.Message).To(ContainSubstring("required"))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when S3 secret is missing required key data", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.S3.Enabled = true
+			instance.Spec.Backend.S3.SecretRef = "s3-secret-missing-key"
+			instance.Spec.Backend.S3.EndpointKey = "endpoint"
+			instance.Spec.Backend.S3.AccessKeyIDKey = "accessKeyId"
+			instance.Spec.Backend.S3.SecretAccessKeyKey = "secretAccessKey"
+			instance.Spec.Backend.S3.BucketKey = "bucket"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "s3-secret-missing-key",
+					Namespace: typeNamespacedName.Namespace,
+				},
+				Data: map[string][]byte{
+					"endpoint":        []byte("https://s3.example.com"),
+					"accessKeyId":     []byte("id"),
+					"secretAccessKey": []byte("secret"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("missing key \"bucket\""))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
 		It("should create a PVC when storage is enabled", func() {
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())

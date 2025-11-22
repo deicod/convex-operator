@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -279,12 +280,21 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 		return err
 	}
 
+	ownerChanged, err := ensureOwner(instance, cm, r.Scheme)
+	if err != nil {
+		return err
+	}
+
 	expected := r.renderBackendConfig(instance)
 	if cm.Data == nil {
 		cm.Data = map[string]string{}
 	}
+	changed := ownerChanged
 	if cm.Data[configMapKey] != expected {
 		cm.Data[configMapKey] = expected
+		changed = true
+	}
+	if changed {
 		return r.Update(ctx, cm)
 	}
 	return nil
@@ -331,6 +341,13 @@ func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instanc
 	if err != nil {
 		return "", err
 	}
+	ownerChanged, err := ensureOwner(instance, secret, r.Scheme)
+	if err != nil {
+		return "", err
+	}
+	if ownerChanged {
+		return secretName, r.Update(ctx, secret)
+	}
 	return secretName, nil
 }
 
@@ -366,6 +383,11 @@ func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *c
 		return err
 	}
 
+	ownerChanged, err := ensureOwner(instance, pvc, r.Scheme)
+	if err != nil {
+		return err
+	}
+
 	desiredSize := pvcSize(instance)
 	desiredSC := storageClassPtr(instance)
 	if pvc.Spec.Resources.Requests == nil {
@@ -384,7 +406,7 @@ func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *c
 		pvc.Spec.StorageClassName = desiredSC
 		needsUpdate = true
 	}
-	if needsUpdate {
+	if needsUpdate || ownerChanged {
 		return r.Update(ctx, pvc)
 	}
 	return nil
@@ -449,9 +471,16 @@ func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instanc
 	if err != nil {
 		return name, err
 	}
-	svc.Spec.Ports = ports
-	svc.Spec.Selector = selector
-	return name, r.Update(ctx, svc)
+	ownerChanged, err := ensureOwner(instance, svc, r.Scheme)
+	if err != nil {
+		return name, err
+	}
+	if ownerChanged || !servicePortsEqual(svc.Spec.Ports, ports) || !selectorsEqual(svc.Spec.Selector, selector) {
+		svc.Spec.Ports = ports
+		svc.Spec.Selector = selector
+		return name, r.Update(ctx, svc)
+	}
+	return name, nil
 }
 
 func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName string) error {
@@ -638,8 +667,15 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		return err
 	}
 
-	sts.Spec = stsSpec
-	return r.Update(ctx, sts)
+	ownerChanged, err := ensureOwner(instance, sts, r.Scheme)
+	if err != nil {
+		return err
+	}
+	if ownerChanged || !statefulSetSpecEqual(sts.Spec, stsSpec) {
+		sts.Spec = stsSpec
+		return r.Update(ctx, sts)
+	}
+	return nil
 }
 
 func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason, serviceName, message string, conds ...metav1.Condition) error {
@@ -694,6 +730,43 @@ func backendServiceName(instance *convexv1alpha1.ConvexInstance) string {
 
 func backendStatefulSetName(instance *convexv1alpha1.ConvexInstance) string {
 	return fmt.Sprintf("%s-backend", instance.Name)
+}
+
+func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, scheme *runtime.Scheme) (bool, error) {
+	if owner := metav1.GetControllerOf(obj); owner != nil {
+		if owner.UID == instance.UID {
+			return false, nil
+		}
+		if owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name {
+			// Adopt resources left behind by a previous instance with the same name.
+			var refs []metav1.OwnerReference
+			for _, ref := range obj.GetOwnerReferences() {
+				if ref.Controller != nil && *ref.Controller {
+					continue
+				}
+				refs = append(refs, ref)
+			}
+			obj.SetOwnerReferences(refs)
+		} else {
+			return false, fmt.Errorf("object %s/%s already owned by %s", obj.GetNamespace(), obj.GetName(), owner.Name)
+		}
+	}
+	if err := controllerutil.SetControllerReference(instance, obj, scheme); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func servicePortsEqual(a, b []corev1.ServicePort) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+func selectorsEqual(a, b map[string]string) bool {
+	return reflect.DeepEqual(a, b)
+}
+
+func statefulSetSpecEqual(a, b appsv1.StatefulSetSpec) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 func randomString(length int) (string, error) {
