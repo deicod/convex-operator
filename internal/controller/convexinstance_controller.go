@@ -1155,6 +1155,25 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 		})
 	}
 
+	actionRule := gatewayv1.HTTPRouteRule{
+		Matches: []gatewayv1.HTTPRouteMatch{
+			{
+				Path: &gatewayv1.HTTPPathMatch{
+					Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+					Value: ptr.To("/http_action/"),
+				},
+			},
+		},
+		BackendRefs: []gatewayv1.HTTPBackendRef{{
+			BackendRef: gatewayv1.BackendRef{
+				BackendObjectReference: gatewayv1.BackendObjectReference{
+					Name: gatewayv1.ObjectName(backendServiceName),
+					Port: ptr.To(gatewayv1.PortNumber(actionPort)),
+				},
+			},
+		}},
+	}
+
 	backendMatches := []gatewayv1.HTTPRouteMatch{
 		{
 			Path: &gatewayv1.HTTPPathMatch{
@@ -1171,18 +1190,12 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 		{
 			Path: &gatewayv1.HTTPPathMatch{
 				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
-				Value: ptr.To("/http_action/"),
-			},
-		},
-		{
-			Path: &gatewayv1.HTTPPathMatch{
-				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
 				Value: ptr.To("/"),
 			},
 		},
 	}
 
-	rules = append(rules, gatewayv1.HTTPRouteRule{
+	rules = append(rules, actionRule, gatewayv1.HTTPRouteRule{
 		Matches: backendMatches,
 		BackendRefs: []gatewayv1.HTTPBackendRef{{
 			BackendRef: gatewayv1.BackendRef{

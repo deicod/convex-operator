@@ -319,7 +319,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(route.Spec.ParentRefs).To(HaveLen(1))
 			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-gateway")))
 
-			Expect(route.Spec.Rules).To(HaveLen(2))
+			Expect(route.Spec.Rules).To(HaveLen(3))
 			dashboardRule := route.Spec.Rules[0]
 			Expect(dashboardRule.BackendRefs).To(HaveLen(1))
 			Expect(*dashboardRule.BackendRefs[0].BackendRef.Port).To(Equal(gatewayv1.PortNumber(6791)))
@@ -327,6 +327,14 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(dashboardRule.Matches[0].Path).NotTo(BeNil())
 			Expect(dashboardRule.Matches[0].Path.Value).NotTo(BeNil())
 			Expect(*dashboardRule.Matches[0].Path.Value).To(Equal("/dashboard"))
+
+			actionRule := route.Spec.Rules[1]
+			Expect(actionRule.BackendRefs).To(HaveLen(1))
+			Expect(*actionRule.BackendRefs[0].BackendRef.Port).To(Equal(gatewayv1.PortNumber(3211)))
+			Expect(actionRule.Matches).NotTo(BeEmpty())
+			Expect(actionRule.Matches[0].Path).NotTo(BeNil())
+			Expect(actionRule.Matches[0].Path.Value).NotTo(BeNil())
+			Expect(*actionRule.Matches[0].Path.Value).To(Equal("/http_action/"))
 		})
 
 		It("should remove the dashboard deployment when disabled", func() {
@@ -366,7 +374,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			route := &gatewayv1.HTTPRoute{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
-			Expect(route.Spec.Rules).To(HaveLen(1))
+			Expect(route.Spec.Rules).To(HaveLen(3))
 			Expect(route.Spec.Rules[0].BackendRefs[0].BackendRef.Name).To(Equal(gatewayv1.ObjectName("test-resource-backend")))
 
 			updated := &convexv1alpha1.ConvexInstance{}
