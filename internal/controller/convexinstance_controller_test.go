@@ -364,12 +364,12 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
-			sts.Spec.Template.Spec.Containers[0].Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+			sts.Spec.Template.Spec.Containers[0].Image = testBackendImageV2
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
 			sts.Status.ReadyReplicas = 1
 			sts.Status.Replicas = 1
 			sts.Status.UpdatedReplicas = 1
 			sts.Status.ObservedGeneration = sts.Generation
-			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
 			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
