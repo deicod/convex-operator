@@ -4,7 +4,7 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 ## Description
 - Reconciles a single backend StatefulSet (one replica) and optional dashboard Deployment per `ConvexInstance`.
 - Wires managed Postgres/MySQL/SQLite URLs and S3-compatible storage via Secret references.
-- Exposes traffic through Gateway API/ingress using the provided host and TLS secret.
+- Exposes traffic through Gateway API/ingress using the provided host, optional TLS secret, and configurable GatewayClass (default `nginx`).
 - Tracks lifecycle through status phase/conditions and upgrade strategy (in-place or export/import).
 
 ## Getting Started
@@ -19,23 +19,28 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 - `spec.environment` (`dev|prod`) and `spec.version` (Convex image tag) are required.
 - `spec.backend`: image (defaults to Convex backend), `db.engine` (`postgres|mysql|sqlite`) plus Secret/key refs, `storage.mode` (`sqlite|external`) with optional PVC, S3 secret/key wiring.
 - `spec.dashboard`: enabled flag (default true), image (defaults to Convex dashboard), replicas/resources.
-- `spec.networking`: hostname and TLS secret reference for Gateway/Ingress.
+- `spec.networking`: hostname, `gatewayClassName` (defaults to `nginx`), and TLS secret reference for Gateway/Ingress. The default assumes NGINX Gateway Fabric and requires no extra annotations for basic host/TLS routing.
 - `spec.maintenance.upgradeStrategy`: `inPlace` (default) or `exportImport`; `spec.scale.backend` provides CPU target/max memory hints.
 
 Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the specification in `SPEC.md`.
 
 ### Status and Conditions
-- `Ready`: overall readiness; `BackendReady` when the backend pod is ready, `WaitingForBackend` otherwise, `ValidationFailed`/`*Error` on failures.
+- `Ready`: overall readiness; `BackendReady` when the backend pod is ready, `WaitingForBackend` or `WaitingForGateway` otherwise, `ValidationFailed`/`*Error` on failures.
 - `ConfigMapReady`: backend ConfigMap ensured (`Available`).
 - `SecretsReady`: generated admin/instance secrets ensured; external DB/S3 secrets are validated, not owned.
 - `PVCReady`: `Available` when created, `Skipped` when storage mode is external or PVC disabled.
 - `ServiceReady`: backend Service ensured.
+- `DashboardServiceReady`: dashboard Service ensured or `Disabled` when dashboard is off.
 - `StatefulSetReady`: `Provisioning` while waiting for ready replicas; `Ready` once the backend pod is ready; error reasons on reconcile failures.
+- `DashboardReady`: `Provisioning` during rollout, `Ready` when deployment ready, `Disabled` when dashboard is off.
+- `GatewayReady` / `HTTPRouteReady`: reflect Gateway/HTTPRoute creation and attachment status.
+- Status endpoints are populated with the external host (and `/dashboard` path) once the HTTPRoute is accepted; otherwise they fall back to the internal Service URL for the API and omit the dashboard URL.
 
 ### Troubleshooting quick tips
 - `SecretsReady=False` with `ValidationFailed`: referenced DB/S3/TLS secret missing or key absent.
 - `ConfigMapReady=False` with `ConfigMapError`: config rendering failed—check controller logs.
 - `ServiceReady=False` or `StatefulSetReady=False` with `*Error`: inspect events/logs for create/update errors (e.g., invalid image, resource limits, service conflicts).
+- `GatewayReady`/`HTTPRouteReady` stuck `Provisioning`: ensure GatewayClass `nginx` (or your configured class) exists and that the TLS Secret reference is valid; check HTTPRoute status for Accepted conditions.
 - `Ready` stuck at `WaitingForBackend`: backend pod not ready; check pod events/logs, PVC binding, image pull, or DB connectivity.
 
 #### Events reference

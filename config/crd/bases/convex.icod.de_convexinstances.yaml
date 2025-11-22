@@ -287,6 +287,11 @@ spec:
               networking:
                 description: Networking configures ingress and TLS wiring.
                 properties:
+                  gatewayClassName:
+                    default: nginx
+                    description: GatewayClassName selects the GatewayClass for the
+                      generated Gateway.
+                    type: string
                   host:
                     description: Host is the external hostname routed to backend/dashboard.
                     minLength: 1

@@ -18,8 +18,11 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -33,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	convexv1alpha1 "github.com/deicod/convex-operator/api/v1alpha1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -46,6 +50,8 @@ var (
 	cfg       *rest.Config
 	k8sClient client.Client
 )
+
+const gatewayAPIModuleVersion = "v1.2.0"
 
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -61,6 +67,7 @@ var _ = BeforeSuite(func() {
 	var err error
 	err = convexv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	Expect(gatewayv1.Install(scheme.Scheme)).To(Succeed())
 
 	// +kubebuilder:scaffold:scheme
 
@@ -68,6 +75,10 @@ var _ = BeforeSuite(func() {
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
 		ErrorIfCRDPathMissing: true,
+	}
+
+	if gatewayCRDs := gatewayStandardCRDPath(); gatewayCRDs != "" {
+		testEnv.CRDDirectoryPaths = append(testEnv.CRDDirectoryPaths, gatewayCRDs)
 	}
 
 	// Retrieve the first found binary directory to allow running tests from IDEs
@@ -113,4 +124,25 @@ func getFirstFoundEnvTestBinaryDir() string {
 		}
 	}
 	return ""
+}
+
+// gatewayStandardCRDPath resolves the path to the Gateway API standard CRDs in the module cache.
+// Tests depend on these CRDs to install gateway.networking.k8s.io types.
+func gatewayStandardCRDPath() string {
+	modCache := os.Getenv("GOMODCACHE")
+	if modCache == "" {
+		output, err := exec.Command("go", "env", "GOMODCACHE").Output()
+		if err != nil {
+			logf.Log.Error(err, "Failed to resolve GOMODCACHE for Gateway API CRDs")
+			return ""
+		}
+		modCache = strings.TrimSpace(string(output))
+	}
+
+	path := filepath.Join(modCache, "sigs.k8s.io", fmt.Sprintf("gateway-api@%s", gatewayAPIModuleVersion), "config", "crd", "standard")
+	if _, err := os.Stat(path); err != nil {
+		logf.Log.Error(err, "Gateway API CRDs not found", "path", path)
+		return ""
+	}
+	return path
 }
