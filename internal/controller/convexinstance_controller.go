@@ -18,20 +18,50 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	convexv1alpha1 "github.com/deicod/convex-operator/api/v1alpha1"
 )
 
+const (
+	finalizerName          = "convex.icod.de/finalizer"
+	adminKeyKey            = "adminKey"
+	instanceSecretKey      = "instanceSecret"
+	defaultBackendPortName = "http"
+	defaultBackendPort     = 3210
+	configMapKey           = "convex.conf"
+	conditionReady         = "Ready"
+	conditionConfigMap     = "ConfigMapReady"
+	conditionSecrets       = "SecretsReady"
+	conditionPVC           = "PVCReady"
+	conditionService       = "ServiceReady"
+	conditionStatefulSet   = "StatefulSetReady"
+)
+
 // ConvexInstanceReconciler reconciles a ConvexInstance object
 type ConvexInstanceReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances,verbs=get;list;watch;create;update;patch;delete
@@ -54,19 +84,91 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	oldPhase := instance.Status.Phase
 
-	updated := instance.DeepCopy()
-	updated.Status.ObservedGeneration = instance.GetGeneration()
-	if updated.Status.Phase == "" {
-		updated.Status.Phase = "Pending"
+	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
+			controllerutil.AddFinalizer(instance, finalizerName)
+			if err := r.Update(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		controllerutil.RemoveFinalizer(instance, finalizerName)
+		if err := r.Update(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
-	if err := r.Status().Patch(ctx, updated, client.MergeFrom(instance)); err != nil {
+	conds := []metav1.Condition{}
+
+	if err := r.validateExternalRefs(ctx, instance); err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
+	}
+
+	if err := r.reconcileConfigMap(ctx, instance); err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "ConfigMapError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "ConfigMapError", err, conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()))
+	}
+	conds = append(conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
+
+	secretName, err := r.reconcileSecrets(ctx, instance)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "SecretError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "SecretError", err, conditionFalse(conditionSecrets, "SecretError", err.Error()))
+	}
+	conds = append(conds, conditionTrue(conditionSecrets, "Available", "Instance/admin secrets ensured"))
+
+	if err := r.reconcilePVC(ctx, instance); err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "PVCError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "PVCError", err, conditionFalse(conditionPVC, "PVCError", err.Error()))
+	}
+	if instance.Spec.Backend.Storage.Mode == "external" || !instance.Spec.Backend.Storage.PVC.Enabled {
+		conds = append(conds, conditionTrue(conditionPVC, "Skipped", "PVC not required"))
+	} else {
+		conds = append(conds, conditionTrue(conditionPVC, "Available", "PVC ensured"))
+	}
+
+	serviceName, err := r.reconcileService(ctx, instance)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "ServiceError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "ServiceError", err, conditionFalse(conditionService, "ServiceError", err.Error()))
+	}
+	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
+
+	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName); err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
+	}
+
+	phase := "Pending"
+	conditionReason := "WaitingForBackend"
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
+		if sts.Status.ReadyReplicas > 0 {
+			phase = "Ready"
+			conditionReason = "BackendReady"
+			conds = append(conds, conditionTrue(conditionStatefulSet, "Ready", "Backend pod ready"))
+		} else {
+			conds = append(conds, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"))
+		}
+	}
+
+	statusMsg := "Waiting for backend readiness"
+	if phase == "Ready" {
+		statusMsg = "Backend ready"
+	}
+	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, conds...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
 			return ctrl.Result{Requeue: true}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if phase == "Ready" && oldPhase != "Ready" {
+		r.recordEvent(instance, corev1.EventTypeNormal, "Ready", "Backend is ready")
 	}
 
 	return ctrl.Result{}, nil
@@ -78,4 +180,464 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&convexv1alpha1.ConvexInstance{}).
 		Named("convexinstance").
 		Complete(r)
+}
+
+func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" {
+		if err := r.ensureSecretExists(ctx, instance.Namespace, ref); err != nil {
+			return fmt.Errorf("db secret %q: %w", ref, err)
+		}
+	}
+	if instance.Spec.Backend.S3.Enabled {
+		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
+			if err := r.ensureSecretExists(ctx, instance.Namespace, ref); err != nil {
+				return fmt.Errorf("s3 secret %q: %w", ref, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) ensureSecretExists(ctx context.Context, namespace, name string) error {
+	secret := &corev1.Secret{}
+	return r.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, secret)
+}
+
+func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	cm := &corev1.ConfigMap{}
+	key := client.ObjectKey{Name: backendConfigMapName(instance), Namespace: instance.Namespace}
+	err := r.Get(ctx, key, cm)
+	if errors.IsNotFound(err) {
+		cm = &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      backendConfigMapName(instance),
+				Namespace: instance.Namespace,
+			},
+			Data: map[string]string{
+				configMapKey: r.renderBackendConfig(instance),
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, cm, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, cm)
+	}
+	if err != nil {
+		return err
+	}
+
+	expected := r.renderBackendConfig(instance)
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	if cm.Data[configMapKey] != expected {
+		cm.Data[configMapKey] = expected
+		return r.Update(ctx, cm)
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) renderBackendConfig(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("CONVEX_PORT=%d\nCONVEX_ENV=%s\nCONVEX_VERSION=%s\n", defaultBackendPort, instance.Spec.Environment, instance.Spec.Version)
+}
+
+func configHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, error) {
+	secretName := generatedSecretName(instance)
+	secret := &corev1.Secret{}
+	key := client.ObjectKey{Name: secretName, Namespace: instance.Namespace}
+	err := r.Get(ctx, key, secret)
+	if errors.IsNotFound(err) {
+		adminKey, err := randomString(24)
+		if err != nil {
+			return "", err
+		}
+		instanceSecret, err := randomString(24)
+		if err != nil {
+			return "", err
+		}
+		secret = &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: instance.Namespace,
+			},
+			StringData: map[string]string{
+				adminKeyKey:       adminKey,
+				instanceSecretKey: instanceSecret,
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
+			return "", err
+		}
+		return secretName, r.Create(ctx, secret)
+	}
+	if err != nil {
+		return "", err
+	}
+	return secretName, nil
+}
+
+func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	if instance.Spec.Backend.Storage.Mode == "external" || !instance.Spec.Backend.Storage.PVC.Enabled {
+		return nil
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := client.ObjectKey{Name: backendPVCName(instance), Namespace: instance.Namespace}
+	err := r.Get(ctx, key, pvc)
+	if errors.IsNotFound(err) {
+		pvc = &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      backendPVCName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: pvcSize(instance),
+					},
+				},
+				StorageClassName: storageClassPtr(instance),
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, pvc, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, pvc)
+	}
+	return err
+}
+
+func pvcSize(instance *convexv1alpha1.ConvexInstance) resource.Quantity {
+	if !instance.Spec.Backend.Storage.PVC.Size.IsZero() {
+		return instance.Spec.Backend.Storage.PVC.Size
+	}
+	return resource.MustParse("10Gi")
+}
+
+func storageClassPtr(instance *convexv1alpha1.ConvexInstance) *string {
+	if instance.Spec.Backend.Storage.PVC.StorageClassName != "" {
+		return ptr.To(instance.Spec.Backend.Storage.PVC.StorageClassName)
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, error) {
+	name := backendServiceName(instance)
+	svc := &corev1.Service{}
+	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
+	err := r.Get(ctx, key, svc)
+	ports := []corev1.ServicePort{{
+		Name:       defaultBackendPortName,
+		Port:       defaultBackendPort,
+		Protocol:   corev1.ProtocolTCP,
+		TargetPort: intstr.FromInt(defaultBackendPort),
+	}}
+	selector := map[string]string{
+		"app.kubernetes.io/name":      "convex-backend",
+		"app.kubernetes.io/instance":  instance.Name,
+		"app.kubernetes.io/component": "backend",
+	}
+	if errors.IsNotFound(err) {
+		svc = &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: instance.Namespace,
+			},
+			Spec: corev1.ServiceSpec{
+				Ports:    ports,
+				Selector: selector,
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, svc, r.Scheme); err != nil {
+			return name, err
+		}
+		return name, r.Create(ctx, svc)
+	}
+	if err != nil {
+		return name, err
+	}
+	svc.Spec.Ports = ports
+	svc.Spec.Selector = selector
+	return name, r.Update(ctx, svc)
+}
+
+func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName string) error {
+	sts := &appsv1.StatefulSet{}
+	key := client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}
+	err := r.Get(ctx, key, sts)
+	replicas := int32(1)
+	labels := map[string]string{
+		"app.kubernetes.io/name":      "convex-backend",
+		"app.kubernetes.io/instance":  instance.Name,
+		"app.kubernetes.io/component": "backend",
+	}
+	env := []corev1.EnvVar{
+		{
+			Name:  "CONVEX_PORT",
+			Value: fmt.Sprintf("%d", defaultBackendPort),
+		},
+		{
+			Name:  "CONVEX_ENV",
+			Value: instance.Spec.Environment,
+		},
+		{
+			Name:  "CONVEX_VERSION",
+			Value: instance.Spec.Version,
+		},
+		{
+			Name: "CONVEX_ADMIN_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  adminKeyKey,
+				},
+			},
+		},
+		{
+			Name: "CONVEX_INSTANCE_SECRET",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  instanceSecretKey,
+				},
+			},
+		},
+	}
+
+	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
+		env = append(env, corev1.EnvVar{
+			Name: "CONVEX_DB_URL",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ref},
+					Key:                  instance.Spec.Backend.DB.URLKey,
+				},
+			},
+		})
+	}
+
+	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
+		s3 := instance.Spec.Backend.S3
+		appendS3Env := func(name, key string) {
+			if key == "" {
+				return
+			}
+			env = append(env, corev1.EnvVar{
+				Name: name,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: s3.SecretRef},
+						Key:                  key,
+					},
+				},
+			})
+		}
+		appendS3Env("CONVEX_S3_ENDPOINT", s3.EndpointKey)
+		appendS3Env("CONVEX_S3_ACCESS_KEY_ID", s3.AccessKeyIDKey)
+		appendS3Env("CONVEX_S3_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
+		appendS3Env("CONVEX_S3_BUCKET", s3.BucketKey)
+	}
+
+	volumes := []corev1.Volume{
+		{
+			Name: "config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: backendConfigMapName(instance),
+					},
+				},
+			},
+		},
+	}
+	volumeMounts := []corev1.VolumeMount{
+		{
+			Name:      "config",
+			MountPath: "/etc/convex",
+		},
+	}
+	if instance.Spec.Backend.Storage.Mode != "external" && instance.Spec.Backend.Storage.PVC.Enabled {
+		volumes = append(volumes, corev1.Volume{
+			Name: "data",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: backendPVCName(instance),
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "data",
+			MountPath: "/var/lib/convex",
+		})
+	}
+
+	podSpec := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: labels,
+			Annotations: map[string]string{
+				"convex.icod.de/config-hash": configHash(r.renderBackendConfig(instance)),
+			},
+		},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot: ptr.To(true),
+			},
+			Containers: []corev1.Container{
+				{
+					Name:            "backend",
+					Image:           instance.Spec.Backend.Image,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Ports: []corev1.ContainerPort{{
+						Name:          defaultBackendPortName,
+						ContainerPort: defaultBackendPort,
+					}},
+					Env:       env,
+					Resources: instance.Spec.Backend.Resources,
+					LivenessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/",
+								Port: intstr.FromInt(defaultBackendPort),
+							},
+						},
+					},
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/",
+								Port: intstr.FromInt(defaultBackendPort),
+							},
+						},
+					},
+					SecurityContext: &corev1.SecurityContext{
+						RunAsNonRoot: ptr.To(true),
+					},
+					VolumeMounts: volumeMounts,
+				},
+			},
+			Volumes: volumes,
+		},
+	}
+
+	stsSpec := appsv1.StatefulSetSpec{
+		ServiceName: serviceName,
+		Replicas:    &replicas,
+		Selector: &metav1.LabelSelector{
+			MatchLabels: labels,
+		},
+		Template: podSpec,
+	}
+
+	if errors.IsNotFound(err) {
+		sts = &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      backendStatefulSetName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: stsSpec,
+		}
+		if err := controllerutil.SetControllerReference(instance, sts, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, sts)
+	}
+	if err != nil {
+		return err
+	}
+
+	sts.Spec = stsSpec
+	return r.Update(ctx, sts)
+}
+
+func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason, serviceName, message string, conds ...metav1.Condition) error {
+	current := instance.DeepCopy()
+	current.Status.ObservedGeneration = instance.GetGeneration()
+	current.Status.Phase = phase
+	current.Status.Endpoints.APIURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, defaultBackendPort)
+	conditionStatus := metav1.ConditionFalse
+	if phase == "Ready" {
+		conditionStatus = metav1.ConditionTrue
+	}
+	if phase == "Error" {
+		conditionStatus = metav1.ConditionFalse
+	}
+	for i := range conds {
+		conds[i].ObservedGeneration = instance.GetGeneration()
+		meta.SetStatusCondition(&current.Status.Conditions, conds[i])
+	}
+	meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{
+		Type:               conditionReady,
+		Status:             conditionStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: instance.GetGeneration(),
+	})
+	return r.Status().Update(ctx, current)
+}
+
+func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason string, originalErr error, conds ...metav1.Condition) error {
+	msg := ""
+	if originalErr != nil {
+		msg = originalErr.Error()
+	}
+	if err := r.updateStatus(ctx, instance, phase, reason, backendServiceName(instance), msg, conds...); err != nil {
+		return err
+	}
+	return originalErr
+}
+
+func backendConfigMapName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-backend-config", instance.Name)
+}
+
+func generatedSecretName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-convex-secrets", instance.Name)
+}
+
+func backendPVCName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-backend-pvc", instance.Name)
+}
+
+func backendServiceName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-backend", instance.Name)
+}
+
+func backendStatefulSetName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-backend", instance.Name)
+}
+
+func randomString(length int) (string, error) {
+	buf := make([]byte, length)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(buf), nil
+}
+
+func (r *ConvexInstanceReconciler) recordEvent(instance *convexv1alpha1.ConvexInstance, eventType, reason, message string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(instance, eventType, reason, message)
+	}
+}
+
+func conditionTrue(condType, reason, message string) metav1.Condition {
+	return condition(condType, reason, message, metav1.ConditionTrue)
+}
+
+func conditionFalse(condType, reason, message string) metav1.Condition {
+	return condition(condType, reason, message, metav1.ConditionFalse)
+}
+
+func condition(condType, reason, message string, status metav1.ConditionStatus) metav1.Condition {
+	return metav1.Condition{
+		Type:    condType,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	}
 }
