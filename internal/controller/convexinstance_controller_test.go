@@ -89,8 +89,12 @@ var _ = Describe("ConvexInstance Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("ensuring status is initialized")
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.ObservedGeneration).To(Equal(updated.GetGeneration()))
+			Expect(updated.Status.Phase).To(Equal("Pending"))
 		})
 	})
 })

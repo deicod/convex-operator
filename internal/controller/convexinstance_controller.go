@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,9 +48,26 @@ type ConvexInstanceReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/reconcile
 func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	instance := &convexv1alpha1.ConvexInstance{}
+	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	updated := instance.DeepCopy()
+	updated.Status.ObservedGeneration = instance.GetGeneration()
+	if updated.Status.Phase == "" {
+		updated.Status.Phase = "Pending"
+	}
+
+	if err := r.Status().Patch(ctx, updated, client.MergeFrom(instance)); err != nil {
+		if errors.IsConflict(err) {
+			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, err
+	}
 
 	return ctrl.Result{}, nil
 }
