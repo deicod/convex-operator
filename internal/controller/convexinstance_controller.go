@@ -2083,7 +2083,7 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
 	desiredHash := desiredUpgradeHash(instance)
 	appliedHash := instance.Status.UpgradeHash
-	upgradePending := backendExists && desiredHash != appliedHash
+	upgradePending := appliedHash != "" && desiredHash != appliedHash
 
 	backendImage := instance.Spec.Backend.Image
 	dashboardImage := instance.Spec.Dashboard.Image
