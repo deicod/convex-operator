@@ -179,7 +179,7 @@
 
   ### M3: Dashboard & Gateway API Integration
 
-  - [ ] Implement dashboard Deployment reconciliation gated by dashboard.enabled, wiring image, replicas, resources, and env pointing to backend Service URL and admin key usage per Convex dashboard requirements.
+  - [x] Implement dashboard Deployment reconciliation gated by dashboard.enabled, wiring image, replicas, resources, and env pointing to backend Service URL and admin key usage per Convex dashboard requirements.
   - [ ] Implement dashboard Service reconciliation for HTTP access, ensuring port alignment with dashboard defaults.
   - [ ] Create Gateway API integration: reconcile Gateway bound to configurable gatewayClassName (example "nginx") in instance namespace or shared (document choice), referencing TLS Secret provided.
   - [ ] Create HTTPRoute with host from spec.networking.host, TLS termination, and path rules routing /, /api/*, /sync, /http_action/* to backend Service and /dashboard* to dashboard Service, ensuring backend-
