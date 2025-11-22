@@ -1774,6 +1774,13 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	exportComplete := plan.exportDone
 	importComplete := plan.importDone
 
+	if !backendReady {
+		status.phase = phaseUpgrading
+		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
 	if !exportComplete {
 		complete, err := r.reconcileExportJob(ctx, instance, serviceName, secretName, plan.currentBackendImage)
 		if err != nil {
