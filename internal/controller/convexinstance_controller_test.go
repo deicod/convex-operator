@@ -401,10 +401,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 					return false
 				}
 				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, &batchv1.Job{})
-				if !errors.IsNotFound(err) {
-					return false
-				}
-				return true
+				return errors.IsNotFound(err)
 			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
 			Eventually(func() bool {
 				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, &corev1.PersistentVolumeClaim{})
