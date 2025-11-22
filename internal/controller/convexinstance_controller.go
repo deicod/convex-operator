@@ -23,11 +23,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"reflect"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -775,15 +775,15 @@ func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, sch
 }
 
 func servicePortsEqual(a, b []corev1.ServicePort) bool {
-	return reflect.DeepEqual(a, b)
+	return apiequality.Semantic.DeepEqual(a, b)
 }
 
 func selectorsEqual(a, b map[string]string) bool {
-	return reflect.DeepEqual(a, b)
+	return apiequality.Semantic.DeepEqual(a, b)
 }
 
 func statefulSetSpecEqual(a, b appsv1.StatefulSetSpec) bool {
-	return reflect.DeepEqual(a, b)
+	return apiequality.Semantic.DeepEqual(a, b)
 }
 
 // alignStatefulSetDefaults copies defaults from the current spec into the desired spec to avoid spurious updates.
@@ -796,6 +796,30 @@ func alignStatefulSetDefaults(current, desired *appsv1.StatefulSetSpec) {
 	}
 	if desired.UpdateStrategy.Type == "" && current.UpdateStrategy.Type != "" {
 		desired.UpdateStrategy = *current.UpdateStrategy.DeepCopy()
+	}
+	alignPodSpecDefaults(&current.Template.Spec, &desired.Template.Spec)
+}
+
+func alignPodSpecDefaults(current, desired *corev1.PodSpec) {
+	if desired.RestartPolicy == "" && current.RestartPolicy != "" {
+		desired.RestartPolicy = current.RestartPolicy
+	}
+	if desired.DNSPolicy == "" && current.DNSPolicy != "" {
+		desired.DNSPolicy = current.DNSPolicy
+	}
+	if desired.SchedulerName == "" && current.SchedulerName != "" {
+		desired.SchedulerName = current.SchedulerName
+	}
+	if desired.ServiceAccountName == "" && current.ServiceAccountName != "" {
+		desired.ServiceAccountName = current.ServiceAccountName
+	}
+	if desired.TerminationGracePeriodSeconds == nil && current.TerminationGracePeriodSeconds != nil {
+		val := *current.TerminationGracePeriodSeconds
+		desired.TerminationGracePeriodSeconds = &val
+	}
+	if desired.EnableServiceLinks == nil && current.EnableServiceLinks != nil {
+		val := *current.EnableServiceLinks
+		desired.EnableServiceLinks = &val
 	}
 }
 
