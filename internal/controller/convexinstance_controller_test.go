@@ -395,12 +395,21 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(upgradeCond).NotTo(BeNil())
 			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
 
-			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, &batchv1.Job{})
-			Expect(errors.IsNotFound(err)).To(BeTrue())
-			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, &batchv1.Job{})
-			Expect(errors.IsNotFound(err)).To(BeTrue())
-			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, &corev1.PersistentVolumeClaim{})
-			Expect(errors.IsNotFound(err)).To(BeTrue())
+			Eventually(func() bool {
+				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, &batchv1.Job{})
+				if !errors.IsNotFound(err) {
+					return false
+				}
+				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, &batchv1.Job{})
+				if !errors.IsNotFound(err) {
+					return false
+				}
+				return true
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
+			Eventually(func() bool {
+				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, &corev1.PersistentVolumeClaim{})
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
 		})
 
 		It("should reconcile the dashboard deployment when enabled", func() {
