@@ -72,7 +72,10 @@ const (
 	conditionUpgrade         = "UpgradeInProgress"
 	conditionExport          = "ExportCompleted"
 	conditionImport          = "ImportCompleted"
+	conditionRollingUpdate   = "RollingUpdate"
+	conditionBackendReady    = "BackendReady"
 	msgInstanceReady         = "Instance ready"
+	msgBackendReady          = "Backend ready"
 	phasePending             = "Pending"
 	phaseReady               = "Ready"
 	phaseUpgrading           = "Upgrading"
@@ -1716,15 +1719,15 @@ func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, ba
 	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
 	if plan.upgradePending {
 		status.phase = phaseUpgrading
-		status.reason = "RollingUpdate"
+		status.reason = conditionRollingUpdate
 		status.message = "Rolling out new version"
 		upgradeCond = conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress")
 	}
 
 	if readyAll {
 		status.phase = phaseReady
-		status.reason = "BackendReady"
-		status.message = "Backend ready"
+		status.reason = conditionBackendReady
+		status.message = msgBackendReady
 		if plan.desiredHash != "" {
 			status.appliedHash = plan.desiredHash
 		}
@@ -1789,14 +1792,14 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 
 	if !backendReady {
 		status.phase = phaseUpgrading
-		status.reason = "RollingUpdate"
+		status.reason = conditionRollingUpdate
 		status.message = "Rolling out new version after export"
 		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
 		return status, nil
 	}
 	if plan.currentBackendImage != instance.Spec.Backend.Image {
 		status.phase = phaseUpgrading
-		status.reason = "RollingUpdate"
+		status.reason = conditionRollingUpdate
 		status.message = "Rolling out new version after export"
 		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
 		return status, nil
@@ -1821,8 +1824,8 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 
 	if readyAll && importComplete {
 		status.phase = phaseReady
-		status.reason = "BackendReady"
-		status.message = "Backend ready"
+		status.reason = conditionBackendReady
+		status.message = msgBackendReady
 		status.appliedHash = plan.desiredHash
 		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
 		r.cleanupUpgradeArtifacts(ctx, instance)
