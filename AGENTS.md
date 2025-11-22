@@ -8,6 +8,7 @@ Brief notes for contributors building the Convex Kubernetes operator. Keep chang
 
 ## Build, Test, and Development Commands
 - `make fmt` / `make vet` — gofmt and vet the tree; run before commits.
+- Only run `gofmt` against `.go` files to avoid touching generated or non-Go assets.
 - `make generate` — regenerate deepcopy code and markers; required after API changes.
 - `make manifests` — rebuild CRD/RBAC YAMLs; commit updates when API changes.
 - `make test` — run unit+envtest suites locally (controller-runtime’s envtest).
