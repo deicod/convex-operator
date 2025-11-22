@@ -47,24 +47,27 @@ import (
 )
 
 const (
-	finalizerName          = "convex.icod.de/finalizer"
-	adminKeyKey            = "adminKey"
-	instanceSecretKey      = "instanceSecret"
-	defaultBackendPortName = "http"
-	defaultBackendPort     = 3210
-	actionPortName         = "http-action"
-	actionPort             = 3211
-	configMapKey           = "convex.conf"
-	conditionReady         = "Ready"
-	conditionConfigMap     = "ConfigMapReady"
-	conditionSecrets       = "SecretsReady"
-	conditionPVC           = "PVCReady"
-	conditionService       = "ServiceReady"
-	conditionStatefulSet   = "StatefulSetReady"
-	phasePending           = "Pending"
-	phaseReady             = "Ready"
-	phaseError             = "Error"
-	storageModeExternal    = "external"
+	finalizerName            = "convex.icod.de/finalizer"
+	adminKeyKey              = "adminKey"
+	instanceSecretKey        = "instanceSecret"
+	defaultBackendPortName   = "http"
+	defaultBackendPort       = 3210
+	actionPortName           = "http-action"
+	actionPort               = 3211
+	defaultDashboardPortName = "http"
+	defaultDashboardPort     = 6791
+	configMapKey             = "convex.conf"
+	conditionReady           = "Ready"
+	conditionConfigMap       = "ConfigMapReady"
+	conditionSecrets         = "SecretsReady"
+	conditionPVC             = "PVCReady"
+	conditionService         = "ServiceReady"
+	conditionStatefulSet     = "StatefulSetReady"
+	conditionDashboard       = "DashboardReady"
+	phasePending             = "Pending"
+	phaseReady               = "Ready"
+	phaseError               = "Error"
+	storageModeExternal      = "external"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -79,6 +82,7 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;services;persistentvolumeclaims;events,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -150,6 +154,13 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
 
+	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, generatedSecretRV)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardError", err, conditionFalse(conditionDashboard, "DashboardError", err.Error()))
+	}
+	conds = append(conds, dashboardCond)
+
 	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, generatedSecretRV, extVersions); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
@@ -186,7 +197,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
-	if phase != phaseReady {
+	if phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -201,6 +212,7 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			secret, ok := obj.(*corev1.Secret)
@@ -557,6 +569,128 @@ func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instanc
 	return name, nil
 }
 
+func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, secretName, generatedSecretRV string) (bool, metav1.Condition, error) {
+	name := dashboardDeploymentName(instance)
+	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
+
+	if !instance.Spec.Dashboard.Enabled {
+		dep := &appsv1.Deployment{}
+		if err := r.Get(ctx, key, dep); err == nil {
+			if err := r.Delete(ctx, dep); err != nil && !errors.IsNotFound(err) {
+				return false, metav1.Condition{}, err
+			}
+		} else if !errors.IsNotFound(err) {
+			return false, metav1.Condition{}, err
+		}
+		return true, conditionTrue(conditionDashboard, "Disabled", "Dashboard disabled"), nil
+	}
+
+	replicas := int32(1)
+	if instance.Spec.Dashboard.Replicas != nil {
+		replicas = *instance.Spec.Dashboard.Replicas
+	}
+
+	labels := map[string]string{
+		"app.kubernetes.io/name":      "convex-dashboard",
+		"app.kubernetes.io/instance":  instance.Name,
+		"app.kubernetes.io/component": "dashboard",
+	}
+	backendURL := backendServiceURL(instance, backendServiceName)
+
+	env := []corev1.EnvVar{
+		{
+			Name:  "NEXT_PUBLIC_DEPLOYMENT_URL",
+			Value: backendURL,
+		},
+		{
+			Name: "NEXT_PUBLIC_ADMIN_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  adminKeyKey,
+				},
+			},
+		},
+	}
+
+	podSpec := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: labels,
+			Annotations: map[string]string{
+				"convex.icod.de/dashboard-hash": configHash(backendURL, generatedSecretRV),
+			},
+		},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot: ptr.To(true),
+			},
+			Containers: []corev1.Container{
+				{
+					Name:            "dashboard",
+					Image:           instance.Spec.Dashboard.Image,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Ports: []corev1.ContainerPort{{
+						Name:          defaultDashboardPortName,
+						ContainerPort: defaultDashboardPort,
+					}},
+					Env:       env,
+					Resources: instance.Spec.Dashboard.Resources,
+					SecurityContext: &corev1.SecurityContext{
+						RunAsNonRoot: ptr.To(true),
+					},
+				},
+			},
+		},
+	}
+
+	depSpec := appsv1.DeploymentSpec{
+		Replicas: &replicas,
+		Selector: &metav1.LabelSelector{
+			MatchLabels: labels,
+		},
+		Template: podSpec,
+	}
+
+	dep := &appsv1.Deployment{}
+	err := r.Get(ctx, key, dep)
+	if errors.IsNotFound(err) {
+		dep = &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: instance.Namespace,
+			},
+			Spec: depSpec,
+		}
+		if err := controllerutil.SetControllerReference(instance, dep, r.Scheme); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		if err := r.Create(ctx, dep); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionDashboard, "Provisioning", "Waiting for dashboard rollout"), nil
+	}
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+
+	ownerChanged, err := ensureOwner(instance, dep, r.Scheme)
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+	alignDeploymentDefaults(&dep.Spec, &depSpec)
+	if ownerChanged || !deploymentSpecEqual(dep.Spec, depSpec) {
+		dep.Spec = depSpec
+		if err := r.Update(ctx, dep); err != nil {
+			return false, metav1.Condition{}, err
+		}
+	}
+
+	if deploymentReady(dep) {
+		return true, conditionTrue(conditionDashboard, "Ready", "Dashboard deployment ready"), nil
+	}
+	return false, conditionFalse(conditionDashboard, "Provisioning", "Waiting for dashboard rollout"), nil
+}
+
 func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV string, extVersions externalSecretVersions) error {
 	sts := &appsv1.StatefulSet{}
 	key := client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}
@@ -765,7 +899,7 @@ func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *c
 	current := instance.DeepCopy()
 	current.Status.ObservedGeneration = instance.GetGeneration()
 	current.Status.Phase = phase
-	current.Status.Endpoints.APIURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, defaultBackendPort)
+	current.Status.Endpoints.APIURL = backendServiceURL(instance, serviceName)
 	conditionStatus := metav1.ConditionFalse
 	if phase == phaseReady {
 		conditionStatus = metav1.ConditionTrue
@@ -815,6 +949,14 @@ func backendStatefulSetName(instance *convexv1alpha1.ConvexInstance) string {
 	return fmt.Sprintf("%s-backend", instance.Name)
 }
 
+func dashboardDeploymentName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-dashboard", instance.Name)
+}
+
+func backendServiceURL(instance *convexv1alpha1.ConvexInstance, serviceName string) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, defaultBackendPort)
+}
+
 func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, scheme *runtime.Scheme) (bool, error) {
 	if owner := metav1.GetControllerOf(obj); owner != nil {
 		if owner.UID == instance.UID {
@@ -852,6 +994,10 @@ func statefulSetSpecEqual(a, b appsv1.StatefulSetSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
 }
 
+func deploymentSpecEqual(a, b appsv1.DeploymentSpec) bool {
+	return apiequality.Semantic.DeepEqual(a, b)
+}
+
 // alignStatefulSetDefaults copies defaults from the current spec into the desired spec to avoid spurious updates.
 func alignStatefulSetDefaults(current, desired *appsv1.StatefulSetSpec) {
 	if desired.RevisionHistoryLimit == nil && current.RevisionHistoryLimit != nil {
@@ -862,6 +1008,17 @@ func alignStatefulSetDefaults(current, desired *appsv1.StatefulSetSpec) {
 	}
 	if desired.UpdateStrategy.Type == "" && current.UpdateStrategy.Type != "" {
 		desired.UpdateStrategy = *current.UpdateStrategy.DeepCopy()
+	}
+	alignPodSpecDefaults(&current.Template.Spec, &desired.Template.Spec)
+}
+
+// alignDeploymentDefaults copies defaults from the current spec into the desired spec to avoid spurious updates.
+func alignDeploymentDefaults(current, desired *appsv1.DeploymentSpec) {
+	if desired.RevisionHistoryLimit == nil && current.RevisionHistoryLimit != nil {
+		desired.RevisionHistoryLimit = ptr.To(*current.RevisionHistoryLimit)
+	}
+	if desired.Strategy.Type == "" && current.Strategy.Type != "" {
+		desired.Strategy = *current.Strategy.DeepCopy()
 	}
 	alignPodSpecDefaults(&current.Template.Spec, &desired.Template.Spec)
 }
@@ -887,6 +1044,13 @@ func alignPodSpecDefaults(current, desired *corev1.PodSpec) {
 		val := *current.EnableServiceLinks
 		desired.EnableServiceLinks = &val
 	}
+}
+
+func deploymentReady(dep *appsv1.Deployment) bool {
+	desired := ptr.Deref(dep.Spec.Replicas, int32(0))
+	return dep.Status.ObservedGeneration >= dep.Generation &&
+		dep.Status.UpdatedReplicas == desired &&
+		dep.Status.ReadyReplicas == desired
 }
 
 func randomString(length int) (string, error) {

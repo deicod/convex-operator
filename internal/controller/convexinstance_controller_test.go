@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -196,6 +197,75 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(stsCond.Reason).To(Equal("Ready"))
 
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Normal Ready Backend is ready")))
+		})
+
+		It("should reconcile the dashboard deployment when enabled", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)).To(Succeed())
+
+			Expect(dep.Spec.Replicas).NotTo(BeNil())
+			Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
+
+			Expect(dep.Spec.Template.Spec.Containers).NotTo(BeEmpty())
+			container := dep.Spec.Template.Spec.Containers[0]
+			Expect(container.Image).To(Equal("ghcr.io/get-convex/convex-dashboard:latest"))
+
+			var adminKeyEnv *corev1.EnvVar
+			envValues := map[string]string{}
+			for i := range container.Env {
+				env := container.Env[i]
+				envValues[env.Name] = env.Value
+				if env.Name == "NEXT_PUBLIC_ADMIN_KEY" {
+					adminKeyEnv = &env
+				}
+			}
+			Expect(envValues).To(HaveKeyWithValue("NEXT_PUBLIC_DEPLOYMENT_URL", "http://test-resource-backend.default.svc.cluster.local:3210"))
+			Expect(adminKeyEnv).NotTo(BeNil())
+			Expect(adminKeyEnv.ValueFrom).NotTo(BeNil())
+			Expect(adminKeyEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+			Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Name).To(Equal("test-resource-convex-secrets"))
+			Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Key).To(Equal("adminKey"))
+		})
+
+		It("should remove the dashboard deployment when disabled", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)).To(Succeed())
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Dashboard.Enabled = false
+			patch := []byte(`{"spec":{"dashboard":{"enabled":false}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() bool {
+				dep := &appsv1.Deployment{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)
+				if errors.IsNotFound(err) {
+					return true
+				}
+				if err != nil {
+					return false
+				}
+				return dep.DeletionTimestamp != nil
+			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			dashCond := meta.FindStatusCondition(updated.Status.Conditions, "DashboardReady")
+			Expect(dashCond).NotTo(BeNil())
+			Expect(dashCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(dashCond.Reason).To(Equal("Disabled"))
 		})
 
 		It("should surface errors when referenced DB secrets are missing", func() {
