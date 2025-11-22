@@ -18,11 +18,18 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +42,14 @@ var _ = Describe("ConvexInstance Controller", func() {
 		const resourceName = "test-resource"
 
 		ctx := context.Background()
+		newReconciler := func() (*ConvexInstanceReconciler, *record.FakeRecorder) {
+			rec := record.NewFakeRecorder(64)
+			return &ConvexInstanceReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: rec,
+			}, rec
+		}
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
@@ -70,31 +85,322 @@ var _ = Describe("ConvexInstance Controller", func() {
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &convexv1alpha1.ConvexInstance{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			if errors.IsNotFound(err) {
+				return
+			}
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Cleanup the specific resource instance ConvexInstance")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			reconciler, _ := newReconciler()
+			_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, typeNamespacedName, &convexv1alpha1.ConvexInstance{})
+				return errors.IsNotFound(err)
+			}, 5*time.Second, 200*time.Millisecond).Should(BeTrue())
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
-			controllerReconciler := &ConvexInstanceReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+			controllerReconciler, _ := newReconciler()
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 			By("ensuring status is initialized")
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 			Expect(updated.Status.ObservedGeneration).To(Equal(updated.GetGeneration()))
 			Expect(updated.Status.Phase).To(Equal("Pending"))
+
+			By("ensuring core resources are created")
+			configMap := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend-config", Namespace: "default"}, configMap)).To(Succeed())
+			Expect(configMap.Data).To(HaveKey("convex.conf"))
+
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-convex-secrets", Namespace: "default"}, secret)).To(Succeed())
+			Expect(secret.Data).To(HaveKey("adminKey"))
+			Expect(secret.Data).To(HaveKey("instanceSecret"))
+
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, service)).To(Succeed())
+			Expect(service.Spec.Ports).To(HaveLen(2))
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers).NotTo(BeEmpty())
+
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("WaitingForBackend"))
+			Expect(readyCond.Message).To(ContainSubstring("Waiting for backend readiness"))
+
+			configReady := meta.FindStatusCondition(updated.Status.Conditions, "ConfigMapReady")
+			Expect(configReady).NotTo(BeNil())
+			Expect(configReady.Status).To(Equal(metav1.ConditionTrue))
+			Expect(configReady.Reason).To(Equal("Available"))
+
+			secretReady := meta.FindStatusCondition(updated.Status.Conditions, "SecretsReady")
+			Expect(secretReady).NotTo(BeNil())
+			Expect(secretReady.Status).To(Equal(metav1.ConditionTrue))
+
+			pvcReady := meta.FindStatusCondition(updated.Status.Conditions, "PVCReady")
+			Expect(pvcReady).NotTo(BeNil())
+			Expect(pvcReady.Status).To(Equal(metav1.ConditionTrue))
+			Expect(pvcReady.Reason).To(Equal("Skipped"))
+
+			svcReady := meta.FindStatusCondition(updated.Status.Conditions, "ServiceReady")
+			Expect(svcReady).NotTo(BeNil())
+			Expect(svcReady.Status).To(Equal(metav1.ConditionTrue))
+
+			stsReady := meta.FindStatusCondition(updated.Status.Conditions, "StatefulSetReady")
+			Expect(stsReady).NotTo(BeNil())
+			Expect(stsReady.Status).To(Equal(metav1.ConditionFalse))
+			Expect(stsReady.Reason).To(Equal("Provisioning"))
+		})
+
+		It("should move to Ready once the StatefulSet reports ready replicas", func() {
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			sts.Status.ReadyReplicas = 1
+			sts.Status.Replicas = 1
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.ObservedGeneration = sts.Generation
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Ready"))
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(readyCond.Reason).To(Equal("BackendReady"))
+			Expect(readyCond.Message).To(Equal("Backend ready"))
+
+			stsCond := meta.FindStatusCondition(updated.Status.Conditions, "StatefulSetReady")
+			Expect(stsCond).NotTo(BeNil())
+			Expect(stsCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(stsCond.Reason).To(Equal("Ready"))
+
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Normal Ready Backend is ready")))
+		})
+
+		It("should surface errors when referenced DB secrets are missing", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.DB.SecretRef = "missing-db-secret"
+			instance.Spec.Backend.DB.URLKey = "url"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Error"))
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("missing-db-secret"))
+
+			secretCond := meta.FindStatusCondition(updated.Status.Conditions, "SecretsReady")
+			Expect(secretCond).NotTo(BeNil())
+			Expect(secretCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(secretCond.Reason).To(Equal("ValidationFailed"))
+
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when DB secret is missing the urlKey", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.SecretRef = "pg-secret-missing-key"
+			instance.Spec.Backend.DB.URLKey = "url"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pg-secret-missing-key",
+					Namespace: typeNamespacedName.Namespace,
+				},
+				Data: map[string][]byte{},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("missing key \"url\""))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when DB engine is postgres and urlKey is missing", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.SecretRef = "pg-secret"
+			instance.Spec.Backend.DB.URLKey = ""
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("db urlKey is required"))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when S3 is enabled without required keys", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.S3.Enabled = true
+			instance.Spec.Backend.S3.SecretRef = "s3-secret"
+			instance.Spec.Backend.S3.EndpointKey = ""
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("s3"))
+			Expect(readyCond.Message).To(ContainSubstring("required"))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when S3 secret is missing required key data", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.S3.Enabled = true
+			instance.Spec.Backend.S3.SecretRef = "s3-secret-missing-key"
+			instance.Spec.Backend.S3.EndpointKey = "endpoint"
+			instance.Spec.Backend.S3.AccessKeyIDKey = "accessKeyId"
+			instance.Spec.Backend.S3.SecretAccessKeyKey = "secretAccessKey"
+			instance.Spec.Backend.S3.BucketKey = "bucket"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "s3-secret-missing-key",
+					Namespace: typeNamespacedName.Namespace,
+				},
+				Data: map[string][]byte{
+					"endpoint":        []byte("https://s3.example.com"),
+					"accessKeyId":     []byte("id"),
+					"secretAccessKey": []byte("secret"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("missing key \"bucket\""))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should create a PVC when storage is enabled", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.Storage.PVC.Enabled = true
+			instance.Spec.Backend.Storage.PVC.Size = resource.MustParse("20Gi")
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend-pvc", Namespace: "default"}, pvc)).To(Succeed())
+			Expect(pvc.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("20Gi")))
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			pvcCond := meta.FindStatusCondition(updated.Status.Conditions, "PVCReady")
+			Expect(pvcCond).NotTo(BeNil())
+			Expect(pvcCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(pvcCond.Reason).To(Equal("Available"))
+		})
+
+		It("should surface an error when storageClassName changes after PVC creation", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.Storage.PVC.Enabled = true
+			instance.Spec.Backend.Storage.PVC.Size = resource.MustParse("20Gi")
+			instance.Spec.Backend.Storage.PVC.StorageClassName = "standard"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend-pvc", Namespace: "default"}, pvc)).To(Succeed())
+			Expect(ptr.Deref(pvc.Spec.StorageClassName, "")).To(Equal("standard"))
+			Expect(pvc.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("20Gi")))
+
+			// Change storageClassName and expect reconciliation to fail due to immutability.
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.Storage.PVC.StorageClassName = "fast"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("PVCError"))
+			Expect(readyCond.Message).To(ContainSubstring("storageClassName is immutable"))
 		})
 	})
 })

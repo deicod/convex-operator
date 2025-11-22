@@ -165,17 +165,17 @@
 
   ### M2: Core Reconciler (Backend + Storage + Secrets)
 
-  - [ ] Implement ConvexInstanceReconciler scaffold with finalizer logic to ensure child cleanup on deletion.
-  - [ ] Add reconciliation step to validate referenced Secrets (DB/S3) presence and surface missing references via status conditions and events for operator visibility.
-  - [ ] Implement ConfigMap rendering for backend non-secret config (ports, logging, feature flags) based on Convex docs; ensure idempotent hashing for rollout triggers.
-  - [ ] Implement secret management for instance secret and admin key: create if absent, avoid overwriting existing, annotate for ownership, and mount via env to backend and dashboard.
-  - [ ] Implement PVC reconciliation when storage.pvc.enabled is true, wiring storageClass/size; skip PVC when disabled or external storage mode selected.
-  - [ ] Implement backend Service reconciliation exposing Convex API and HTTP action ports per Convex defaults, ensuring stable cluster DNS name for dashboard usage.
-  - [ ] Implement backend StatefulSet reconciliation (replicas=1) with env wiring: DB URL from Secret, S3 creds when enabled, instance/admin secrets, config from ConfigMap; include liveness/readiness probes to
+  - [x] Implement ConvexInstanceReconciler scaffold with finalizer logic to ensure child cleanup on deletion.
+  - [x] Add reconciliation step to validate referenced Secrets (DB/S3) presence and surface missing references via status conditions and events for operator visibility.
+  - [x] Implement ConfigMap rendering for backend non-secret config (ports, logging, feature flags) based on Convex docs; ensure idempotent hashing for rollout triggers.
+  - [x] Implement secret management for instance secret and admin key: create if absent, avoid overwriting existing, annotate for ownership, and mount via env to backend and dashboard.
+  - [x] Implement PVC reconciliation when storage.pvc.enabled is true, wiring storageClass/size; skip PVC when disabled or external storage mode selected.
+  - [x] Implement backend Service reconciliation exposing Convex API and HTTP action ports per Convex defaults, ensuring stable cluster DNS name for dashboard usage.
+  - [x] Implement backend StatefulSet reconciliation (replicas=1) with env wiring: DB URL from Secret, S3 creds when enabled, instance/admin secrets, config from ConfigMap; include liveness/readiness probes to
     Convex HTTP endpoints.
-  - [ ] Add resource requests/limits from spec and set pod security context defaults (non-root if compatible) while respecting Convex image needs.
-  - [ ] Populate status (observedGeneration, phase, conditions) based on StatefulSet readiness and pod probe success; set endpoints.apiUrl using Service DNS + port.
-  - [ ] Verify owner references on all managed objects for automatic garbage collection and validate deletion flow via envtest/kind smoke test.
+  - [x] Add resource requests/limits from spec and set pod security context defaults (non-root if compatible) while respecting Convex image needs.
+  - [x] Populate status (observedGeneration, phase, conditions) based on StatefulSet readiness and pod probe success; set endpoints.apiUrl using Service DNS + port.
+  - [x] Verify owner references on all managed objects for automatic garbage collection and validate deletion flow via envtest/kind smoke test.
 
   ### M3: Dashboard & Gateway API Integration
 

@@ -24,6 +24,25 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 
 Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the specification in `SPEC.md`.
 
+### Status and Conditions
+- `Ready`: overall readiness; `BackendReady` when the backend pod is ready, `WaitingForBackend` otherwise, `ValidationFailed`/`*Error` on failures.
+- `ConfigMapReady`: backend ConfigMap ensured (`Available`).
+- `SecretsReady`: generated admin/instance secrets ensured; external DB/S3 secrets are validated, not owned.
+- `PVCReady`: `Available` when created, `Skipped` when storage mode is external or PVC disabled.
+- `ServiceReady`: backend Service ensured.
+- `StatefulSetReady`: `Provisioning` while waiting for ready replicas; `Ready` once the backend pod is ready; error reasons on reconcile failures.
+
+### Troubleshooting quick tips
+- `SecretsReady=False` with `ValidationFailed`: referenced DB/S3/TLS secret missing or key absent.
+- `ConfigMapReady=False` with `ConfigMapError`: config rendering failed—check controller logs.
+- `ServiceReady=False` or `StatefulSetReady=False` with `*Error`: inspect events/logs for create/update errors (e.g., invalid image, resource limits, service conflicts).
+- `Ready` stuck at `WaitingForBackend`: backend pod not ready; check pod events/logs, PVC binding, image pull, or DB connectivity.
+
+#### Events reference
+- `Warning ValidationFailed`: referenced secret missing/invalid.
+- `Warning ConfigMapError/SecretError/PVCError/ServiceError/StatefulSetError`: reconcile step failed; check controller logs and the referenced object.
+- `Normal Ready`: backend became Ready.
+
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
 
