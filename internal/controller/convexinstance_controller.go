@@ -1496,7 +1496,6 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,
 		instance.Spec.Dashboard.Image,
-		instance.Spec.Maintenance.UpgradeStrategy,
 	)
 }
 
