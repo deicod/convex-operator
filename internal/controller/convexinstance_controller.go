@@ -1698,6 +1698,14 @@ func jobFailed(job *batchv1.Job) bool {
 	return job.Status.Failed > 0
 }
 
+func (r *ConvexInstanceReconciler) backendHasReadyReplica(ctx context.Context, instance *convexv1alpha1.ConvexInstance) bool {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err != nil {
+		return false
+	}
+	return sts.Status.ReadyReplicas > 0
+}
+
 func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, backendReady, dashboardReady, gatewayReady, routeReady bool, serviceName, secretName string, baseConds []metav1.Condition) (upgradeStatus, error) {
 	status := upgradeStatus{
 		phase:       phasePending,
@@ -1774,7 +1782,7 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	exportComplete := plan.exportDone
 	importComplete := plan.importDone
 
-	if !backendReady {
+	if !backendReady && !r.backendHasReadyReplica(ctx, instance) {
 		status.phase = phaseUpgrading
 		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
 		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
