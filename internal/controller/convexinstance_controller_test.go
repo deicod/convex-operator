@@ -43,6 +43,8 @@ import (
 var _ = Describe("ConvexInstance Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
+		const testBackendImageV2 = "ghcr.io/get-convex/convex-backend:2.0.0"
+		const strategyExportImport = "exportImport"
 
 		ctx := context.Background()
 		newReconciler := func() (*ConvexInstanceReconciler, *record.FakeRecorder) {
@@ -299,7 +301,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			oldHash := current.Status.UpgradeHash
 
 			current.Spec.Version = "2.0.0"
-			current.Spec.Backend.Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+			current.Spec.Backend.Image = testBackendImageV2
 			Expect(k8sClient.Update(ctx, current)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -342,8 +344,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
 			oldHash := current.Status.UpgradeHash
 
-			current.Spec.Maintenance.UpgradeStrategy = "exportImport"
-			current.Spec.Backend.Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+			current.Spec.Maintenance.UpgradeStrategy = strategyExportImport
+			current.Spec.Backend.Image = testBackendImageV2
 			current.Spec.Version = "2.0.0"
 			Expect(k8sClient.Update(ctx, current)).To(Succeed())
 

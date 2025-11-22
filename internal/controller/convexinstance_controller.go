@@ -76,6 +76,8 @@ const (
 	phaseReady               = "Ready"
 	phaseUpgrading           = "Upgrading"
 	phaseError               = "Error"
+	upgradeStrategyInPlace   = "inPlace"
+	upgradeStrategyExport    = "exportImport"
 	storageModeExternal      = "external"
 	defaultGatewayClassName  = "nginx"
 	upgradeExportJobSuffix   = "upgrade-export"
@@ -160,30 +162,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		currentDashboardImage = existingDashboard.Spec.Template.Spec.Containers[0].Image
 	}
 
-	desiredHash := desiredUpgradeHash(instance)
-	appliedHash := instance.Status.UpgradeHash
-	upgradePending := backendExists && appliedHash != "" && desiredHash != appliedHash
-	strategy := instance.Spec.Maintenance.UpgradeStrategy
-	if strategy == "" {
-		strategy = "inPlace"
-	}
-	exportDone := conditionTrueForGeneration(instance.Status.Conditions, conditionExport, instance.GetGeneration())
-	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
-
-	effectiveBackendImage := instance.Spec.Backend.Image
-	effectiveDashboardImage := instance.Spec.Dashboard.Image
-	if strategy == "exportImport" && upgradePending && !exportDone {
-		if currentBackendImage != "" {
-			effectiveBackendImage = currentBackendImage
-		}
-		if currentDashboardImage != "" {
-			effectiveDashboardImage = currentDashboardImage
-		}
-	}
-
-	upgradeInProgress := upgradePending
-	upgradeReason := ""
-	upgradeMsg := ""
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage)
 
 	conds := []metav1.Condition{}
 	extVersions, err := r.validateExternalRefs(ctx, instance)
@@ -229,14 +208,14 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conds = append(conds, dashboardSvcCond)
 
-	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, generatedSecretRV, effectiveDashboardImage)
+	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, generatedSecretRV, plan.effectiveDashboardImage)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardError", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardError", err, conditionFalse(conditionDashboard, "DashboardError", err.Error()))
 	}
 	conds = append(conds, dashboardCond)
 
-	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, generatedSecretRV, effectiveBackendImage, extVersions); err != nil {
+	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, generatedSecretRV, plan.effectiveBackendImage, extVersions); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
 	}
@@ -262,127 +241,14 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conds = append(conds, backendCond)
 
-	exportComplete := exportDone
-	importComplete := importDone
-
-	if strategy == "exportImport" && (upgradePending || exportDone || importDone) {
-		if err := r.reconcileUpgradePVC(ctx, instance); err != nil {
-			r.recordEvent(instance, corev1.EventTypeWarning, "UpgradePVCError", err.Error())
-			return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "UpgradePVCError", err, conditionFalse(conditionUpgrade, "UpgradePVCError", err.Error()))
-		}
-		exportImage := currentBackendImage
-		if exportImage == "" {
-			exportImage = effectiveBackendImage
-		}
-		if !exportComplete {
-			exportComplete, err = r.reconcileExportJob(ctx, instance, serviceName, secretName, exportImage)
-			if err != nil {
-				r.recordEvent(instance, corev1.EventTypeWarning, "ExportJobError", err.Error())
-				return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ExportJobError", err, conditionFalse(conditionExport, "ExportJobError", err.Error()))
-			}
-		}
-		if exportComplete {
-			exportDone = true
-		}
-
-		desiredBackendReady := backendReady && effectiveBackendImage == instance.Spec.Backend.Image
-		if exportComplete && desiredBackendReady && !importComplete {
-			importImage := instance.Spec.Backend.Image
-			importComplete, err = r.reconcileImportJob(ctx, instance, serviceName, secretName, importImage)
-			if err != nil {
-				r.recordEvent(instance, corev1.EventTypeWarning, "ImportJobError", err.Error())
-				return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ImportJobError", err, conditionFalse(conditionImport, "ImportJobError", err.Error()))
-			}
-		}
-		if importComplete {
-			importDone = true
-		}
-
-		if importComplete && desiredBackendReady && gatewayReady && routeReady {
-			upgradePending = false
-			upgradeInProgress = false
-			appliedHash = desiredHash
-			r.cleanupUpgradeArtifacts(ctx, instance)
-		} else {
-			upgradeInProgress = true
-		}
+	status, err := r.handleUpgrade(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, conds)
+	if err != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
 	}
 
-	if upgradePending && strategy == "inPlace" {
-		upgradeReason = "RollingUpdate"
-		upgradeMsg = "Rolling out new version"
-	}
-	if upgradePending && strategy == "exportImport" {
-		switch {
-		case !exportDone:
-			upgradeReason = "Exporting"
-			upgradeMsg = "Running export job"
-		case exportDone && !backendReady:
-			upgradeReason = "RollingUpdate"
-			upgradeMsg = "Rolling out new version after export"
-		case exportDone && backendReady && !importDone:
-			upgradeReason = "Importing"
-			upgradeMsg = "Running import job"
-		}
-	}
-
-	if upgradePending && strategy == "inPlace" && backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady {
-		upgradePending = false
-		upgradeInProgress = false
-		appliedHash = desiredHash
-	}
-
-	if upgradeInProgress || (strategy == "inPlace" && upgradePending) {
-		conds = append(conds, conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress"))
-	} else {
-		conds = append(conds, conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress"))
-	}
-	if strategy == "exportImport" {
-		if exportDone {
-			conds = append(conds, conditionTrue(conditionExport, "Completed", "Export job completed"))
-		} else if upgradePending || upgradeInProgress {
-			conds = append(conds, conditionFalse(conditionExport, "Pending", "Waiting for export job"))
-		}
-		if importDone {
-			conds = append(conds, conditionTrue(conditionImport, "Completed", "Import job completed"))
-		} else if upgradePending || upgradeInProgress {
-			conds = append(conds, conditionFalse(conditionImport, "Pending", "Waiting for import job"))
-		}
-	}
-
-	phase := phasePending
-	conditionReason := "WaitingForBackend"
-	statusMsg := "Waiting for backend readiness"
-
-	if upgradeInProgress {
-		phase = phaseUpgrading
-		if upgradeReason != "" {
-			conditionReason = upgradeReason
-		} else {
-			conditionReason = "UpgradeInProgress"
-		}
-		if upgradeMsg != "" {
-			statusMsg = upgradeMsg
-		} else {
-			statusMsg = "Upgrade in progress"
-		}
-	} else if backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady {
-		phase = phaseReady
-		conditionReason = "Ready"
-		statusMsg = "Instance ready"
-		appliedHash = desiredHash
-	} else {
-		if instance.Spec.Dashboard.Enabled && !dashboardReady {
-			conditionReason = "WaitingForDashboard"
-			statusMsg = "Waiting for dashboard readiness"
-		} else if !gatewayReady || !routeReady {
-			conditionReason = "WaitingForGateway"
-			statusMsg = "Waiting for Gateway/HTTPRoute readiness"
-		}
-	}
-
-	readyEvent := phase == phaseReady && oldPhase != phaseReady
-	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, gatewayReady && routeReady, appliedHash, conds...); err != nil {
+	readyEvent := status.phase == phaseReady && oldPhase != phaseReady
+	if err := r.updateStatus(ctx, instance, status.phase, status.reason, serviceName, status.message, gatewayReady && routeReady, status.appliedHash, status.conditions...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
 			return ctrl.Result{Requeue: true}, nil
@@ -393,7 +259,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
-	if phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) || !gatewayReady || !routeReady {
+	if status.phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) || !gatewayReady || !routeReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -441,6 +307,27 @@ type externalSecretVersions struct {
 	dbResourceVersion  string
 	s3ResourceVersion  string
 	tlsResourceVersion string
+}
+
+type upgradePlan struct {
+	strategy                string
+	desiredHash             string
+	appliedHash             string
+	upgradePending          bool
+	exportDone              bool
+	importDone              bool
+	effectiveBackendImage   string
+	effectiveDashboardImage string
+	currentBackendImage     string
+	currentDashboardImage   string
+}
+
+type upgradeStatus struct {
+	phase       string
+	reason      string
+	message     string
+	appliedHash string
+	conditions  []metav1.Condition
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
@@ -1772,43 +1659,6 @@ func externalScheme(instance *convexv1alpha1.ConvexInstance) string {
 	return "http"
 }
 
-func (r *ConvexInstanceReconciler) calculateReadiness(ctx context.Context, instance *convexv1alpha1.ConvexInstance, dashboardReady, gatewayReady, routeReady bool, conds []metav1.Condition, oldPhase string) (string, string, string, []metav1.Condition, bool) {
-	phase := phasePending
-	conditionReason := "WaitingForBackend"
-	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
-		observedUpToDate := sts.Status.ObservedGeneration >= sts.Generation &&
-			sts.Status.UpdatedReplicas == *sts.Spec.Replicas &&
-			sts.Status.ReadyReplicas == sts.Status.UpdatedReplicas
-		if observedUpToDate && sts.Status.ReadyReplicas > 0 {
-			phase = phaseReady
-			conditionReason = "BackendReady"
-			conds = append(conds, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"))
-		} else {
-			conds = append(conds, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"))
-		}
-	}
-
-	statusMsg := "Waiting for backend readiness"
-	if phase == phaseReady {
-		statusMsg = "Backend ready"
-	}
-	if instance.Spec.Dashboard.Enabled && !dashboardReady {
-		if phase == phaseReady {
-			phase = phasePending
-			conditionReason = "WaitingForDashboard"
-			statusMsg = "Waiting for dashboard readiness"
-		}
-	}
-	if phase == phaseReady && (!gatewayReady || !routeReady) {
-		phase = phasePending
-		conditionReason = "WaitingForGateway"
-		statusMsg = "Waiting for Gateway/HTTPRoute readiness"
-	}
-	readyEvent := phase == phaseReady && oldPhase != phaseReady
-	return phase, conditionReason, statusMsg, conds, readyEvent
-}
-
 func (r *ConvexInstanceReconciler) backendStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err != nil {
@@ -1881,6 +1731,140 @@ func jobSucceeded(job *batchv1.Job) bool {
 
 func jobFailed(job *batchv1.Job) bool {
 	return job.Status.Failed > 0
+}
+
+func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, backendReady, dashboardReady, gatewayReady, routeReady bool, serviceName, secretName string, baseConds []metav1.Condition) (upgradeStatus, error) {
+	status := upgradeStatus{
+		phase:       phasePending,
+		reason:      "WaitingForBackend",
+		message:     "Waiting for backend readiness",
+		appliedHash: plan.appliedHash,
+		conditions:  append([]metav1.Condition{}, baseConds...),
+	}
+
+	switch plan.strategy {
+	case upgradeStrategyExport:
+		return r.handleExportImport(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, status)
+	default:
+		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status), nil
+	}
+}
+
+func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool, status upgradeStatus) upgradeStatus {
+	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
+	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+	if plan.upgradePending {
+		status.phase = phaseUpgrading
+		status.reason = "RollingUpdate"
+		status.message = "Rolling out new version"
+		upgradeCond = conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress")
+	}
+
+	if readyAll {
+		status.phase = phaseReady
+		status.reason = "Ready"
+		status.message = "Instance ready"
+		if plan.desiredHash != "" {
+			status.appliedHash = plan.desiredHash
+		}
+		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+	} else {
+		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+	}
+
+	status.conditions = append(status.conditions, upgradeCond)
+	return status
+}
+
+func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, backendReady, dashboardReady, gatewayReady, routeReady bool, serviceName, secretName string, status upgradeStatus) (upgradeStatus, error) {
+	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
+
+	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+	exportCond := conditionFalse(conditionExport, "Pending", "Waiting for export job")
+	importCond := conditionFalse(conditionImport, "Pending", "Waiting for import job")
+
+	if !plan.upgradePending {
+		if plan.exportDone || plan.importDone {
+			r.cleanupUpgradeArtifacts(ctx, instance)
+		}
+		if readyAll {
+			status.phase = phaseReady
+			status.reason = "Ready"
+			status.message = "Instance ready"
+			if plan.desiredHash != "" {
+				status.appliedHash = plan.desiredHash
+			}
+		} else {
+			status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+		}
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if err := r.reconcileUpgradePVC(ctx, instance); err != nil {
+		return status, err
+	}
+
+	upgradeCond = conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress")
+	exportComplete := plan.exportDone
+	importComplete := plan.importDone
+
+	if !exportComplete {
+		complete, err := r.reconcileExportJob(ctx, instance, serviceName, secretName, plan.currentBackendImage)
+		if err != nil {
+			return status, err
+		}
+		exportComplete = complete
+	}
+	if exportComplete {
+		exportCond = conditionTrue(conditionExport, "Completed", "Export job completed")
+	} else {
+		status.phase = phaseUpgrading
+		status.reason = "Exporting"
+		status.message = "Running export job"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if !backendReady {
+		status.phase = phaseUpgrading
+		status.reason = "RollingUpdate"
+		status.message = "Rolling out new version after export"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if !importComplete {
+		complete, err := r.reconcileImportJob(ctx, instance, serviceName, secretName, instance.Spec.Backend.Image)
+		if err != nil {
+			return status, err
+		}
+		importComplete = complete
+	}
+	if importComplete {
+		importCond = conditionTrue(conditionImport, "Completed", "Import job completed")
+	} else {
+		status.phase = phaseUpgrading
+		status.reason = "Importing"
+		status.message = "Running import job"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if readyAll && importComplete {
+		status.phase = phaseReady
+		status.reason = "Ready"
+		status.message = "Instance ready"
+		status.appliedHash = plan.desiredHash
+		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+		r.cleanupUpgradeArtifacts(ctx, instance)
+	} else {
+		status.phase = phaseUpgrading
+		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+	}
+
+	status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+	return status, nil
 }
 
 // alignStatefulSetDefaults copies defaults from the current spec into the desired spec to avoid spurious updates.
@@ -1974,5 +1958,53 @@ func condition(condType, reason, message string, status metav1.ConditionStatus) 
 		Status:  status,
 		Reason:  reason,
 		Message: message,
+	}
+}
+
+func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool) (string, string) {
+	if instance.Spec.Dashboard.Enabled && !dashboardReady {
+		return "WaitingForDashboard", "Waiting for dashboard readiness"
+	}
+	if !gatewayReady || !routeReady {
+		return "WaitingForGateway", "Waiting for Gateway/HTTPRoute readiness"
+	}
+	if !backendReady {
+		return "WaitingForBackend", "Waiting for backend readiness"
+	}
+	return "Ready", "Instance ready"
+}
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage string) upgradePlan {
+	strategy := instance.Spec.Maintenance.UpgradeStrategy
+	if strategy == "" {
+		strategy = upgradeStrategyInPlace
+	}
+	exportDone := conditionTrueForGeneration(instance.Status.Conditions, conditionExport, instance.GetGeneration())
+	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
+	desiredHash := desiredUpgradeHash(instance)
+	appliedHash := instance.Status.UpgradeHash
+	upgradePending := backendExists && appliedHash != "" && desiredHash != appliedHash
+
+	backendImage := instance.Spec.Backend.Image
+	dashboardImage := instance.Spec.Dashboard.Image
+	if strategy == upgradeStrategyExport && upgradePending && !exportDone {
+		if currentBackendImage != "" {
+			backendImage = currentBackendImage
+		}
+		if currentDashboardImage != "" {
+			dashboardImage = currentDashboardImage
+		}
+	}
+
+	return upgradePlan{
+		strategy:                strategy,
+		desiredHash:             desiredHash,
+		appliedHash:             appliedHash,
+		upgradePending:          upgradePending,
+		exportDone:              exportDone,
+		importDone:              importDone,
+		effectiveBackendImage:   backendImage,
+		effectiveDashboardImage: dashboardImage,
+		currentBackendImage:     currentBackendImage,
+		currentDashboardImage:   currentDashboardImage,
 	}
 }
