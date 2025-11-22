@@ -1723,8 +1723,8 @@ func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, ba
 
 	if readyAll {
 		status.phase = phaseReady
-		status.reason = conditionReady
-		status.message = msgInstanceReady
+		status.reason = "BackendReady"
+		status.message = "Backend ready"
 		if plan.desiredHash != "" {
 			status.appliedHash = plan.desiredHash
 		}
@@ -1814,8 +1814,8 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 
 	if readyAll && importComplete {
 		status.phase = phaseReady
-		status.reason = "Ready"
-		status.message = "Instance ready"
+		status.reason = "BackendReady"
+		status.message = "Backend ready"
 		status.appliedHash = plan.desiredHash
 		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
 		r.cleanupUpgradeArtifacts(ctx, instance)
@@ -1923,16 +1923,16 @@ func condition(condType, reason, message string, status metav1.ConditionStatus) 
 }
 
 func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool) (string, string) {
+	if !backendReady {
+		return "WaitingForBackend", "Waiting for backend readiness"
+	}
 	if instance.Spec.Dashboard.Enabled && !dashboardReady {
 		return "WaitingForDashboard", "Waiting for dashboard readiness"
 	}
 	if !gatewayReady || !routeReady {
 		return "WaitingForGateway", "Waiting for Gateway/HTTPRoute readiness"
 	}
-	if !backendReady {
-		return "WaitingForBackend", "Waiting for backend readiness"
-	}
-	return "Ready", "Instance ready"
+	return "BackendReady", "Backend ready"
 }
 
 func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
