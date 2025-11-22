@@ -39,7 +39,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	convexv1alpha1 "github.com/deicod/convex-operator/api/v1alpha1"
 )
@@ -112,8 +114,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	conds := []metav1.Condition{}
-
-	if err := r.validateExternalRefs(ctx, instance); err != nil {
+	extVersions, err := r.validateExternalRefs(ctx, instance)
+	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
@@ -124,7 +126,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conds = append(conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
 
-	secretName, err := r.reconcileSecrets(ctx, instance)
+	secretName, generatedSecretRV, err := r.reconcileSecrets(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "SecretError", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "SecretError", err, conditionFalse(conditionSecrets, "SecretError", err.Error()))
@@ -148,7 +150,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
 
-	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName); err != nil {
+	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, generatedSecretRV, extVersions); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
 	}
@@ -200,32 +202,56 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			secret, ok := obj.(*corev1.Secret)
+			if !ok {
+				return nil
+			}
+			var instances convexv1alpha1.ConvexInstanceList
+			if err := r.List(ctx, &instances, client.InNamespace(secret.Namespace)); err != nil {
+				return nil
+			}
+			var requests []reconcile.Request
+			for _, inst := range instances.Items {
+				if inst.Spec.Backend.DB.SecretRef == secret.Name || inst.Spec.Backend.S3.SecretRef == secret.Name || generatedSecretName(&inst) == secret.Name {
+					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+				}
+			}
+			return requests
+		})).
 		Named("convexinstance").
 		Complete(r)
 }
 
-func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+type externalSecretVersions struct {
+	dbResourceVersion string
+	s3ResourceVersion string
+}
+
+func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
+	result := externalSecretVersions{}
 	db := instance.Spec.Backend.DB
 	if db.Engine != "sqlite" && db.SecretRef == "" {
-		return fmt.Errorf("db secret is required for engine %q", db.Engine)
+		return result, fmt.Errorf("db secret is required for engine %q", db.Engine)
 	}
 	if db.Engine != "sqlite" && db.URLKey == "" {
-		return fmt.Errorf("db urlKey is required for engine %q", db.Engine)
+		return result, fmt.Errorf("db urlKey is required for engine %q", db.Engine)
 	}
 	if ref := db.SecretRef; ref != "" {
 		secret := &corev1.Secret{}
 		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-			return fmt.Errorf("db secret %q: %w", ref, err)
+			return result, fmt.Errorf("db secret %q: %w", ref, err)
 		}
 		if db.URLKey != "" {
 			if _, ok := secret.Data[db.URLKey]; !ok {
-				return fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
+				return result, fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
 			}
 		}
+		result.dbResourceVersion = secret.ResourceVersion
 	}
 	if instance.Spec.Backend.S3.Enabled {
 		if instance.Spec.Backend.S3.SecretRef == "" {
-			return fmt.Errorf("s3 secret is required when s3 is enabled")
+			return result, fmt.Errorf("s3 secret is required when s3 is enabled")
 		}
 		requiredS3Keys := map[string]string{
 			"endpointKey":        instance.Spec.Backend.S3.EndpointKey,
@@ -235,13 +261,13 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 		}
 		for field, val := range requiredS3Keys {
 			if val == "" {
-				return fmt.Errorf("s3 %s is required when s3 is enabled", field)
+				return result, fmt.Errorf("s3 %s is required when s3 is enabled", field)
 			}
 		}
 		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
 			secret := &corev1.Secret{}
 			if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-				return fmt.Errorf("s3 secret %q: %w", ref, err)
+				return result, fmt.Errorf("s3 secret %q: %w", ref, err)
 			}
 			keys := []string{
 				instance.Spec.Backend.S3.EndpointKey,
@@ -254,12 +280,13 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 					continue
 				}
 				if _, ok := secret.Data[key]; !ok {
-					return fmt.Errorf("s3 secret %q missing key %q", ref, key)
+					return result, fmt.Errorf("s3 secret %q missing key %q", ref, key)
 				}
 			}
+			result.s3ResourceVersion = secret.ResourceVersion
 		}
 	}
-	return nil
+	return result, nil
 }
 
 func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
@@ -309,24 +336,28 @@ func (r *ConvexInstanceReconciler) renderBackendConfig(instance *convexv1alpha1.
 	return fmt.Sprintf("CONVEX_PORT=%d\nCONVEX_ENV=%s\nCONVEX_VERSION=%s\n", defaultBackendPort, instance.Spec.Environment, instance.Spec.Version)
 }
 
-func configHash(content string) string {
-	sum := sha256.Sum256([]byte(content))
+func configHash(content string, values ...string) string {
+	buf := []byte(content)
+	for _, v := range values {
+		buf = append(buf, []byte(v)...)
+	}
+	sum := sha256.Sum256(buf)
 	return hex.EncodeToString(sum[:])
 }
 
-func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, error) {
+func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, string, error) {
 	secretName := generatedSecretName(instance)
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{Name: secretName, Namespace: instance.Namespace}
 	err := r.Get(ctx, key, secret)
 	if errors.IsNotFound(err) {
-		adminKey, err := randomString(24)
+		adminKey, err := randomAdminString()
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
-		instanceSecret, err := randomString(24)
+		instanceSecret, err := randomAdminString()
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		secret = &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
@@ -339,16 +370,19 @@ func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instanc
 			},
 		}
 		if err := controllerutil.SetControllerReference(instance, secret, r.Scheme); err != nil {
-			return "", err
+			return "", "", err
 		}
-		return secretName, r.Create(ctx, secret)
+		if err := r.Create(ctx, secret); err != nil {
+			return "", "", err
+		}
+		return secretName, secret.ResourceVersion, nil
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	ownerChanged, err := ensureOwner(instance, secret, r.Scheme)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	changed := ownerChanged
@@ -356,26 +390,28 @@ func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instanc
 		secret.Data = map[string][]byte{}
 	}
 	if _, ok := secret.Data[adminKeyKey]; !ok {
-		keyVal, genErr := randomString(24)
+		keyVal, genErr := randomAdminString()
 		if genErr != nil {
-			return "", genErr
+			return "", "", genErr
 		}
 		secret.Data[adminKeyKey] = []byte(keyVal)
 		changed = true
 	}
 	if _, ok := secret.Data[instanceSecretKey]; !ok {
-		keyVal, genErr := randomString(24)
+		keyVal, genErr := randomAdminString()
 		if genErr != nil {
-			return "", genErr
+			return "", "", genErr
 		}
 		secret.Data[instanceSecretKey] = []byte(keyVal)
 		changed = true
 	}
 
 	if changed {
-		return secretName, r.Update(ctx, secret)
+		if err := r.Update(ctx, secret); err != nil {
+			return "", "", err
+		}
 	}
-	return secretName, nil
+	return secretName, secret.ResourceVersion, nil
 }
 
 func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
@@ -521,7 +557,7 @@ func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instanc
 	return name, nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName string) error {
+func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV string, extVersions externalSecretVersions) error {
 	sts := &appsv1.StatefulSet{}
 	key := client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, sts)
@@ -635,7 +671,12 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
 			Annotations: map[string]string{
-				"convex.icod.de/config-hash": configHash(r.renderBackendConfig(instance)),
+				"convex.icod.de/config-hash": configHash(
+					r.renderBackendConfig(instance),
+					generatedSecretRV,
+					extVersions.dbResourceVersion,
+					extVersions.s3ResourceVersion,
+				),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -854,6 +895,10 @@ func randomString(length int) (string, error) {
 		return "", err
 	}
 	return base64.RawStdEncoding.EncodeToString(buf), nil
+}
+
+func randomAdminString() (string, error) {
+	return randomString(24)
 }
 
 func (r *ConvexInstanceReconciler) recordEvent(instance *convexv1alpha1.ConvexInstance, eventType, reason, message string) {
