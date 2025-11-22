@@ -1241,15 +1241,16 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 }
 
 func (r *ConvexInstanceReconciler) cleanupUpgradeArtifacts(ctx context.Context, instance *convexv1alpha1.ConvexInstance) {
+	propagation := metav1.DeletePropagationBackground
 	for _, name := range []string{exportJobName(instance), importJobName(instance)} {
 		job := &batchv1.Job{}
 		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: instance.Namespace}, job); err == nil {
-			_ = r.Delete(ctx, job)
+			_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
 		}
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := r.Get(ctx, client.ObjectKey{Name: upgradePVCName(instance), Namespace: instance.Namespace}, pvc); err == nil {
-		_ = r.Delete(ctx, pvc)
+		_ = r.Delete(ctx, pvc, &client.DeleteOptions{PropagationPolicy: &propagation})
 	}
 }
 
