@@ -173,6 +173,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
 			sts.Status.ReadyReplicas = 1
 			sts.Status.Replicas = 1
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.ObservedGeneration = sts.Generation
 			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})

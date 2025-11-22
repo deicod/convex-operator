@@ -157,7 +157,10 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	conditionReason := "WaitingForBackend"
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
-		if sts.Status.ReadyReplicas > 0 {
+		observedUpToDate := sts.Status.ObservedGeneration >= sts.Generation &&
+			sts.Status.UpdatedReplicas == *sts.Spec.Replicas &&
+			sts.Status.ReadyReplicas == sts.Status.UpdatedReplicas
+		if observedUpToDate && sts.Status.ReadyReplicas > 0 {
 			phase = phaseReady
 			conditionReason = "BackendReady"
 			conds = append(conds, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"))
@@ -404,7 +407,7 @@ func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *c
 		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
 		needsUpdate = true
 	}
-	if !storageClassEqual(desiredSC, pvc.Spec.StorageClassName) {
+	if desiredSC != nil && !storageClassEqual(desiredSC, pvc.Spec.StorageClassName) {
 		pvc.Spec.StorageClassName = desiredSC
 		needsUpdate = true
 	}
