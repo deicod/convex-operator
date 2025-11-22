@@ -1020,6 +1020,10 @@ func alignDeploymentDefaults(current, desired *appsv1.DeploymentSpec) {
 	if desired.Strategy.Type == "" && current.Strategy.Type != "" {
 		desired.Strategy = *current.Strategy.DeepCopy()
 	}
+	if desired.ProgressDeadlineSeconds == nil && current.ProgressDeadlineSeconds != nil {
+		val := *current.ProgressDeadlineSeconds
+		desired.ProgressDeadlineSeconds = &val
+	}
 	alignPodSpecDefaults(&current.Template.Spec, &desired.Template.Spec)
 }
 
