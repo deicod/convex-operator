@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- convex_v1alpha1_convexinstance.yaml
+- convex_v1alpha1_convexinstance_prod.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

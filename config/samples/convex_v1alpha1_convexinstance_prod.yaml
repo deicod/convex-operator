@@ -1,0 +1,46 @@
+apiVersion: convex.icod.de/v1alpha1
+kind: ConvexInstance
+metadata:
+  labels:
+    app.kubernetes.io/name: convex-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: convex-prod
+spec:
+  environment: prod
+  version: "1.0.0"
+  backend:
+    image: ghcr.io/get-convex/convex-backend:1.0.0
+    resources:
+      requests:
+        cpu: 1
+        memory: 2Gi
+      limits:
+        cpu: 2
+        memory: 4Gi
+    db:
+      engine: postgres
+      secretRef: convex-prod-db
+      urlKey: url
+    storage:
+      mode: external
+      pvc:
+        enabled: false
+    s3:
+      enabled: true
+      secretRef: convex-prod-s3
+      endpointKey: endpoint
+      accessKeyIdKey: accessKeyId
+      secretAccessKeyKey: secretAccessKey
+      bucketKey: bucket
+  dashboard:
+    enabled: true
+    replicas: 2
+  networking:
+    host: convex.example.com
+    tlsSecretRef: convex-prod-tls
+  scale:
+    backend:
+      cpuTargetUtilization: 70
+      maxMemory: 8Gi
+  maintenance:
+    upgradeStrategy: exportImport
