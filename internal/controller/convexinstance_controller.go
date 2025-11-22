@@ -1794,6 +1794,13 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
 		return status, nil
 	}
+	if plan.currentBackendImage != instance.Spec.Backend.Image {
+		status.phase = phaseUpgrading
+		status.reason = "RollingUpdate"
+		status.message = "Rolling out new version after export"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
 
 	if !importComplete {
 		complete, err := r.reconcileImportJob(ctx, instance, serviceName, secretName, instance.Spec.Backend.Image)
