@@ -1025,7 +1025,6 @@ func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instanc
 		if err := r.Update(ctx, gw); err != nil {
 			return false, metav1.Condition{}, err
 		}
-		return false, conditionFalse(conditionGateway, "Provisioning", "Gateway updated"), nil
 	}
 
 	if gatewayIsReady(gw) {
@@ -1078,7 +1077,6 @@ func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, insta
 		if err := r.Update(ctx, route); err != nil {
 			return false, metav1.Condition{}, err
 		}
-		return false, conditionFalse(conditionHTTPRoute, "Provisioning", "HTTPRoute updated"), nil
 	}
 
 	readyCond := routeAccepted(route)
