@@ -199,18 +199,25 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
-	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" {
+	db := instance.Spec.Backend.DB
+	if db.Engine != "sqlite" && db.SecretRef == "" {
+		return fmt.Errorf("db secret is required for engine %q", db.Engine)
+	}
+	if ref := db.SecretRef; ref != "" {
 		secret := &corev1.Secret{}
 		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
 			return fmt.Errorf("db secret %q: %w", ref, err)
 		}
-		if instance.Spec.Backend.DB.URLKey != "" {
-			if _, ok := secret.Data[instance.Spec.Backend.DB.URLKey]; !ok {
-				return fmt.Errorf("db secret %q missing key %q", ref, instance.Spec.Backend.DB.URLKey)
+		if db.URLKey != "" {
+			if _, ok := secret.Data[db.URLKey]; !ok {
+				return fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
 			}
 		}
 	}
 	if instance.Spec.Backend.S3.Enabled {
+		if instance.Spec.Backend.S3.SecretRef == "" {
+			return fmt.Errorf("s3 secret is required when s3 is enabled")
+		}
 		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
 			secret := &corev1.Secret{}
 			if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
@@ -341,7 +348,32 @@ func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *c
 		}
 		return r.Create(ctx, pvc)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	desiredSize := pvcSize(instance)
+	desiredSC := storageClassPtr(instance)
+	if pvc.Spec.Resources.Requests == nil {
+		pvc.Spec.Resources.Requests = corev1.ResourceList{}
+	}
+	currentSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	needsUpdate := false
+	if desiredSize.Cmp(currentSize) != 0 {
+		if !currentSize.IsZero() && desiredSize.Cmp(currentSize) < 0 {
+			return fmt.Errorf("pvc size shrink not supported: current=%s desired=%s", currentSize.String(), desiredSize.String())
+		}
+		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
+		needsUpdate = true
+	}
+	if !storageClassEqual(desiredSC, pvc.Spec.StorageClassName) {
+		pvc.Spec.StorageClassName = desiredSC
+		needsUpdate = true
+	}
+	if needsUpdate {
+		return r.Update(ctx, pvc)
+	}
+	return nil
 }
 
 func pvcSize(instance *convexv1alpha1.ConvexInstance) resource.Quantity {
@@ -356,6 +388,16 @@ func storageClassPtr(instance *convexv1alpha1.ConvexInstance) *string {
 		return ptr.To(instance.Spec.Backend.Storage.PVC.StorageClassName)
 	}
 	return nil
+}
+
+func storageClassEqual(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
 
 func (r *ConvexInstanceReconciler) reconcileService(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, error) {
