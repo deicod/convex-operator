@@ -55,6 +55,10 @@ const (
 	conditionPVC           = "PVCReady"
 	conditionService       = "ServiceReady"
 	conditionStatefulSet   = "StatefulSetReady"
+	phasePending           = "Pending"
+	phaseReady             = "Ready"
+	phaseError             = "Error"
+	storageModeExternal    = "external"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -86,7 +90,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	oldPhase := instance.Status.Phase
 
-	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+	if instance.DeletionTimestamp.IsZero() {
 		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
 			controllerutil.AddFinalizer(instance, finalizerName)
 			if err := r.Update(ctx, instance); err != nil {
@@ -105,27 +109,27 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	if err := r.validateExternalRefs(ctx, instance); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
 
 	if err := r.reconcileConfigMap(ctx, instance); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ConfigMapError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "ConfigMapError", err, conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()))
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ConfigMapError", err, conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()))
 	}
 	conds = append(conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
 
 	secretName, err := r.reconcileSecrets(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "SecretError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "SecretError", err, conditionFalse(conditionSecrets, "SecretError", err.Error()))
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "SecretError", err, conditionFalse(conditionSecrets, "SecretError", err.Error()))
 	}
 	conds = append(conds, conditionTrue(conditionSecrets, "Available", "Instance/admin secrets ensured"))
 
 	if err := r.reconcilePVC(ctx, instance); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "PVCError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "PVCError", err, conditionFalse(conditionPVC, "PVCError", err.Error()))
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "PVCError", err, conditionFalse(conditionPVC, "PVCError", err.Error()))
 	}
-	if instance.Spec.Backend.Storage.Mode == "external" || !instance.Spec.Backend.Storage.PVC.Enabled {
+	if instance.Spec.Backend.Storage.Mode == storageModeExternal || !instance.Spec.Backend.Storage.PVC.Enabled {
 		conds = append(conds, conditionTrue(conditionPVC, "Skipped", "PVC not required"))
 	} else {
 		conds = append(conds, conditionTrue(conditionPVC, "Available", "PVC ensured"))
@@ -134,30 +138,30 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	serviceName, err := r.reconcileService(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ServiceError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "ServiceError", err, conditionFalse(conditionService, "ServiceError", err.Error()))
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ServiceError", err, conditionFalse(conditionService, "ServiceError", err.Error()))
 	}
 	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
 
 	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName); err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "Error", "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
 	}
 
-	phase := "Pending"
+	phase := phasePending
 	conditionReason := "WaitingForBackend"
 	sts := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
 		if sts.Status.ReadyReplicas > 0 {
-			phase = "Ready"
+			phase = phaseReady
 			conditionReason = "BackendReady"
-			conds = append(conds, conditionTrue(conditionStatefulSet, "Ready", "Backend pod ready"))
+			conds = append(conds, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"))
 		} else {
 			conds = append(conds, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"))
 		}
 	}
 
 	statusMsg := "Waiting for backend readiness"
-	if phase == "Ready" {
+	if phase == phaseReady {
 		statusMsg = "Backend ready"
 	}
 	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, conds...); err != nil {
@@ -167,8 +171,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		return ctrl.Result{}, err
 	}
-	if phase == "Ready" && oldPhase != "Ready" {
-		r.recordEvent(instance, corev1.EventTypeNormal, "Ready", "Backend is ready")
+	if phase == phaseReady && oldPhase != phaseReady {
+		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
 	return ctrl.Result{}, nil
@@ -282,7 +286,7 @@ func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instanc
 }
 
 func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
-	if instance.Spec.Backend.Storage.Mode == "external" || !instance.Spec.Backend.Storage.PVC.Enabled {
+	if instance.Spec.Backend.Storage.Mode == storageModeExternal || !instance.Spec.Backend.Storage.PVC.Enabled {
 		return nil
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -461,7 +465,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			MountPath: "/etc/convex",
 		},
 	}
-	if instance.Spec.Backend.Storage.Mode != "external" && instance.Spec.Backend.Storage.PVC.Enabled {
+	if instance.Spec.Backend.Storage.Mode != storageModeExternal && instance.Spec.Backend.Storage.PVC.Enabled {
 		volumes = append(volumes, corev1.Volume{
 			Name: "data",
 			VolumeSource: corev1.VolumeSource{
@@ -560,11 +564,8 @@ func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *c
 	current.Status.Phase = phase
 	current.Status.Endpoints.APIURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, defaultBackendPort)
 	conditionStatus := metav1.ConditionFalse
-	if phase == "Ready" {
+	if phase == phaseReady {
 		conditionStatus = metav1.ConditionTrue
-	}
-	if phase == "Error" {
-		conditionStatus = metav1.ConditionFalse
 	}
 	for i := range conds {
 		conds[i].ObservedGeneration = instance.GetGeneration()
@@ -580,12 +581,12 @@ func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *c
 	return r.Status().Update(ctx, current)
 }
 
-func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason string, originalErr error, conds ...metav1.Condition) error {
+func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instance *convexv1alpha1.ConvexInstance, reason string, originalErr error, conds ...metav1.Condition) error {
 	msg := ""
 	if originalErr != nil {
 		msg = originalErr.Error()
 	}
-	if err := r.updateStatus(ctx, instance, phase, reason, backendServiceName(instance), msg, conds...); err != nil {
+	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, conds...); err != nil {
 		return err
 	}
 	return originalErr
