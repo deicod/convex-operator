@@ -376,7 +376,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			importJob := &batchv1.Job{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, importJob)).To(Succeed())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, importJob)
+				return err == nil
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
 			importJob.Status.Succeeded = 1
 			Expect(k8sClient.Status().Update(ctx, importJob)).To(Succeed())
 
