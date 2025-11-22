@@ -72,7 +72,7 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=configmaps;secrets;services;persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps;secrets;services;persistentvolumeclaims;events,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -200,23 +200,39 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
 	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" {
-		if err := r.ensureSecretExists(ctx, instance.Namespace, ref); err != nil {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
 			return fmt.Errorf("db secret %q: %w", ref, err)
+		}
+		if instance.Spec.Backend.DB.URLKey != "" {
+			if _, ok := secret.Data[instance.Spec.Backend.DB.URLKey]; !ok {
+				return fmt.Errorf("db secret %q missing key %q", ref, instance.Spec.Backend.DB.URLKey)
+			}
 		}
 	}
 	if instance.Spec.Backend.S3.Enabled {
 		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
-			if err := r.ensureSecretExists(ctx, instance.Namespace, ref); err != nil {
+			secret := &corev1.Secret{}
+			if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
 				return fmt.Errorf("s3 secret %q: %w", ref, err)
+			}
+			keys := []string{
+				instance.Spec.Backend.S3.EndpointKey,
+				instance.Spec.Backend.S3.AccessKeyIDKey,
+				instance.Spec.Backend.S3.SecretAccessKeyKey,
+				instance.Spec.Backend.S3.BucketKey,
+			}
+			for _, key := range keys {
+				if key == "" {
+					continue
+				}
+				if _, ok := secret.Data[key]; !ok {
+					return fmt.Errorf("s3 secret %q missing key %q", ref, key)
+				}
 			}
 		}
 	}
 	return nil
-}
-
-func (r *ConvexInstanceReconciler) ensureSecretExists(ctx context.Context, namespace, name string) error {
-	secret := &corev1.Secret{}
-	return r.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, secret)
 }
 
 func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
