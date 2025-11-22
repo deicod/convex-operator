@@ -353,7 +353,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			exportJob := &batchv1.Job{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, exportJob)).To(Succeed())
+			Eventually(func() bool {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, exportJob) == nil
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 			makeBackendReady()
 			exportJob.Status.Succeeded = 1
