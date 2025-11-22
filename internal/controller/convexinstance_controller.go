@@ -1209,13 +1209,15 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 
 func gatewayIsReady(gw *gatewayv1.Gateway) bool {
 	readyCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionReady))
-	return readyCond != nil && readyCond.Status == metav1.ConditionTrue
+	return readyCond != nil &&
+		readyCond.Status == metav1.ConditionTrue &&
+		readyCond.ObservedGeneration >= gw.Generation
 }
 
 func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
 	for _, parent := range route.Status.Parents {
 		cond := meta.FindStatusCondition(parent.Conditions, string(gatewayv1.RouteConditionAccepted))
-		if cond != nil {
+		if cond != nil && cond.ObservedGeneration >= route.Generation {
 			return cond
 		}
 	}
