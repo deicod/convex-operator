@@ -166,33 +166,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
 	}
 
-	phase := phasePending
-	conditionReason := "WaitingForBackend"
-	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
-		observedUpToDate := sts.Status.ObservedGeneration >= sts.Generation &&
-			sts.Status.UpdatedReplicas == *sts.Spec.Replicas &&
-			sts.Status.ReadyReplicas == sts.Status.UpdatedReplicas
-		if observedUpToDate && sts.Status.ReadyReplicas > 0 {
-			phase = phaseReady
-			conditionReason = "BackendReady"
-			conds = append(conds, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"))
-		} else {
-			conds = append(conds, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"))
-		}
-	}
-
-	statusMsg := "Waiting for backend readiness"
-	if phase == phaseReady {
-		statusMsg = "Backend ready"
-	}
-	if instance.Spec.Dashboard.Enabled && !dashboardReady {
-		if phase == phaseReady {
-			phase = phasePending
-			conditionReason = "WaitingForDashboard"
-			statusMsg = "Waiting for dashboard readiness"
-		}
-	}
+	phase, conditionReason, statusMsg, conds, readyEvent := r.calculateReadiness(ctx, instance, dashboardReady, conds, oldPhase)
 	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, conds...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
@@ -200,7 +174,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		return ctrl.Result{}, err
 	}
-	if phase == phaseReady && oldPhase != phaseReady {
+	if readyEvent {
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
@@ -962,6 +936,38 @@ func dashboardDeploymentName(instance *convexv1alpha1.ConvexInstance) string {
 
 func backendServiceURL(instance *convexv1alpha1.ConvexInstance, serviceName string) string {
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", serviceName, instance.Namespace, defaultBackendPort)
+}
+
+func (r *ConvexInstanceReconciler) calculateReadiness(ctx context.Context, instance *convexv1alpha1.ConvexInstance, dashboardReady bool, conds []metav1.Condition, oldPhase string) (string, string, string, []metav1.Condition, bool) {
+	phase := phasePending
+	conditionReason := "WaitingForBackend"
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
+		observedUpToDate := sts.Status.ObservedGeneration >= sts.Generation &&
+			sts.Status.UpdatedReplicas == *sts.Spec.Replicas &&
+			sts.Status.ReadyReplicas == sts.Status.UpdatedReplicas
+		if observedUpToDate && sts.Status.ReadyReplicas > 0 {
+			phase = phaseReady
+			conditionReason = "BackendReady"
+			conds = append(conds, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"))
+		} else {
+			conds = append(conds, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"))
+		}
+	}
+
+	statusMsg := "Waiting for backend readiness"
+	if phase == phaseReady {
+		statusMsg = "Backend ready"
+	}
+	if instance.Spec.Dashboard.Enabled && !dashboardReady {
+		if phase == phaseReady {
+			phase = phasePending
+			conditionReason = "WaitingForDashboard"
+			statusMsg = "Waiting for dashboard readiness"
+		}
+	}
+	readyEvent := phase == phaseReady && oldPhase != phaseReady
+	return phase, conditionReason, statusMsg, conds, readyEvent
 }
 
 func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, scheme *runtime.Scheme) (bool, error) {
