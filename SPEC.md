@@ -191,16 +191,16 @@
 
   ### M4: Upgrade Strategies & Maintenance
 
-  - [ ] Implement detection of spec.version or image changes and branch on maintenance.upgradeStrategy.
-  - [ ] For inPlace, orchestrate StatefulSet/Deployment rolling updates, set phase Upgrading, track rollout status, and revert to Ready or Error conditions with meaningful reasons.
-  - [ ] For exportImport, design Job templates using Convex CLI (example commands with placeholders) to export data before rollout and import after; ensure Jobs mount admin key and connect to API endpoint
+  - [x] Implement detection of spec.version or image changes and branch on maintenance.upgradeStrategy.
+  - [x] For inPlace, orchestrate StatefulSet/Deployment rolling updates, set phase Upgrading, track rollout status, and revert to Ready or Error conditions with meaningful reasons.
+  - [x] For exportImport, design Job templates using Convex CLI (example commands with placeholders) to export data before rollout and import after; ensure Jobs mount admin key and connect to API endpoint
     securely.
-  - [ ] Add sequencing: set Upgrading, run export Job, wait completion, roll backend image, run import Job, then set Ready; handle failures with Degraded condition and avoid infinite retries (backoff and requeue
+  - [x] Add sequencing: set Upgrading, run export Job, wait completion, roll backend image, run import Job, then set Ready; handle failures with Degraded condition and avoid infinite retries (backoff and requeue
     with events).
-  - [ ] Ensure cleanup of temporary Jobs/ConfigMaps/PVCs used for export artifacts (if any) to avoid resource leaks post-upgrade.
-  - [ ] Add safeguards preventing multiple concurrent upgrade flows per instance; serialize by finalizer/condition locks.
-  - [ ] Extend status/conditions to reflect upgrade progress (e.g., UpgradeInProgress, ExportCompleted, ImportCompleted) with timestamps/messages for observability.
-  - [ ] Add tests simulating version bumps for both strategies, verifying state transitions and resource mutations without breaking singleton backend constraint.
+  - [x] Ensure cleanup of temporary Jobs/ConfigMaps/PVCs used for export artifacts (if any) to avoid resource leaks post-upgrade.
+  - [x] Add safeguards preventing multiple concurrent upgrade flows per instance; serialize by finalizer/condition locks.
+  - [x] Extend status/conditions to reflect upgrade progress (e.g., UpgradeInProgress, ExportCompleted, ImportCompleted) with timestamps/messages for observability.
+  - [x] Add tests simulating version bumps for both strategies, verifying state transitions and resource mutations without breaking singleton backend constraint.
 
   ### M5: Testing, CI, Docs
 

@@ -418,6 +418,10 @@ spec:
                 - Error
                 - Upgrading
                 type: string
+              upgradeHash:
+                description: UpgradeHash tracks the last fully applied spec hash to
+                  gate future upgrades.
+                type: string
             type: object
         required:
         - spec

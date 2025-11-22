@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -58,6 +59,56 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Namespace: "default", // TODO(user):Modify as needed
 		}
 		convexinstance := &convexv1alpha1.ConvexInstance{}
+		makeBackendReady := func() {
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			sts.Status.ReadyReplicas = 1
+			sts.Status.Replicas = 1
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.ObservedGeneration = sts.Generation
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		}
+		makeDashboardReady := func() {
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)).To(Succeed())
+			dep.Status.Replicas = 1
+			dep.Status.UpdatedReplicas = 1
+			dep.Status.ReadyReplicas = 1
+			dep.Status.ObservedGeneration = dep.Generation
+			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+		}
+		makeGatewayReady := func() {
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
+			gw.Status.Conditions = []metav1.Condition{{
+				Type:               string(gatewayv1.GatewayConditionReady),
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: gw.GetGeneration(),
+			}}
+			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
+		}
+		makeRouteAccepted := func() {
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			route.Status.Parents = []gatewayv1.RouteParentStatus{{
+				ParentRef: gatewayv1.ParentReference{
+					Name:      gatewayv1.ObjectName("test-resource-gateway"),
+					Namespace: ptr.To(gatewayv1.Namespace("default")),
+				},
+				ControllerName: gatewayv1.GatewayController("test.example/controller"),
+				Conditions: []metav1.Condition{{
+					Type:               string(gatewayv1.RouteConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					Reason:             "Accepted",
+					Message:            "Attached to listener",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: route.GetGeneration(),
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
+		}
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind ConvexInstance")
@@ -190,51 +241,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			sts := &appsv1.StatefulSet{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
-			sts.Status.ReadyReplicas = 1
-			sts.Status.Replicas = 1
-			sts.Status.UpdatedReplicas = 1
-			sts.Status.ObservedGeneration = sts.Generation
-			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
-
-			dep := &appsv1.Deployment{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)).To(Succeed())
-			dep.Status.Replicas = 1
-			dep.Status.UpdatedReplicas = 1
-			dep.Status.ReadyReplicas = 1
-			dep.Status.ObservedGeneration = dep.Generation
-			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
-
-			gw := &gatewayv1.Gateway{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
-			gw.Status.Conditions = []metav1.Condition{{
-				Type:               string(gatewayv1.GatewayConditionReady),
-				Status:             metav1.ConditionTrue,
-				Reason:             "Ready",
-				LastTransitionTime: metav1.Now(),
-				ObservedGeneration: gw.GetGeneration(),
-			}}
-			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
-
-			route := &gatewayv1.HTTPRoute{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
-			route.Status.Parents = []gatewayv1.RouteParentStatus{{
-				ParentRef: gatewayv1.ParentReference{
-					Name:      gatewayv1.ObjectName("test-resource-gateway"),
-					Namespace: ptr.To(gatewayv1.Namespace("default")),
-				},
-				ControllerName: gatewayv1.GatewayController("test.example/controller"),
-				Conditions: []metav1.Condition{{
-					Type:               string(gatewayv1.RouteConditionAccepted),
-					Status:             metav1.ConditionTrue,
-					Reason:             "Accepted",
-					Message:            "Attached to listener",
-					LastTransitionTime: metav1.Now(),
-					ObservedGeneration: route.GetGeneration(),
-				}},
-			}}
-			Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
+			makeBackendReady()
+			makeDashboardReady()
+			makeGatewayReady()
+			makeRouteAccepted()
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
@@ -261,10 +271,131 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(routeCond).NotTo(BeNil())
 			Expect(routeCond.Status).To(Equal(metav1.ConditionTrue))
 
+			Expect(updated.Status.UpgradeHash).NotTo(BeEmpty())
+			upgradeCond := meta.FindStatusCondition(updated.Status.Conditions, "UpgradeInProgress")
+			Expect(upgradeCond).NotTo(BeNil())
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
+
 			Expect(updated.Status.Endpoints.APIURL).To(Equal("http://convex-dev.example.com"))
 			Expect(updated.Status.Endpoints.DashboardURL).To(Equal("http://convex-dev.example.com/dashboard"))
 
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Normal Ready Backend is ready")))
+		})
+
+		It("should handle an in-place upgrade rollout", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+			makeGatewayReady()
+			makeRouteAccepted()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			current := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			oldHash := current.Status.UpgradeHash
+
+			current.Spec.Version = "2.0.0"
+			current.Spec.Backend.Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			pending := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, pending)).To(Succeed())
+			Expect(pending.Status.Phase).To(Equal("Upgrading"))
+			upgradeCond := meta.FindStatusCondition(pending.Status.Conditions, "UpgradeInProgress")
+			Expect(upgradeCond).NotTo(BeNil())
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionTrue))
+
+			makeBackendReady()
+			makeDashboardReady()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			final := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, final)).To(Succeed())
+			Expect(final.Status.Phase).To(Equal("Ready"))
+			Expect(final.Status.UpgradeHash).NotTo(Equal(oldHash))
+			upgradeCond = meta.FindStatusCondition(final.Status.Conditions, "UpgradeInProgress")
+			Expect(upgradeCond).NotTo(BeNil())
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
+		})
+
+		It("should orchestrate export/import upgrades", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+			makeGatewayReady()
+			makeRouteAccepted()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			current := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			oldHash := current.Status.UpgradeHash
+
+			current.Spec.Maintenance.UpgradeStrategy = "exportImport"
+			current.Spec.Backend.Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+			current.Spec.Version = "2.0.0"
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			exportJob := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, exportJob)).To(Succeed())
+
+			makeBackendReady()
+			exportJob.Status.Succeeded = 1
+			Expect(k8sClient.Status().Update(ctx, exportJob)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			sts.Spec.Template.Spec.Containers[0].Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+			sts.Status.ReadyReplicas = 1
+			sts.Status.Replicas = 1
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.ObservedGeneration = sts.Generation
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			importJob := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, importJob)).To(Succeed())
+			importJob.Status.Succeeded = 1
+			Expect(k8sClient.Status().Update(ctx, importJob)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			final := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, final)).To(Succeed())
+			Expect(final.Status.Phase).To(Equal("Ready"))
+			Expect(final.Status.UpgradeHash).NotTo(Equal(oldHash))
+
+			upgradeCond := meta.FindStatusCondition(final.Status.Conditions, "UpgradeInProgress")
+			Expect(upgradeCond).NotTo(BeNil())
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
+
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, &batchv1.Job{})
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, &batchv1.Job{})
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, &corev1.PersistentVolumeClaim{})
+			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
 		It("should reconcile the dashboard deployment when enabled", func() {
