@@ -350,7 +350,29 @@ func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instanc
 	if err != nil {
 		return "", err
 	}
-	if ownerChanged {
+
+	changed := ownerChanged
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
+	}
+	if _, ok := secret.Data[adminKeyKey]; !ok {
+		keyVal, genErr := randomString(24)
+		if genErr != nil {
+			return "", genErr
+		}
+		secret.Data[adminKeyKey] = []byte(keyVal)
+		changed = true
+	}
+	if _, ok := secret.Data[instanceSecretKey]; !ok {
+		keyVal, genErr := randomString(24)
+		if genErr != nil {
+			return "", genErr
+		}
+		secret.Data[instanceSecretKey] = []byte(keyVal)
+		changed = true
+	}
+
+	if changed {
 		return secretName, r.Update(ctx, secret)
 	}
 	return secretName, nil
