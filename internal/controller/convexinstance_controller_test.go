@@ -396,17 +396,28 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
 
 			Eventually(func() bool {
-				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, &batchv1.Job{})
-				if !errors.IsNotFound(err) {
+				export := &batchv1.Job{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, export); err == nil {
+					if export.DeletionTimestamp == nil {
+						return false
+					}
+				} else if !errors.IsNotFound(err) {
 					return false
 				}
-				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, &batchv1.Job{})
+
+				importJob := &batchv1.Job{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, importJob); err == nil {
+					return importJob.DeletionTimestamp != nil
+				}
 				return errors.IsNotFound(err)
-			}, 60*time.Second, 200*time.Millisecond).Should(BeTrue())
+			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
 			Eventually(func() bool {
-				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, &corev1.PersistentVolumeClaim{})
+				pvc := &corev1.PersistentVolumeClaim{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, pvc); err == nil {
+					return pvc.DeletionTimestamp != nil
+				}
 				return errors.IsNotFound(err)
-			}, 60*time.Second, 200*time.Millisecond).Should(BeTrue())
+			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
 		})
 
 		It("should reconcile the dashboard deployment when enabled", func() {
