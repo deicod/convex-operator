@@ -122,19 +122,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	oldPhase := instance.Status.Phase
 
-	if instance.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
-			controllerutil.AddFinalizer(instance, finalizerName)
-			if err := r.Update(ctx, instance); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-	} else {
-		controllerutil.RemoveFinalizer(instance, finalizerName)
-		if err := r.Update(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	if stop, err := r.ensureFinalizer(ctx, instance); err != nil || stop {
+		return ctrl.Result{}, err
 	}
 
 	// Capture current backend/dashboard state to drive upgrade decisions.
@@ -165,91 +154,26 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage)
 
-	conds := []metav1.Condition{}
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
 
-	if err := r.reconcileConfigMap(ctx, instance); err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "ConfigMapError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ConfigMapError", err, conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()))
-	}
-	conds = append(conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
-
-	secretName, generatedSecretRV, err := r.reconcileSecrets(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "SecretError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "SecretError", err, conditionFalse(conditionSecrets, "SecretError", err.Error()))
-	}
-	conds = append(conds, conditionTrue(conditionSecrets, "Available", "Instance/admin secrets ensured"))
-
-	if err := r.reconcilePVC(ctx, instance); err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "PVCError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "PVCError", err, conditionFalse(conditionPVC, "PVCError", err.Error()))
-	}
-	if instance.Spec.Backend.Storage.Mode == storageModeExternal || !instance.Spec.Backend.Storage.PVC.Enabled {
-		conds = append(conds, conditionTrue(conditionPVC, "Skipped", "PVC not required"))
-	} else {
-		conds = append(conds, conditionTrue(conditionPVC, "Available", "PVC ensured"))
+	coreRes, resErr := r.reconcileCoreResources(ctx, instance, plan, extVersions)
+	if resErr != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, resErr.reason, resErr.err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, resErr.reason, resErr.err, resErr.cond)
 	}
 
-	serviceName, err := r.reconcileService(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "ServiceError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ServiceError", err, conditionFalse(conditionService, "ServiceError", err.Error()))
-	}
-	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
-
-	dashboardServiceName, dashboardSvcCond, err := r.reconcileDashboardService(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardServiceError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardServiceError", err, conditionFalse(conditionDashboardSvc, "DashboardServiceError", err.Error()))
-	}
-	conds = append(conds, dashboardSvcCond)
-
-	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, generatedSecretRV, plan.effectiveDashboardImage)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardError", err, conditionFalse(conditionDashboard, "DashboardError", err.Error()))
-	}
-	conds = append(conds, dashboardCond)
-
-	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, generatedSecretRV, plan.effectiveBackendImage, extVersions); err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
-	}
-
-	gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "GatewayError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "GatewayError", err, conditionFalse(conditionGateway, "GatewayError", err.Error()))
-	}
-	conds = append(conds, gatewayCond)
-
-	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashboardServiceName)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "HTTPRouteError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "HTTPRouteError", err, conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()))
-	}
-	conds = append(conds, routeCond)
-
-	backendReady, backendCond, err := r.backendStatus(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
-	}
-	conds = append(conds, backendCond)
-
-	status, err := r.handleUpgrade(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, conds)
+	status, err := r.handleUpgrade(ctx, instance, plan, coreRes.backendReady, coreRes.dashboardReady, coreRes.gatewayReady, coreRes.routeReady, coreRes.serviceName, coreRes.secretName, coreRes.conds)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
 	}
 
 	readyEvent := status.phase == phaseReady && oldPhase != phaseReady
-	if err := r.updateStatus(ctx, instance, status.phase, status.reason, serviceName, status.message, gatewayReady && routeReady, status.appliedHash, status.conditions...); err != nil {
+	if err := r.updateStatus(ctx, instance, status.phase, status.reason, coreRes.serviceName, status.message, coreRes.gatewayReady && coreRes.routeReady, status.appliedHash, status.conditions...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
 			return ctrl.Result{Requeue: true}, nil
@@ -260,7 +184,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
-	if status.phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) || !gatewayReady || !routeReady {
+	if status.phase != phaseReady || (!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) || !coreRes.gatewayReady || !coreRes.routeReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -329,6 +253,42 @@ type upgradeStatus struct {
 	message     string
 	appliedHash string
 	conditions  []metav1.Condition
+}
+
+type reconcileOutcome struct {
+	serviceName          string
+	dashboardServiceName string
+	dashboardReady       bool
+	gatewayReady         bool
+	routeReady           bool
+	backendReady         bool
+	secretName           string
+	secretRV             string
+	conds                []metav1.Condition
+}
+
+type resourceErr struct {
+	reason string
+	cond   metav1.Condition
+	err    error
+}
+
+// ensureFinalizer adds or removes the controller finalizer. It returns true when reconciliation should stop (during deletion) or when an update occurred.
+func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, error) {
+	if instance.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
+			controllerutil.AddFinalizer(instance, finalizerName)
+			if err := r.Update(ctx, instance); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	}
+	controllerutil.RemoveFinalizer(instance, finalizerName)
+	if err := r.Update(ctx, instance); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
@@ -1973,6 +1933,120 @@ func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dash
 		return "WaitingForBackend", "Waiting for backend readiness"
 	}
 	return "Ready", "Instance ready"
+}
+
+func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
+	result := reconcileOutcome{conds: []metav1.Condition{}}
+
+	if err := r.reconcileConfigMap(ctx, instance); err != nil {
+		return result, &resourceErr{
+			reason: "ConfigMapError",
+			cond:   conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()),
+			err:    err,
+		}
+	}
+	result.conds = append(result.conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
+
+	secretName, secretRV, err := r.reconcileSecrets(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "SecretError",
+			cond:   conditionFalse(conditionSecrets, "SecretError", err.Error()),
+			err:    err,
+		}
+	}
+	result.secretName = secretName
+	result.secretRV = secretRV
+	result.conds = append(result.conds, conditionTrue(conditionSecrets, "Available", "Instance/admin secrets ensured"))
+
+	if err := r.reconcilePVC(ctx, instance); err != nil {
+		return result, &resourceErr{
+			reason: "PVCError",
+			cond:   conditionFalse(conditionPVC, "PVCError", err.Error()),
+			err:    err,
+		}
+	}
+	if instance.Spec.Backend.Storage.Mode == storageModeExternal || !instance.Spec.Backend.Storage.PVC.Enabled {
+		result.conds = append(result.conds, conditionTrue(conditionPVC, "Skipped", "PVC not required"))
+	} else {
+		result.conds = append(result.conds, conditionTrue(conditionPVC, "Available", "PVC ensured"))
+	}
+
+	serviceName, err := r.reconcileService(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "ServiceError",
+			cond:   conditionFalse(conditionService, "ServiceError", err.Error()),
+			err:    err,
+		}
+	}
+	result.serviceName = serviceName
+	result.conds = append(result.conds, conditionTrue(conditionService, "Available", "Backend service ready"))
+
+	dashSvcName, dashSvcCond, err := r.reconcileDashboardService(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "DashboardServiceError",
+			cond:   conditionFalse(conditionDashboardSvc, "DashboardServiceError", err.Error()),
+			err:    err,
+		}
+	}
+	result.dashboardServiceName = dashSvcName
+	result.conds = append(result.conds, dashSvcCond)
+
+	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, secretRV, plan.effectiveDashboardImage)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "DashboardError",
+			cond:   conditionFalse(conditionDashboard, "DashboardError", err.Error()),
+			err:    err,
+		}
+	}
+	result.dashboardReady = dashboardReady
+	result.conds = append(result.conds, dashboardCond)
+
+	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, secretRV, plan.effectiveBackendImage, extVersions); err != nil {
+		return result, &resourceErr{
+			reason: "StatefulSetError",
+			cond:   conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()),
+			err:    err,
+		}
+	}
+
+	gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "GatewayError",
+			cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+			err:    err,
+		}
+	}
+	result.gatewayReady = gatewayReady
+	result.conds = append(result.conds, gatewayCond)
+
+	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "HTTPRouteError",
+			cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+			err:    err,
+		}
+	}
+	result.routeReady = routeReady
+	result.conds = append(result.conds, routeCond)
+
+	backendReady, backendCond, err := r.backendStatus(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "StatefulSetError",
+			cond:   conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()),
+			err:    err,
+		}
+	}
+	result.backendReady = backendReady
+	result.conds = append(result.conds, backendCond)
+
+	return result, nil
 }
 func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
