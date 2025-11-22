@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -175,6 +176,10 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
+	if phase != phaseReady {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -182,6 +187,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&convexv1alpha1.ConvexInstance{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&corev1.Service{}).
 		Named("convexinstance").
 		Complete(r)
 }

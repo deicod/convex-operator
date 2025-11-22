@@ -104,10 +104,11 @@ var _ = Describe("ConvexInstance Controller", func() {
 			By("Reconciling the created resource")
 			controllerReconciler, _ := newReconciler()
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 			By("ensuring status is initialized")
 			updated := &convexv1alpha1.ConvexInstance{}
