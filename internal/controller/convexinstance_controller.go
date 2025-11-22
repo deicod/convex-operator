@@ -72,6 +72,7 @@ const (
 	conditionUpgrade         = "UpgradeInProgress"
 	conditionExport          = "ExportCompleted"
 	conditionImport          = "ImportCompleted"
+	msgInstanceReady         = "Instance ready"
 	phasePending             = "Pending"
 	phaseReady               = "Ready"
 	phaseUpgrading           = "Upgrading"
@@ -1762,8 +1763,8 @@ func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, ba
 
 	if readyAll {
 		status.phase = phaseReady
-		status.reason = "Ready"
-		status.message = "Instance ready"
+		status.reason = conditionReady
+		status.message = msgInstanceReady
 		if plan.desiredHash != "" {
 			status.appliedHash = plan.desiredHash
 		}
@@ -1789,8 +1790,8 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 		}
 		if readyAll {
 			status.phase = phaseReady
-			status.reason = "Ready"
-			status.message = "Instance ready"
+			status.reason = conditionReady
+			status.message = msgInstanceReady
 			if plan.desiredHash != "" {
 				status.appliedHash = plan.desiredHash
 			}
