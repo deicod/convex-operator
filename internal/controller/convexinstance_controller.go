@@ -203,6 +203,9 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	if db.Engine != "sqlite" && db.SecretRef == "" {
 		return fmt.Errorf("db secret is required for engine %q", db.Engine)
 	}
+	if db.Engine != "sqlite" && db.URLKey == "" {
+		return fmt.Errorf("db urlKey is required for engine %q", db.Engine)
+	}
 	if ref := db.SecretRef; ref != "" {
 		secret := &corev1.Secret{}
 		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
@@ -217,6 +220,17 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	if instance.Spec.Backend.S3.Enabled {
 		if instance.Spec.Backend.S3.SecretRef == "" {
 			return fmt.Errorf("s3 secret is required when s3 is enabled")
+		}
+		requiredS3Keys := map[string]string{
+			"endpointKey":        instance.Spec.Backend.S3.EndpointKey,
+			"accessKeyIdKey":     instance.Spec.Backend.S3.AccessKeyIDKey,
+			"secretAccessKeyKey": instance.Spec.Backend.S3.SecretAccessKeyKey,
+			"bucketKey":          instance.Spec.Backend.S3.BucketKey,
+		}
+		for field, val := range requiredS3Keys {
+			if val == "" {
+				return fmt.Errorf("s3 %s is required when s3 is enabled", field)
+			}
 		}
 		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
 			secret := &corev1.Secret{}
