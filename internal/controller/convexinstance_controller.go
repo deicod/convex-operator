@@ -408,6 +408,9 @@ func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *c
 		needsUpdate = true
 	}
 	if desiredSC != nil && !storageClassEqual(desiredSC, pvc.Spec.StorageClassName) {
+		if pvc.Spec.StorageClassName != nil {
+			return fmt.Errorf("pvc storageClassName is immutable: current=%s desired=%s", ptr.Deref(pvc.Spec.StorageClassName, ""), ptr.Deref(desiredSC, ""))
+		}
 		pvc.Spec.StorageClassName = desiredSC
 		needsUpdate = true
 	}

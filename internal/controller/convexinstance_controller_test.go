@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -366,6 +367,40 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(pvcCond).NotTo(BeNil())
 			Expect(pvcCond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(pvcCond.Reason).To(Equal("Available"))
+		})
+
+		It("should surface an error when storageClassName changes after PVC creation", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.Storage.PVC.Enabled = true
+			instance.Spec.Backend.Storage.PVC.Size = resource.MustParse("20Gi")
+			instance.Spec.Backend.Storage.PVC.StorageClassName = "standard"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend-pvc", Namespace: "default"}, pvc)).To(Succeed())
+			Expect(ptr.Deref(pvc.Spec.StorageClassName, "")).To(Equal("standard"))
+			Expect(pvc.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("20Gi")))
+
+			// Change storageClassName and expect reconciliation to fail due to immutability.
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.Storage.PVC.StorageClassName = "fast"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("PVCError"))
+			Expect(readyCond.Message).To(ContainSubstring("storageClassName is immutable"))
 		})
 	})
 })
