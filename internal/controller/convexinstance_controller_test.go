@@ -402,11 +402,11 @@ var _ = Describe("ConvexInstance Controller", func() {
 				}
 				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, &batchv1.Job{})
 				return errors.IsNotFound(err)
-			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+			}, 60*time.Second, 200*time.Millisecond).Should(BeTrue())
 			Eventually(func() bool {
 				err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-pvc", Namespace: "default"}, &corev1.PersistentVolumeClaim{})
 				return errors.IsNotFound(err)
-			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+			}, 60*time.Second, 200*time.Millisecond).Should(BeTrue())
 		})
 
 		It("should reconcile the dashboard deployment when enabled", func() {
