@@ -186,6 +186,13 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if phase == phaseReady {
 		statusMsg = "Backend ready"
 	}
+	if instance.Spec.Dashboard.Enabled && !dashboardReady {
+		if phase == phaseReady {
+			phase = phasePending
+			conditionReason = "WaitingForDashboard"
+			statusMsg = "Waiting for dashboard readiness"
+		}
+	}
 	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, conds...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
