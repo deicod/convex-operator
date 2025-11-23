@@ -161,9 +161,9 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	desiredHash := desiredUpgradeHash(instance)
-	exportSucceeded, importSucceeded := r.observeUpgradeJobs(ctx, instance, desiredHash)
+	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
 
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded, desiredHash)
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
@@ -253,6 +253,8 @@ type upgradePlan struct {
 	upgradePlanned          bool
 	exportDone              bool
 	importDone              bool
+	exportFailed            bool
+	importFailed            bool
 	effectiveBackendImage   string
 	effectiveDashboardImage string
 	effectiveVersion        string
@@ -287,14 +289,19 @@ type resourceErr struct {
 	err    error
 }
 
-func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, instance *convexv1alpha1.ConvexInstance, desiredHash string) (bool, bool) {
+func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, instance *convexv1alpha1.ConvexInstance, desiredHash string) (bool, bool, bool, bool) {
 	exportSucceeded := false
 	importSucceeded := false
+	exportFailed := false
+	importFailed := false
 
 	expJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}, expJob); err == nil {
 		if expJob.Annotations != nil && expJob.Annotations[upgradeHashAnnotation] == desiredHash && jobSucceeded(expJob) {
 			exportSucceeded = true
+		}
+		if jobFailed(expJob) {
+			exportFailed = true
 		}
 	}
 	impJob := &batchv1.Job{}
@@ -302,8 +309,11 @@ func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, insta
 		if impJob.Annotations != nil && impJob.Annotations[upgradeHashAnnotation] == desiredHash && jobSucceeded(impJob) {
 			importSucceeded = true
 		}
+		if jobFailed(impJob) {
+			importFailed = true
+		}
 	}
-	return exportSucceeded, importSucceeded
+	return exportSucceeded, importSucceeded, exportFailed, importFailed
 }
 
 // ensureFinalizer adds or removes the controller finalizer. It returns true when reconciliation should stop (during deletion) or when an update occurred.
@@ -1845,11 +1855,15 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	if plan.importDone {
 		importCond = conditionTrue(conditionImport, "Completed", "Import job completed")
 	}
+	if plan.exportFailed {
+		exportCond = conditionFalse(conditionExport, "Failed", "Export job failed")
+	}
+	if plan.importFailed {
+		importCond = conditionFalse(conditionImport, "Failed", "Import job failed")
+	}
 
 	if !plan.upgradePending && !importPending {
-		if plan.exportDone || plan.importDone {
-			r.cleanupUpgradeArtifacts(ctx, instance)
-		}
+		r.cleanupUpgradeArtifacts(ctx, instance)
 		if readyAll {
 			status.phase = phaseReady
 			status.reason = conditionReady
@@ -2164,7 +2178,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
-func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded bool, desiredHash string) upgradePlan {
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {
 		strategy = upgradeStrategyInPlace
@@ -2180,6 +2194,12 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	}
 	if importSucceeded {
 		importDone = true
+	}
+	if exportFailed {
+		exportDone = false
+	}
+	if importFailed {
+		importDone = false
 	}
 	appliedHash := observedUpgradeHash(instance, backendExists, currentBackendImage, currentBackendVersion)
 	if appliedHash == "" && backendExists {
