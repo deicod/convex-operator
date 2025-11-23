@@ -2184,9 +2184,6 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 		if currentBackendImage != "" {
 			backendImage = currentBackendImage
 		}
-		if currentDashboardImage != "" {
-			dashboardImage = currentDashboardImage
-		}
 		if currentBackendVersion != "" {
 			backendVersion = currentBackendVersion
 		}
