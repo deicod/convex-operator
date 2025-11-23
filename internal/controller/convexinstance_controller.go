@@ -1768,6 +1768,12 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
 	exportCond := conditionFalse(conditionExport, "Pending", "Waiting for export job")
 	importCond := conditionFalse(conditionImport, "Pending", "Waiting for import job")
+	if plan.exportDone {
+		exportCond = conditionTrue(conditionExport, "Completed", "Export job completed")
+	}
+	if plan.importDone {
+		importCond = conditionTrue(conditionImport, "Completed", "Import job completed")
+	}
 
 	if !plan.upgradePending {
 		if plan.exportDone || plan.importDone {
