@@ -1276,6 +1276,13 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 		}
 		return false, nil
 	}
+
+	if job.Annotations == nil || job.Annotations[upgradeHashAnnotation] != upgradeHash {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
+	}
+
 	if jobFailed(job) {
 		return false, fmt.Errorf("import job %q failed", job.Name)
 	}
