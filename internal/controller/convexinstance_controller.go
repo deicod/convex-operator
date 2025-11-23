@@ -1505,7 +1505,6 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 	return configHash(
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,
-		instance.Spec.Dashboard.Image,
 	)
 }
 
@@ -1519,7 +1518,6 @@ func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, backendExists 
 	return configHash(
 		currentBackendVersion,
 		currentBackendImage,
-		currentDashboardImage,
 	)
 }
 
