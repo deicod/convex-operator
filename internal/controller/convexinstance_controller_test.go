@@ -381,6 +381,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			importJob := &batchv1.Job{}
 			Eventually(func() bool {
+				_, _ = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, importJob)
 				return err == nil
 			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
