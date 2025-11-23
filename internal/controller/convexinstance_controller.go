@@ -1795,11 +1795,15 @@ func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *
 	case upgradeStrategyExport:
 		return r.handleExportImport(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, status)
 	default:
-		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status), nil
+		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
+			if plan.exportDone || plan.importDone {
+				r.cleanupUpgradeArtifacts(ctx, instance)
+			}
+		}), nil
 	}
 }
 
-func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool, status upgradeStatus) upgradeStatus {
+func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool, status upgradeStatus, cleanup func()) upgradeStatus {
 	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
 	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
 	if plan.upgradePending {
@@ -1817,6 +1821,9 @@ func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, ba
 			status.appliedHash = plan.desiredHash
 		}
 		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+		if cleanup != nil {
+			cleanup()
+		}
 	} else {
 		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
 	}
