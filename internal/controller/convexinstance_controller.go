@@ -1785,6 +1785,7 @@ func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, ba
 
 func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, backendReady, dashboardReady, gatewayReady, routeReady bool, serviceName, secretName string, status upgradeStatus) (upgradeStatus, error) {
 	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
+	importPending := plan.exportDone && !plan.importDone
 
 	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
 	exportCond := conditionFalse(conditionExport, "Pending", "Waiting for export job")
@@ -1796,7 +1797,7 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 		importCond = conditionTrue(conditionImport, "Completed", "Import job completed")
 	}
 
-	if !plan.upgradePending {
+	if !plan.upgradePending && !importPending {
 		if plan.exportDone || plan.importDone {
 			r.cleanupUpgradeArtifacts(ctx, instance)
 		}
