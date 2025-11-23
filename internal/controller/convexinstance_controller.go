@@ -246,6 +246,7 @@ type upgradePlan struct {
 	desiredHash             string
 	appliedHash             string
 	upgradePending          bool
+	upgradePlanned          bool
 	exportDone              bool
 	importDone              bool
 	effectiveBackendImage   string
@@ -2125,11 +2126,12 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	}
 	upgradeAllowed := instance.Status.UpgradeHash != "" || instance.Status.Phase == phaseReady
 	upgradePending := backendExists && desiredHash != appliedHash && upgradeAllowed
+	upgradePlanned := backendExists && desiredHash != appliedHash
 
 	backendImage := instance.Spec.Backend.Image
 	dashboardImage := instance.Spec.Dashboard.Image
 	backendVersion := instance.Spec.Version
-	if strategy == upgradeStrategyExport && upgradePending && !exportDone {
+	if strategy == upgradeStrategyExport && backendExists && (!exportDone || upgradePending) {
 		if currentBackendImage != "" {
 			backendImage = currentBackendImage
 		}
@@ -2146,6 +2148,7 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 		desiredHash:             desiredHash,
 		appliedHash:             appliedHash,
 		upgradePending:          upgradePending,
+		upgradePlanned:          upgradePlanned,
 		exportDone:              exportDone,
 		importDone:              importDone,
 		effectiveBackendImage:   backendImage,
