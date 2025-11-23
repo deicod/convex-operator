@@ -87,6 +87,7 @@ const (
 	upgradeExportJobSuffix   = "upgrade-export"
 	upgradeImportJobSuffix   = "upgrade-import"
 	upgradePVCNameSuffix     = "upgrade-pvc"
+	upgradeHashAnnotation    = "convex.icod.de/upgrade-hash"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -161,7 +162,10 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	exportSucceeded, importSucceeded := r.observeUpgradeJobs(ctx, instance)
 
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded)
+	desiredHash := desiredUpgradeHash(instance)
+	exportSucceeded, importSucceeded := r.observeUpgradeJobs(ctx, instance, desiredHash)
+
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded, desiredHash)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
@@ -285,17 +289,21 @@ type resourceErr struct {
 	err    error
 }
 
-func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, bool) {
+func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, instance *convexv1alpha1.ConvexInstance, desiredHash string) (bool, bool) {
 	exportSucceeded := false
 	importSucceeded := false
 
 	expJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}, expJob); err == nil {
-		exportSucceeded = jobSucceeded(expJob) && expJob.OwnerReferences != nil && expJob.OwnerReferences[0].UID == instance.UID
+		if expJob.Annotations != nil && expJob.Annotations[upgradeHashAnnotation] == desiredHash && jobSucceeded(expJob) {
+			exportSucceeded = true
+		}
 	}
 	impJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: importJobName(instance), Namespace: instance.Namespace}, impJob); err == nil {
-		importSucceeded = jobSucceeded(impJob) && impJob.OwnerReferences != nil && impJob.OwnerReferences[0].UID == instance.UID
+		if impJob.Annotations != nil && impJob.Annotations[upgradeHashAnnotation] == desiredHash && jobSucceeded(impJob) {
+			importSucceeded = true
+		}
 	}
 	return exportSucceeded, importSucceeded
 }
@@ -1106,7 +1114,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 	return nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image string) (bool, error) {
+func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image, upgradeHash string) (bool, error) {
 	if image == "" {
 		image = instance.Spec.Backend.Image
 	}
@@ -1120,6 +1128,9 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      exportJobName(instance),
 				Namespace: instance.Namespace,
+				Annotations: map[string]string{
+					upgradeHashAnnotation: upgradeHash,
+				},
 			},
 			Spec: batchv1.JobSpec{
 				BackoffLimit:            ptr.To(int32(3)),
@@ -1178,6 +1189,18 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 		return false, nil
 	}
 
+	if job.Annotations == nil || job.Annotations[upgradeHashAnnotation] != upgradeHash {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
+	}
+
+	if job.Annotations == nil || job.Annotations[upgradeHashAnnotation] != upgradeHash {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
+	}
+
 	if jobFailed(job) {
 		return false, fmt.Errorf("export job %q failed", job.Name)
 	}
@@ -1187,7 +1210,7 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 	return false, nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image string) (bool, error) {
+func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image, upgradeHash string) (bool, error) {
 	if image == "" {
 		image = instance.Spec.Backend.Image
 	}
@@ -1201,6 +1224,9 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      importJobName(instance),
 				Namespace: instance.Namespace,
+				Annotations: map[string]string{
+					upgradeHashAnnotation: upgradeHash,
+				},
 			},
 			Spec: batchv1.JobSpec{
 				BackoffLimit:            ptr.To(int32(3)),
@@ -1844,7 +1870,7 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	}
 
 	if !exportComplete {
-		complete, err := r.reconcileExportJob(ctx, instance, serviceName, secretName, plan.currentBackendImage)
+		complete, err := r.reconcileExportJob(ctx, instance, serviceName, secretName, plan.currentBackendImage, plan.desiredHash)
 		if err != nil {
 			return status, err
 		}
@@ -1876,7 +1902,7 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	}
 
 	if !importComplete {
-		complete, err := r.reconcileImportJob(ctx, instance, serviceName, secretName, instance.Spec.Backend.Image)
+		complete, err := r.reconcileImportJob(ctx, instance, serviceName, secretName, instance.Spec.Backend.Image, plan.desiredHash)
 		if err != nil {
 			return status, err
 		}
@@ -2128,7 +2154,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
-func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded bool) upgradePlan {
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded bool, desiredHash string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {
 		strategy = upgradeStrategyInPlace
@@ -2141,7 +2167,6 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	if importSucceeded {
 		importDone = true
 	}
-	desiredHash := desiredUpgradeHash(instance)
 	appliedHash := observedUpgradeHash(instance, backendExists, currentBackendImage, currentBackendVersion)
 	if appliedHash == "" && backendExists {
 		appliedHash = configHash(currentBackendVersion, currentBackendImage, "")
