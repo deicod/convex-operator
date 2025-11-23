@@ -1564,17 +1564,8 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 	)
 }
 
-func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentBackendVersion string) string {
-	if instance.Status.UpgradeHash != "" {
-		return instance.Status.UpgradeHash
-	}
-	if !backendExists {
-		return ""
-	}
-	return configHash(
-		currentBackendVersion,
-		currentBackendImage,
-	)
+func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
+	return instance.Status.UpgradeHash
 }
 
 func backendVersionFromStatefulSet(sts *appsv1.StatefulSet) string {
@@ -2201,10 +2192,7 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	if importFailed {
 		importDone = false
 	}
-	appliedHash := observedUpgradeHash(instance, backendExists, currentBackendImage, currentBackendVersion)
-	if appliedHash == "" && backendExists {
-		appliedHash = configHash(currentBackendVersion, currentBackendImage, "")
-	}
+	appliedHash := observedUpgradeHash(instance)
 	upgradePlanned := backendExists && desiredHash != appliedHash
 	upgradePending := backendExists && (desiredHash != appliedHash || (exportDone && !importDone))
 
