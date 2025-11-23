@@ -2171,6 +2171,10 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	}
 	exportDone := conditionTrueForGeneration(instance.Status.Conditions, conditionExport, instance.GetGeneration())
 	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
+	if desiredHash != instance.Status.UpgradeHash {
+		exportDone = false
+		importDone = false
+	}
 	if exportSucceeded {
 		exportDone = true
 	}
