@@ -291,11 +291,11 @@ func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, insta
 
 	expJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}, expJob); err == nil {
-		exportSucceeded = jobSucceeded(expJob)
+		exportSucceeded = jobSucceeded(expJob) && expJob.OwnerReferences != nil && expJob.OwnerReferences[0].UID == instance.UID
 	}
 	impJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: importJobName(instance), Namespace: instance.Namespace}, impJob); err == nil {
-		importSucceeded = jobSucceeded(impJob)
+		importSucceeded = jobSucceeded(impJob) && impJob.OwnerReferences != nil && impJob.OwnerReferences[0].UID == instance.UID
 	}
 	return exportSucceeded, importSucceeded
 }
