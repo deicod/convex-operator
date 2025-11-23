@@ -255,6 +255,8 @@ type upgradePlan struct {
 	importDone              bool
 	exportFailed            bool
 	importFailed            bool
+	backendChanged          bool
+	dashboardChanged        bool
 	effectiveBackendImage   string
 	effectiveDashboardImage string
 	effectiveVersion        string
@@ -1561,11 +1563,21 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 	return configHash(
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,
+		instance.Spec.Dashboard.Image,
 	)
 }
 
-func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
-	return instance.Status.UpgradeHash
+func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string) string {
+	if instance.Status.UpgradeHash != "" {
+		return instance.Status.UpgradeHash
+	}
+	if currentBackendImage == "" && currentDashboardImage == "" {
+		return ""
+	}
+	if currentVersion == "" {
+		currentVersion = instance.Spec.Version
+	}
+	return configHash(currentVersion, currentBackendImage, currentDashboardImage)
 }
 
 func backendVersionFromStatefulSet(sts *appsv1.StatefulSet) string {
@@ -1804,7 +1816,14 @@ func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *
 
 	switch plan.strategy {
 	case upgradeStrategyExport:
-		return r.handleExportImport(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, status)
+		if plan.backendChanged {
+			return r.handleExportImport(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, status)
+		}
+		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
+			if plan.exportDone || plan.importDone {
+				r.cleanupUpgradeArtifacts(ctx, instance)
+			}
+		}), nil
 	default:
 		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
 			if plan.exportDone || plan.importDone {
@@ -2202,9 +2221,12 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	if importFailed {
 		importDone = false
 	}
-	appliedHash := observedUpgradeHash(instance)
+	appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage)
 	upgradePlanned := backendExists && desiredHash != appliedHash
 	upgradePending := backendExists && (desiredHash != appliedHash || (exportDone && !importDone))
+
+	backendChanged := backendExists && (instance.Spec.Backend.Image != currentBackendImage || instance.Spec.Version != currentBackendVersion)
+	dashboardChanged := instance.Spec.Dashboard.Image != "" && instance.Spec.Dashboard.Image != currentDashboardImage
 
 	backendImage := instance.Spec.Backend.Image
 	dashboardImage := instance.Spec.Dashboard.Image
@@ -2226,6 +2248,8 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 		upgradePlanned:          upgradePlanned,
 		exportDone:              exportDone,
 		importDone:              importDone,
+		backendChanged:          backendChanged,
+		dashboardChanged:        dashboardChanged,
 		effectiveBackendImage:   backendImage,
 		effectiveDashboardImage: dashboardImage,
 		effectiveVersion:        backendVersion,
