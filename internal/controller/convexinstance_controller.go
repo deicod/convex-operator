@@ -159,7 +159,9 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
 	}
 
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion)
+	exportSucceeded, importSucceeded := r.observeUpgradeJobs(ctx, instance)
+
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
@@ -281,6 +283,21 @@ type resourceErr struct {
 	reason string
 	cond   metav1.Condition
 	err    error
+}
+
+func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, bool) {
+	exportSucceeded := false
+	importSucceeded := false
+
+	expJob := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}, expJob); err == nil {
+		exportSucceeded = jobSucceeded(expJob)
+	}
+	impJob := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKey{Name: importJobName(instance), Namespace: instance.Namespace}, impJob); err == nil {
+		importSucceeded = jobSucceeded(impJob)
+	}
+	return exportSucceeded, importSucceeded
 }
 
 // ensureFinalizer adds or removes the controller finalizer. It returns true when reconciliation should stop (during deletion) or when an update occurred.
@@ -2115,20 +2132,26 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
-func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string) upgradePlan {
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded bool) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {
 		strategy = upgradeStrategyInPlace
 	}
 	exportDone := conditionTrueForGeneration(instance.Status.Conditions, conditionExport, instance.GetGeneration())
 	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
+	if exportSucceeded {
+		exportDone = true
+	}
+	if importSucceeded {
+		importDone = true
+	}
 	desiredHash := desiredUpgradeHash(instance)
 	appliedHash := observedUpgradeHash(instance, backendExists, currentBackendImage, currentBackendVersion)
 	if appliedHash == "" && backendExists {
 		appliedHash = configHash(currentBackendVersion, currentBackendImage, "")
 	}
 	upgradePlanned := backendExists && desiredHash != appliedHash
-	upgradePending := backendExists && (desiredHash != appliedHash || (exportDone && !importDone))
+	upgradePending := backendExists && (desiredHash != appliedHash || exportDone || importDone)
 
 	backendImage := instance.Spec.Backend.Image
 	dashboardImage := instance.Spec.Dashboard.Image
