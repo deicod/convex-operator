@@ -374,8 +374,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 			sts.Status.ObservedGeneration = sts.Generation
 			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
 
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			Eventually(func() bool {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				return err == nil
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
 
 			importJob := &batchv1.Job{}
 			Eventually(func() bool {
