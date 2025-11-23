@@ -2131,7 +2131,7 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	backendImage := instance.Spec.Backend.Image
 	dashboardImage := instance.Spec.Dashboard.Image
 	backendVersion := instance.Spec.Version
-	if strategy == upgradeStrategyExport && backendExists && (!exportDone || upgradePending) {
+	if strategy == upgradeStrategyExport && backendExists && !exportDone {
 		if currentBackendImage != "" {
 			backendImage = currentBackendImage
 		}
