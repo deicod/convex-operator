@@ -1162,7 +1162,9 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 	}
 
 	if jobFailed(job) {
-		return false, fmt.Errorf("export job %q failed", job.Name)
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
 	}
 	if jobSucceeded(job) {
 		return true, nil
@@ -1242,7 +1244,9 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 		return false, nil
 	}
 	if jobFailed(job) {
-		return false, fmt.Errorf("import job %q failed", job.Name)
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
 	}
 	if jobSucceeded(job) {
 		return true, nil
