@@ -154,8 +154,12 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if dashboardExists && len(existingDashboard.Spec.Template.Spec.Containers) > 0 {
 		currentDashboardImage = existingDashboard.Spec.Template.Spec.Containers[0].Image
 	}
+	currentBackendVersion := ""
+	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
+		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
+	}
 
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage)
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
@@ -246,8 +250,10 @@ type upgradePlan struct {
 	importDone              bool
 	effectiveBackendImage   string
 	effectiveDashboardImage string
+	effectiveVersion        string
 	currentBackendImage     string
 	currentDashboardImage   string
+	currentBackendVersion   string
 }
 
 type upgradeStatus struct {
@@ -362,7 +368,7 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	return result, nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance, version string) error {
 	cm := &corev1.ConfigMap{}
 	key := client.ObjectKey{Name: backendConfigMapName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, cm)
@@ -373,7 +379,7 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 				Namespace: instance.Namespace,
 			},
 			Data: map[string]string{
-				configMapKey: r.renderBackendConfig(instance),
+				configMapKey: r.renderBackendConfig(instance, version),
 			},
 		}
 		if err := controllerutil.SetControllerReference(instance, cm, r.Scheme); err != nil {
@@ -390,7 +396,7 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 		return err
 	}
 
-	expected := r.renderBackendConfig(instance)
+	expected := r.renderBackendConfig(instance, version)
 	if cm.Data == nil {
 		cm.Data = map[string]string{}
 	}
@@ -405,8 +411,8 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 	return nil
 }
 
-func (r *ConvexInstanceReconciler) renderBackendConfig(instance *convexv1alpha1.ConvexInstance) string {
-	return fmt.Sprintf("CONVEX_PORT=%d\nCONVEX_ENV=%s\nCONVEX_VERSION=%s\n", defaultBackendPort, instance.Spec.Environment, instance.Spec.Version)
+func (r *ConvexInstanceReconciler) renderBackendConfig(instance *convexv1alpha1.ConvexInstance, version string) string {
+	return fmt.Sprintf("CONVEX_PORT=%d\nCONVEX_ENV=%s\nCONVEX_VERSION=%s\n", defaultBackendPort, instance.Spec.Environment, version)
 }
 
 func configHash(content string, values ...string) string {
@@ -872,13 +878,16 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 	return false, conditionFalse(conditionDashboard, "Provisioning", "Waiting for dashboard rollout"), nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV, backendImage string, extVersions externalSecretVersions) error {
+func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV, backendImage, backendVersion string, extVersions externalSecretVersions) error {
 	sts := &appsv1.StatefulSet{}
 	key := client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, sts)
 	replicas := int32(1)
 	if backendImage == "" {
 		backendImage = instance.Spec.Backend.Image
+	}
+	if backendVersion == "" {
+		backendVersion = instance.Spec.Version
 	}
 	labels := map[string]string{
 		"app.kubernetes.io/name":      "convex-backend",
@@ -896,7 +905,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		},
 		{
 			Name:  "CONVEX_VERSION",
-			Value: instance.Spec.Version,
+			Value: backendVersion,
 		},
 		{
 			Name: "CONVEX_ADMIN_KEY",
@@ -990,7 +999,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			Labels: labels,
 			Annotations: map[string]string{
 				"convex.icod.de/config-hash": configHash(
-					r.renderBackendConfig(instance),
+					r.renderBackendConfig(instance, backendVersion),
 					generatedSecretRV,
 					extVersions.dbResourceVersion,
 					extVersions.s3ResourceVersion,
@@ -1499,7 +1508,7 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 	)
 }
 
-func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage string) string {
+func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string) string {
 	if instance.Status.UpgradeHash != "" {
 		return instance.Status.UpgradeHash
 	}
@@ -1507,10 +1516,19 @@ func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, backendExists 
 		return ""
 	}
 	return configHash(
-		instance.Spec.Version,
+		currentBackendVersion,
 		currentBackendImage,
 		currentDashboardImage,
 	)
+}
+
+func backendVersionFromStatefulSet(sts *appsv1.StatefulSet) string {
+	for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "CONVEX_VERSION" {
+			return env.Value
+		}
+	}
+	return ""
 }
 
 func conditionTrueForGeneration(conditions []metav1.Condition, condType string, generation int64) bool {
@@ -1983,7 +2001,7 @@ func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dash
 func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
 	result := reconcileOutcome{conds: []metav1.Condition{}}
 
-	if err := r.reconcileConfigMap(ctx, instance); err != nil {
+	if err := r.reconcileConfigMap(ctx, instance, plan.effectiveVersion); err != nil {
 		return result, &resourceErr{
 			reason: "ConfigMapError",
 			cond:   conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()),
@@ -2050,7 +2068,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	result.dashboardReady = dashboardReady
 	result.conds = append(result.conds, dashboardCond)
 
-	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, secretRV, plan.effectiveBackendImage, extVersions); err != nil {
+	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, secretRV, plan.effectiveBackendImage, plan.effectiveVersion, extVersions); err != nil {
 		return result, &resourceErr{
 			reason: "StatefulSetError",
 			cond:   conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()),
@@ -2093,7 +2111,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
-func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage string) upgradePlan {
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {
 		strategy = upgradeStrategyInPlace
@@ -2101,21 +2119,25 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	exportDone := conditionTrueForGeneration(instance.Status.Conditions, conditionExport, instance.GetGeneration())
 	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
 	desiredHash := desiredUpgradeHash(instance)
-	appliedHash := observedUpgradeHash(instance, backendExists, currentBackendImage, currentDashboardImage)
+	appliedHash := observedUpgradeHash(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion)
 	if appliedHash == "" && backendExists {
-		appliedHash = configHash(currentBackendImage, currentDashboardImage, "")
+		appliedHash = configHash(currentBackendVersion, currentBackendImage, currentDashboardImage)
 	}
 	upgradeAllowed := instance.Status.UpgradeHash != "" || instance.Status.Phase == phaseReady
 	upgradePending := backendExists && desiredHash != appliedHash && upgradeAllowed
 
 	backendImage := instance.Spec.Backend.Image
 	dashboardImage := instance.Spec.Dashboard.Image
+	backendVersion := instance.Spec.Version
 	if strategy == upgradeStrategyExport && upgradePending && !exportDone {
 		if currentBackendImage != "" {
 			backendImage = currentBackendImage
 		}
 		if currentDashboardImage != "" {
 			dashboardImage = currentDashboardImage
+		}
+		if currentBackendVersion != "" {
+			backendVersion = currentBackendVersion
 		}
 	}
 
@@ -2128,7 +2150,9 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 		importDone:              importDone,
 		effectiveBackendImage:   backendImage,
 		effectiveDashboardImage: dashboardImage,
+		effectiveVersion:        backendVersion,
 		currentBackendImage:     currentBackendImage,
 		currentDashboardImage:   currentDashboardImage,
+		currentBackendVersion:   currentBackendVersion,
 	}
 }
