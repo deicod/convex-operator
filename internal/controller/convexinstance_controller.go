@@ -160,8 +160,6 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
 	}
 
-	exportSucceeded, importSucceeded := r.observeUpgradeJobs(ctx, instance)
-
 	desiredHash := desiredUpgradeHash(instance)
 	exportSucceeded, importSucceeded := r.observeUpgradeJobs(ctx, instance, desiredHash)
 
