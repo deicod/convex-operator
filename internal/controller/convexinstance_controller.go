@@ -1768,11 +1768,21 @@ func httpRouteSpecEqual(a, b gatewayv1.HTTPRouteSpec) bool {
 }
 
 func jobSucceeded(job *batchv1.Job) bool {
-	return job.Status.Succeeded > 0
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func jobFailed(job *batchv1.Job) bool {
-	return job.Status.Failed > 0
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *ConvexInstanceReconciler) backendHasReadyReplica(ctx context.Context, instance *convexv1alpha1.ConvexInstance) bool {
