@@ -1193,12 +1193,6 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 		return false, nil
 	}
 
-	if job.Annotations == nil || job.Annotations[upgradeHashAnnotation] != upgradeHash {
-		propagation := metav1.DeletePropagationBackground
-		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
-		return false, nil
-	}
-
 	if jobFailed(job) {
 		return false, fmt.Errorf("export job %q failed", job.Name)
 	}
