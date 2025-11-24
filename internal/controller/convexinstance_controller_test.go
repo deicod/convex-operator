@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -1120,5 +1121,107 @@ var _ = Describe("upgrade plan helpers", func() {
 		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, "", instance.Spec.Version, false, false, false, false, desiredHash)
 		Expect(plan.upgradePending).To(BeFalse())
 		Expect(plan.upgradePlanned).To(BeFalse())
+	})
+})
+
+var _ = Describe("config and secret helpers", func() {
+	ctx := context.Background()
+
+	It("renders backend env vars including DB and S3 secrets", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "env-vars",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:    "postgres",
+						SecretRef: "db-secret",
+						URLKey:    "url",
+					},
+					S3: convexv1alpha1.BackendS3Spec{
+						Enabled:            true,
+						SecretRef:          "s3-secret",
+						EndpointKey:        "endpoint",
+						AccessKeyIDKey:     "accessKey",
+						SecretAccessKeyKey: "secretAccessKey",
+						BucketKey:          "bucket",
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "env-vars.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+			dbResourceVersion: "db-rv",
+			s3ResourceVersion: "s3-rv",
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		Expect(getEnv("CONVEX_PORT")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_PORT").Value).To(Equal(fmt.Sprintf("%d", defaultBackendPort)))
+		Expect(getEnv("CONVEX_ENV")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_ENV").Value).To(Equal("prod"))
+		Expect(getEnv("CONVEX_VERSION")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_VERSION").Value).To(Equal("9.9.9"))
+
+		adminKeyEnv := getEnv("CONVEX_ADMIN_KEY")
+		Expect(adminKeyEnv).NotTo(BeNil())
+		Expect(adminKeyEnv.ValueFrom).NotTo(BeNil())
+		Expect(adminKeyEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Name).To(Equal(generatedSecretName(instance)))
+		Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Key).To(Equal(adminKeyKey))
+
+		instanceSecretEnv := getEnv("CONVEX_INSTANCE_SECRET")
+		Expect(instanceSecretEnv).NotTo(BeNil())
+		Expect(instanceSecretEnv.ValueFrom).NotTo(BeNil())
+		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Name).To(Equal(generatedSecretName(instance)))
+		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Key).To(Equal(instanceSecretKey))
+
+		dbEnv := getEnv("CONVEX_DB_URL")
+		Expect(dbEnv).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("db-secret"))
+		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
+
+		Expect(getEnv("CONVEX_S3_ENDPOINT")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("accessKey"))
+		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("secretAccessKey"))
+		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
 	})
 })
