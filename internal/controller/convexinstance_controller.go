@@ -1574,10 +1574,14 @@ func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
 }
 
 func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
+	dashboardImage := instance.Spec.Dashboard.Image
+	if !instance.Spec.Dashboard.Enabled {
+		dashboardImage = ""
+	}
 	return configHash(
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,
-		instance.Spec.Dashboard.Image,
+		dashboardImage,
 	)
 }
 

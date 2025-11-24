@@ -992,4 +992,34 @@ var _ = Describe("upgrade plan helpers", func() {
 		Expect(plan.upgradePending).To(BeTrue())
 		Expect(plan.currentBackendImage).To(Equal(currentBackendImage))
 	})
+
+	It("does not flag upgrades when the dashboard is disabled", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "no-dashboard",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Version: "1.0.0",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine: "sqlite",
+					},
+				},
+				Dashboard: convexv1alpha1.DashboardSpec{
+					Enabled: false,
+					Image:   "ghcr.io/get-convex/convex-dashboard:1.0.0",
+				},
+			},
+		}
+
+		desiredHash := desiredUpgradeHash(instance)
+		appliedHash := observedUpgradeHash(instance, instance.Spec.Version, instance.Spec.Backend.Image, "")
+		Expect(desiredHash).To(Equal(appliedHash))
+
+		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, "", instance.Spec.Version, false, false, false, false, desiredHash)
+		Expect(plan.upgradePending).To(BeFalse())
+		Expect(plan.upgradePlanned).To(BeFalse())
+	})
 })
