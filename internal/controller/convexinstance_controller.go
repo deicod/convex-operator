@@ -1932,6 +1932,7 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	if !exportComplete {
 		complete, err := r.reconcileExportJob(ctx, instance, serviceName, secretName, plan.currentBackendImage, plan.desiredHash)
 		if err != nil {
+			status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
 			return status, err
 		}
 		exportComplete = complete
@@ -1964,6 +1965,7 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 	if !importComplete {
 		complete, err := r.reconcileImportJob(ctx, instance, serviceName, secretName, instance.Spec.Backend.Image, plan.desiredHash)
 		if err != nil {
+			status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
 			return status, err
 		}
 		importComplete = complete
