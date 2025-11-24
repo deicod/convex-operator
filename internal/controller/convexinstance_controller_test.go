@@ -359,6 +359,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			makeBackendReady()
 			exportJob.Status.Succeeded = 1
+			exportJob.Status.Conditions = []batchv1.JobCondition{{
+				Type:   batchv1.JobComplete,
+				Status: corev1.ConditionTrue,
+			}}
 			Expect(k8sClient.Status().Update(ctx, exportJob)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -386,6 +390,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 				return err == nil
 			}, 15*time.Second, 200*time.Millisecond).Should(BeTrue())
 			importJob.Status.Succeeded = 1
+			importJob.Status.Conditions = []batchv1.JobCondition{{
+				Type:   batchv1.JobComplete,
+				Status: corev1.ConditionTrue,
+			}}
 			Expect(k8sClient.Status().Update(ctx, importJob)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
