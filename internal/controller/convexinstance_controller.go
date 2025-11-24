@@ -1134,6 +1134,41 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 		if !errors.IsNotFound(err) {
 			return false, err
 		}
+		podSpec := corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyOnFailure,
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: upgradePVCName(instance),
+					},
+				},
+			}},
+			Containers: []corev1.Container{{
+				Name:    "export",
+				Image:   image,
+				Command: []string{"/bin/sh", "-c", "convex export --url $API_URL --admin-key $ADMIN_KEY --output /data/export.tar.gz"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "API_URL",
+						Value: backendServiceURL(instance, serviceName),
+					},
+					{
+						Name: "ADMIN_KEY",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+								Key:                  adminKeyKey,
+							},
+						},
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "data",
+					MountPath: "/data",
+				}},
+			}},
+		}
 		job = &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      exportJobName(instance),
@@ -1152,41 +1187,7 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 							"app.kubernetes.io/component": "upgrade-export",
 						},
 					},
-					Spec: corev1.PodSpec{
-						RestartPolicy: corev1.RestartPolicyOnFailure,
-						Volumes: []corev1.Volume{{
-							Name: "data",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: upgradePVCName(instance),
-								},
-							},
-						}},
-						Containers: []corev1.Container{{
-							Name:    "export",
-							Image:   image,
-							Command: []string{"/bin/sh", "-c", "convex export --url $API_URL --admin-key $ADMIN_KEY --output /data/export.tar.gz"},
-							Env: []corev1.EnvVar{
-								{
-									Name:  "API_URL",
-									Value: backendServiceURL(instance, serviceName),
-								},
-								{
-									Name: "ADMIN_KEY",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-											Key:                  adminKeyKey,
-										},
-									},
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{{
-								Name:      "data",
-								MountPath: "/data",
-							}},
-						}},
-					},
+					Spec: podSpec,
 				},
 			},
 		}
@@ -1226,6 +1227,41 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 		if !errors.IsNotFound(err) {
 			return false, err
 		}
+		podSpec := corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyOnFailure,
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: upgradePVCName(instance),
+					},
+				},
+			}},
+			Containers: []corev1.Container{{
+				Name:    "import",
+				Image:   image,
+				Command: []string{"/bin/sh", "-c", "convex import --url $API_URL --admin-key $ADMIN_KEY --input /data/export.tar.gz"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "API_URL",
+						Value: backendServiceURL(instance, serviceName),
+					},
+					{
+						Name: "ADMIN_KEY",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+								Key:                  adminKeyKey,
+							},
+						},
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "data",
+					MountPath: "/data",
+				}},
+			}},
+		}
 		job = &batchv1.Job{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      importJobName(instance),
@@ -1244,41 +1280,7 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 							"app.kubernetes.io/component": "upgrade-import",
 						},
 					},
-					Spec: corev1.PodSpec{
-						RestartPolicy: corev1.RestartPolicyOnFailure,
-						Volumes: []corev1.Volume{{
-							Name: "data",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: upgradePVCName(instance),
-								},
-							},
-						}},
-						Containers: []corev1.Container{{
-							Name:    "import",
-							Image:   image,
-							Command: []string{"/bin/sh", "-c", "convex import --url $API_URL --admin-key $ADMIN_KEY --input /data/export.tar.gz"},
-							Env: []corev1.EnvVar{
-								{
-									Name:  "API_URL",
-									Value: backendServiceURL(instance, serviceName),
-								},
-								{
-									Name: "ADMIN_KEY",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-											Key:                  adminKeyKey,
-										},
-									},
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{{
-								Name:      "data",
-								MountPath: "/data",
-							}},
-						}},
-					},
+					Spec: podSpec,
 				},
 			},
 		}
