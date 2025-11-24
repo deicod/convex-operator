@@ -1844,8 +1844,9 @@ func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *
 
 func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool, status upgradeStatus, cleanup func()) upgradeStatus {
 	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
+	rolloutPending := plan.desiredHash != "" && plan.desiredHash == plan.appliedHash && !readyAll
 	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
-	if plan.upgradePending {
+	if plan.upgradePending || rolloutPending {
 		status.phase = phaseUpgrading
 		status.reason = conditionRollingUpdate
 		status.message = "Rolling out new version"

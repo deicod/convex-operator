@@ -334,6 +334,48 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
+		It("keeps UpgradeInProgress true until the new rollout is ready", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+			makeGatewayReady()
+			makeRouteAccepted()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			current := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			current.Spec.Version = testVersionV2
+			current.Spec.Backend.Image = testBackendImageV2
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			sts.Spec.Template.Spec.Containers[0].Image = testBackendImageV2
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+			sts.Status.ReadyReplicas = 0
+			sts.Status.Replicas = 1
+			sts.Status.UpdatedReplicas = 0
+			sts.Status.ObservedGeneration = sts.Generation
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			pending := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, pending)).To(Succeed())
+			Expect(pending.Status.Phase).To(Equal("Upgrading"))
+			upgradeCond := meta.FindStatusCondition(pending.Status.Conditions, "UpgradeInProgress")
+			Expect(upgradeCond).NotTo(BeNil())
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionTrue))
+		})
+
 		It("should orchestrate export/import upgrades", func() {
 			controllerReconciler, _ := newReconciler()
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
