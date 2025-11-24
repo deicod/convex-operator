@@ -1816,7 +1816,7 @@ func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *
 
 	switch plan.strategy {
 	case upgradeStrategyExport:
-		if plan.backendChanged {
+		if plan.backendChanged || plan.exportDone || plan.exportFailed || plan.importDone || plan.importFailed {
 			return r.handleExportImport(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, status)
 		}
 		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
