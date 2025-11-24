@@ -205,7 +205,7 @@
   ### M5: Testing, CI, Docs
 
   - [ ] Add unit tests for config/secrets rendering helpers, ensuring env var construction matches Convex expectations.
-  - [ ] Add envtest suites covering create/update/delete happy paths, missing Secret failures, dashboard toggle, Gateway/HTTPRoute reconciliation, and upgrade flows (mocked Jobs).
+  - [x] Add envtest suites covering create/update/delete happy paths, missing Secret failures, dashboard toggle, Gateway/HTTPRoute reconciliation, and upgrade flows (mocked Jobs).
   - [ ] Integrate golangci-lint, go fmt, go vet, and make test targets into CI (GitHub Actions or equivalent), with caching to speed runs.
   - [ ] Write developer guide for local kind/minikube deployment, including how to apply sample dev/prod ConvexInstance manifests and verify readiness via kubectl and curl against Gateway host (with example
     values).

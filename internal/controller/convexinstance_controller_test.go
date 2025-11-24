@@ -1225,3 +1225,427 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
 	})
 })
+
+var _ = Describe("envtest lifecycle suites", func() {
+	ctx := context.Background()
+	newReconciler := func() *ConvexInstanceReconciler {
+		return &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+	}
+
+	makeBackendReady := func(name string) {
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("%s-backend", name), Namespace: "default"}, sts)).To(Succeed())
+		sts.Status.ReadyReplicas = 1
+		sts.Status.Replicas = 1
+		sts.Status.UpdatedReplicas = 1
+		sts.Status.ObservedGeneration = sts.Generation
+		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+	}
+	makeDashboardReady := func(name string) {
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("%s-dashboard", name), Namespace: "default"}, dep)).To(Succeed())
+		dep.Status.Replicas = 1
+		dep.Status.UpdatedReplicas = 1
+		dep.Status.ReadyReplicas = 1
+		dep.Status.ObservedGeneration = dep.Generation
+		Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+	}
+	makeGatewayReady := func(name string) {
+		gw := &gatewayv1.Gateway{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("%s-gateway", name), Namespace: "default"}, gw)).To(Succeed())
+		gw.Status.Conditions = []metav1.Condition{{
+			Type:               string(gatewayv1.GatewayConditionReady),
+			Status:             metav1.ConditionTrue,
+			Reason:             "Ready",
+			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: gw.GetGeneration(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
+	}
+	makeRouteAccepted := func(name string) {
+		route := &gatewayv1.HTTPRoute{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("%s-route", name), Namespace: "default"}, route)).To(Succeed())
+		route.Status.Parents = []gatewayv1.RouteParentStatus{{
+			ParentRef: gatewayv1.ParentReference{
+				Name: gatewayv1.ObjectName(fmt.Sprintf("%s-gateway", name)),
+			},
+			ControllerName: gatewayv1.GatewayController("test.example/controller"),
+			Conditions: []metav1.Condition{{
+				Type:               string(gatewayv1.RouteConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				Reason:             "Accepted",
+				Message:            "Attached to listener",
+				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: route.GetGeneration(),
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
+	}
+
+	It("handles create/update/delete happy paths", func() {
+		name := types.NamespacedName{Name: "lifecycle-env", Namespace: "default"}
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name.Name,
+				Namespace: name.Namespace,
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "dev",
+				Version:     "1.0.0",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine: "sqlite",
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "lifecycle.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := newReconciler()
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "lifecycle-env-backend", Namespace: "default"}, sts)).To(Succeed())
+
+		// Trigger an upgrade by bumping version and image.
+		Expect(k8sClient.Get(ctx, name, instance)).To(Succeed())
+		instance.Spec.Version = "1.1.0"
+		instance.Spec.Backend.Image = "ghcr.io/get-convex/convex-backend:1.1.0"
+		Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &convexv1alpha1.ConvexInstance{}
+		Expect(k8sClient.Get(ctx, name, updated)).To(Succeed())
+		upgradeCond := meta.FindStatusCondition(updated.Status.Conditions, "UpgradeInProgress")
+		Expect(upgradeCond).NotTo(BeNil())
+
+		// Delete the instance and ensure owned resources are cleaned up.
+		Expect(k8sClient.Delete(ctx, instance)).To(Succeed())
+		Eventually(func() bool {
+			_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+			err := k8sClient.Get(ctx, name, &convexv1alpha1.ConvexInstance{})
+			if errors.IsNotFound(err) {
+				return true
+			}
+			return err == nil
+		}, 20*time.Second, 200*time.Millisecond).Should(BeTrue())
+	})
+
+	It("surfaces missing secret validation failures", func() {
+		name := types.NamespacedName{Name: "missing-secret", Namespace: "default"}
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name.Name,
+				Namespace: name.Namespace,
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "dev",
+				Version:     "1.0.0",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:    "postgres",
+						SecretRef: "absent-secret",
+						URLKey:    "url",
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "missing.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := newReconciler()
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).To(HaveOccurred())
+
+		updated := &convexv1alpha1.ConvexInstance{}
+		Expect(k8sClient.Get(ctx, name, updated)).To(Succeed())
+		readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+		Expect(readyCond).NotTo(BeNil())
+		Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+	})
+
+	It("covers export/import upgrade flow with mocked jobs", func() {
+		name := types.NamespacedName{Name: "mock-upgrade", Namespace: "default"}
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name.Name,
+				Namespace: name.Namespace,
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "dev",
+				Version:     "1.0.0",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine: "sqlite",
+					},
+				},
+				Maintenance: convexv1alpha1.MaintenanceSpec{
+					UpgradeStrategy: upgradeStrategyExport,
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "mock-upgrade.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := newReconciler()
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		makeBackendReady(name.Name)
+		makeDashboardReady(name.Name)
+		makeGatewayReady(name.Name)
+		makeRouteAccepted(name.Name)
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Trigger export/import upgrade.
+		Expect(k8sClient.Get(ctx, name, instance)).To(Succeed())
+		instance.Spec.Backend.Image = "ghcr.io/get-convex/convex-backend:2.0.0"
+		instance.Spec.Version = "2.0.0"
+		Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		desiredHash := desiredUpgradeHash(instance)
+
+		exportJob := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: "mock-upgrade-upgrade-export", Namespace: "default"}, exportJob); errors.IsNotFound(err) {
+			exportJob = &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "mock-upgrade-upgrade-export",
+					Namespace: "default",
+					Annotations: map[string]string{
+						upgradeHashAnnotation: desiredHash,
+					},
+				},
+				Spec: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							RestartPolicy: corev1.RestartPolicyNever,
+							Containers: []corev1.Container{{
+								Name:  "export",
+								Image: "busybox",
+							}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, exportJob)).To(Succeed())
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+		}
+		now := metav1.Now()
+		exportJob.Status.Succeeded = 1
+		exportJob.Status.StartTime = &now
+		exportJob.Status.CompletionTime = &now
+		exportJob.Status.Conditions = []batchv1.JobCondition{{
+			Type:               batchv1.JobComplete,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		}, {
+			Type:               condSuccessCriteriaMet,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		}}
+		Expect(k8sClient.Status().Update(ctx, exportJob)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mock-upgrade-backend", Namespace: "default"}, sts)).To(Succeed())
+		sts.Status.ReadyReplicas = 1
+		sts.Status.Replicas = 1
+		sts.Status.UpdatedReplicas = 1
+		sts.Status.ObservedGeneration = sts.Generation
+		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+		importJob := &batchv1.Job{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: "mock-upgrade-upgrade-import", Namespace: "default"}, importJob); errors.IsNotFound(err) {
+			importJob = &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "mock-upgrade-upgrade-import",
+					Namespace: "default",
+					Annotations: map[string]string{
+						upgradeHashAnnotation: desiredHash,
+					},
+				},
+				Spec: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							RestartPolicy: corev1.RestartPolicyNever,
+							Containers: []corev1.Container{{
+								Name:  "import",
+								Image: "busybox",
+							}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, importJob)).To(Succeed())
+		} else {
+			Expect(err).NotTo(HaveOccurred())
+		}
+		now = metav1.Now()
+		importJob.Status.Succeeded = 1
+		importJob.Status.StartTime = &now
+		importJob.Status.CompletionTime = &now
+		importJob.Status.Conditions = []batchv1.JobCondition{{
+			Type:               batchv1.JobComplete,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		}, {
+			Type:               condSuccessCriteriaMet,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		}}
+		Expect(k8sClient.Status().Update(ctx, importJob)).To(Succeed())
+
+		Eventually(func() string {
+			_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+			final := &convexv1alpha1.ConvexInstance{}
+			if err := k8sClient.Get(ctx, name, final); err != nil {
+				return ""
+			}
+			return final.Status.Phase
+		}, 20*time.Second, 200*time.Millisecond).Should(Equal("Ready"))
+
+		final := &convexv1alpha1.ConvexInstance{}
+		Expect(k8sClient.Get(ctx, name, final)).To(Succeed())
+		upgradeCond := meta.FindStatusCondition(final.Status.Conditions, "UpgradeInProgress")
+		Expect(upgradeCond).NotTo(BeNil())
+		Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
+	})
+})
+
+var _ = Describe("config and secret helpers", func() {
+	ctx := context.Background()
+
+	It("renders backend env vars including DB and S3 secrets", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "env-vars",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:    "postgres",
+						SecretRef: "db-secret",
+						URLKey:    "url",
+					},
+					S3: convexv1alpha1.BackendS3Spec{
+						Enabled:            true,
+						SecretRef:          "s3-secret",
+						EndpointKey:        "endpoint",
+						AccessKeyIDKey:     "accessKey",
+						SecretAccessKeyKey: "secretAccessKey",
+						BucketKey:          "bucket",
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "env-vars.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+			dbResourceVersion: "db-rv",
+			s3ResourceVersion: "s3-rv",
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		Expect(getEnv("CONVEX_PORT")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_PORT").Value).To(Equal(fmt.Sprintf("%d", defaultBackendPort)))
+		Expect(getEnv("CONVEX_ENV")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_ENV").Value).To(Equal("prod"))
+		Expect(getEnv("CONVEX_VERSION")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_VERSION").Value).To(Equal("9.9.9"))
+
+		adminKeyEnv := getEnv("CONVEX_ADMIN_KEY")
+		Expect(adminKeyEnv).NotTo(BeNil())
+		Expect(adminKeyEnv.ValueFrom).NotTo(BeNil())
+		Expect(adminKeyEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Name).To(Equal(generatedSecretName(instance)))
+		Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Key).To(Equal(adminKeyKey))
+
+		instanceSecretEnv := getEnv("CONVEX_INSTANCE_SECRET")
+		Expect(instanceSecretEnv).NotTo(BeNil())
+		Expect(instanceSecretEnv.ValueFrom).NotTo(BeNil())
+		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Name).To(Equal(generatedSecretName(instance)))
+		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Key).To(Equal(instanceSecretKey))
+
+		dbEnv := getEnv("CONVEX_DB_URL")
+		Expect(dbEnv).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("db-secret"))
+		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
+
+		Expect(getEnv("CONVEX_S3_ENDPOINT")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("accessKey"))
+		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("secretAccessKey"))
+		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+	})
+})
