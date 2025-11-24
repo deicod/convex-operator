@@ -1147,7 +1147,7 @@ func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, insta
 			return false, err
 		}
 		podSpec := corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyOnFailure,
+			RestartPolicy: corev1.RestartPolicyNever,
 			Volumes: []corev1.Volume{{
 				Name: "data",
 				VolumeSource: corev1.VolumeSource{
@@ -1240,7 +1240,7 @@ func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, insta
 			return false, err
 		}
 		podSpec := corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyOnFailure,
+			RestartPolicy: corev1.RestartPolicyNever,
 			Volumes: []corev1.Volume{{
 				Name: "data",
 				VolumeSource: corev1.VolumeSource{
