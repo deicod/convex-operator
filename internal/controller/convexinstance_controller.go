@@ -1582,9 +1582,6 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 }
 
 func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string) string {
-	if instance.Status.UpgradeHash != "" {
-		return instance.Status.UpgradeHash
-	}
 	if currentBackendImage == "" && currentDashboardImage == "" {
 		return ""
 	}

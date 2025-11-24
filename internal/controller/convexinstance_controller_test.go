@@ -912,4 +912,40 @@ var _ = Describe("upgrade plan helpers", func() {
 		_, _, exportFailed, _ = controllerReconciler.observeUpgradeJobs(ctx, instance, desiredHash)
 		Expect(exportFailed).To(BeTrue())
 	})
+
+	It("derives applied upgrade hash from observed images even when status is set", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hash-drift",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Version: "2.0.0",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:2.0.0",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine: "sqlite",
+					},
+				},
+				Dashboard: convexv1alpha1.DashboardSpec{
+					Image: "ghcr.io/get-convex/convex-dashboard:2.0.0",
+				},
+			},
+		}
+		desiredHash := desiredUpgradeHash(instance)
+		instance.Status.UpgradeHash = desiredHash
+
+		currentBackendImage := "ghcr.io/get-convex/convex-backend:1.0.0"
+		currentDashboardImage := "ghcr.io/get-convex/convex-dashboard:1.0.0"
+		currentBackendVersion := "1.0.0"
+
+		appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage)
+		Expect(appliedHash).To(Equal(configHash(currentBackendVersion, currentBackendImage, currentDashboardImage)))
+		Expect(appliedHash).NotTo(Equal(desiredHash))
+
+		plan := buildUpgradePlan(instance, true, currentBackendImage, currentDashboardImage, currentBackendVersion, false, false, false, false, desiredHash)
+		Expect(plan.upgradePlanned).To(BeTrue())
+		Expect(plan.upgradePending).To(BeTrue())
+		Expect(plan.currentBackendImage).To(Equal(currentBackendImage))
+	})
 })
