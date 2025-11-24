@@ -40,6 +40,11 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+const (
+	condSuccessCriteriaMet = batchv1.JobConditionType("SuccessCriteriaMet")
+	condFailureTarget      = batchv1.JobConditionType("FailureTarget")
+)
+
 var _ = Describe("ConvexInstance Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
@@ -369,7 +374,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 				LastTransitionTime: now,
 				LastProbeTime:      now,
 			}, {
-				Type:               batchv1.JobSuccessCriteriaMet,
+				Type:               condSuccessCriteriaMet,
 				Status:             corev1.ConditionTrue,
 				LastTransitionTime: now,
 				LastProbeTime:      now,
@@ -410,7 +415,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 				LastTransitionTime: now,
 				LastProbeTime:      now,
 			}, {
-				Type:               batchv1.JobSuccessCriteriaMet,
+				Type:               condSuccessCriteriaMet,
 				Status:             corev1.ConditionTrue,
 				LastTransitionTime: now,
 				LastProbeTime:      now,
@@ -888,7 +893,7 @@ var _ = Describe("upgrade plan helpers", func() {
 			LastTransitionTime: metav1.Now(),
 			LastProbeTime:      metav1.Now(),
 		}, {
-			Type:               batchv1.JobFailureTarget,
+			Type:               condFailureTarget,
 			Status:             corev1.ConditionTrue,
 			LastTransitionTime: metav1.Now(),
 			LastProbeTime:      metav1.Now(),
