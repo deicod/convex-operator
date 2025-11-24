@@ -1821,7 +1821,7 @@ func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *
 		phase:       phasePending,
 		reason:      "WaitingForBackend",
 		message:     "Waiting for backend readiness",
-		appliedHash: plan.appliedHash,
+		appliedHash: "",
 		conditions:  append([]metav1.Condition{}, baseConds...),
 	}
 

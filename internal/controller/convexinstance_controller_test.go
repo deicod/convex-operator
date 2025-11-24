@@ -348,6 +348,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			current := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			oldHash := current.Status.UpgradeHash
 			current.Spec.Version = testVersionV2
 			current.Spec.Backend.Image = testBackendImageV2
 			Expect(k8sClient.Update(ctx, current)).To(Succeed())
@@ -374,6 +375,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			upgradeCond := meta.FindStatusCondition(pending.Status.Conditions, "UpgradeInProgress")
 			Expect(upgradeCond).NotTo(BeNil())
 			Expect(upgradeCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(pending.Status.UpgradeHash).To(Equal(oldHash))
 		})
 
 		It("should orchestrate export/import upgrades", func() {
