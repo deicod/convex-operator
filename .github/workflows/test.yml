@@ -16,8 +16,13 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
 
-      - name: Running Tests
+      - name: Lint, vet, fmt, and test
         run: |
-          go mod tidy
+          go mod download
+          make fmt
+          make vet
+          make lint
           make test
