@@ -479,7 +479,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
-		It("keeps upgrade marked in progress after import if the backend is unready", func() {
+		It("does not mark upgrade in progress once export/import are done and backend becomes unready", func() {
 			controllerReconciler, _ := newReconciler()
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
@@ -572,10 +572,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			pending := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, pending)).To(Succeed())
-			Expect(pending.Status.Phase).To(Equal("Upgrading"))
+			Expect(pending.Status.Phase).To(Equal("Pending"))
 			upgradeCond := meta.FindStatusCondition(pending.Status.Conditions, "UpgradeInProgress")
 			Expect(upgradeCond).NotTo(BeNil())
-			Expect(upgradeCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
 		It("should reconcile the dashboard deployment when enabled", func() {
