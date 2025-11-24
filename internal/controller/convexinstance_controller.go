@@ -1826,9 +1826,7 @@ func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *
 		}), nil
 	default:
 		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
-			if plan.exportDone || plan.importDone {
-				r.cleanupUpgradeArtifacts(ctx, instance)
-			}
+			r.cleanupUpgradeArtifacts(ctx, instance)
 		}), nil
 	}
 }
