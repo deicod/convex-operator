@@ -299,19 +299,21 @@ func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, insta
 
 	expJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}, expJob); err == nil {
-		if expJob.Annotations != nil && expJob.Annotations[upgradeHashAnnotation] == desiredHash && jobSucceeded(expJob) {
+		matchesHash := expJob.Annotations != nil && expJob.Annotations[upgradeHashAnnotation] == desiredHash
+		if matchesHash && jobSucceeded(expJob) {
 			exportSucceeded = true
 		}
-		if jobFailed(expJob) {
+		if matchesHash && jobFailed(expJob) {
 			exportFailed = true
 		}
 	}
 	impJob := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Name: importJobName(instance), Namespace: instance.Namespace}, impJob); err == nil {
-		if impJob.Annotations != nil && impJob.Annotations[upgradeHashAnnotation] == desiredHash && jobSucceeded(impJob) {
+		matchesHash := impJob.Annotations != nil && impJob.Annotations[upgradeHashAnnotation] == desiredHash
+		if matchesHash && jobSucceeded(impJob) {
 			importSucceeded = true
 		}
-		if jobFailed(impJob) {
+		if matchesHash && jobFailed(impJob) {
 			importFailed = true
 		}
 	}
@@ -598,6 +600,7 @@ func (r *ConvexInstanceReconciler) reconcileUpgradePVC(ctx context.Context, inst
 	key := client.ObjectKey{Name: upgradePVCName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, pvc)
 	size := resource.MustParse("1Gi")
+	desiredSC := storageClassPtr(instance)
 	if errors.IsNotFound(err) {
 		pvc = &corev1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -605,7 +608,8 @@ func (r *ConvexInstanceReconciler) reconcileUpgradePVC(ctx context.Context, inst
 				Namespace: instance.Namespace,
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: desiredSC,
 				Resources: corev1.VolumeResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceStorage: size,
@@ -626,15 +630,23 @@ func (r *ConvexInstanceReconciler) reconcileUpgradePVC(ctx context.Context, inst
 	if err != nil {
 		return err
 	}
+	needsUpdate := ownerChanged
 	currentSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if currentSize.IsZero() || currentSize.Cmp(size) < 0 {
 		if pvc.Spec.Resources.Requests == nil {
 			pvc.Spec.Resources.Requests = corev1.ResourceList{}
 		}
 		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = size
-		ownerChanged = true
+		needsUpdate = true
 	}
-	if ownerChanged {
+	if desiredSC != nil && !storageClassEqual(desiredSC, pvc.Spec.StorageClassName) {
+		if pvc.Spec.StorageClassName != nil {
+			return fmt.Errorf("upgrade pvc storageClassName is immutable: current=%s desired=%s", ptr.Deref(pvc.Spec.StorageClassName, ""), ptr.Deref(desiredSC, ""))
+		}
+		pvc.Spec.StorageClassName = desiredSC
+		needsUpdate = true
+	}
+	if needsUpdate {
 		return r.Update(ctx, pvc)
 	}
 	return nil
