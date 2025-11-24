@@ -37,6 +37,13 @@ Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the s
 - `UpgradeInProgress`: true while upgrades run; `ExportCompleted` / `ImportCompleted` track export/import strategy progress.
 - Status endpoints are populated with the external host (and `/dashboard` path) once the HTTPRoute is accepted; otherwise they fall back to the internal Service URL for the API and omit the dashboard URL.
 
+### RBAC and Security
+- Writes are namespace-scoped: ConfigMaps, Secrets, Services/PVCs, Jobs, StatefulSets/Deployments, and Gateway/HTTPRoute are created only in the ConvexInstance namespace.
+- Secrets are only referenced (DB/S3/TLS) and generated admin/instance secrets live in the same namespace; managed objects carry owner references for cleanup on deletion.
+- Cluster-scoped access is limited to watching/listing ConvexInstances and Gateway API types via controller-runtime; no cluster-wide writes are requested.
+- Review `config/rbac/role.yaml` before install. Clusters with strict RBAC may require an admin to approve the manager Role/ClusterRole and bindings.
+- CRDs are under `config/crd/bases/`; regenerate via `make manifests` after API changes—avoid manual edits.
+
 ### Troubleshooting quick tips
 - `SecretsReady=False` with `ValidationFailed`: referenced DB/S3/TLS secret missing or key absent.
 - `ConfigMapReady=False` with `ConfigMapError`: config rendering failed—check controller logs.
