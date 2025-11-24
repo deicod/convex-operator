@@ -24,6 +24,11 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 
 Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the specification in `SPEC.md`.
 
+### Gateway and TLS assumptions
+- The operator assumes a `GatewayClass` named `nginx` by default (see `spec.networking.gatewayClassName`). Change it in the ConvexInstance spec to match your installed Gateway implementation.
+- A Gateway and HTTPRoute are created per instance, using the provided `spec.networking.host` and optional `spec.networking.tlsSecretRef` for TLS. Certificates are **not** managed by the operator—provide a pre-created TLS Secret in the target namespace if HTTPS is desired.
+- If your cluster lacks the referenced GatewayClass, the `GatewayReady`/`HTTPRouteReady` conditions will stay `False`; install the class or update the spec to a class that exists.
+
 ### Status and Conditions
 - `Ready`: overall readiness; `BackendReady` when the backend pod is ready, `WaitingForBackend` or `WaitingForGateway` otherwise, `ValidationFailed`/`*Error` on failures.
 - `ConfigMapReady`: backend ConfigMap ensured (`Available`).
@@ -46,10 +51,13 @@ Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the s
 
 ### Troubleshooting quick tips
 - `SecretsReady=False` with `ValidationFailed`: referenced DB/S3/TLS secret missing or key absent.
+- `SecretsReady=False` with `ValidationFailed` mentioning `db urlKey is required`: set `spec.backend.db.urlKey` and ensure the key exists in the referenced Secret.
+- `SecretsReady=False` with S3 key errors: ensure all S3 keys (endpoint/accessKeyId/secretAccessKey/bucket) are set in the Secret and referenced in the spec when S3 is enabled.
 - `ConfigMapReady=False` with `ConfigMapError`: config rendering failed—check controller logs.
 - `ServiceReady=False` or `StatefulSetReady=False` with `*Error`: inspect events/logs for create/update errors (e.g., invalid image, resource limits, service conflicts).
-- `GatewayReady`/`HTTPRouteReady` stuck `Provisioning`: ensure GatewayClass `nginx` (or your configured class) exists and that the TLS Secret reference is valid; check HTTPRoute status for Accepted conditions.
-- `Ready` stuck at `WaitingForBackend`: backend pod not ready; check pod events/logs, PVC binding, image pull, or DB connectivity.
+- `GatewayReady`/`HTTPRouteReady` stuck `Provisioning`: ensure GatewayClass (default `nginx`) exists, TLS Secret reference is valid, and HTTPRoute status shows `Accepted=True`.
+- `Ready` stuck at `WaitingForBackend` or `StatefulSetReady=Provisioning`: backend rollout still progressing or failed; check pod events/logs, PVC binding, image pull, or DB connectivity.
+- Upgrade stuck `UpgradeInProgress`: check export/import Job status and backend rollout; failed Jobs surface via `ExportCompleted`/`ImportCompleted` conditions and controller events.
 
 #### Events reference
 - `Warning ValidationFailed`: referenced secret missing/invalid.
