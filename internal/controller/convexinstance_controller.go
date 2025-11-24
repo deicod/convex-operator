@@ -1906,7 +1906,9 @@ func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, insta
 				status.appliedHash = plan.desiredHash
 			}
 		} else {
+			status.phase = phaseUpgrading
 			status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+			upgradeCond = conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress")
 		}
 		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
 		return status, nil

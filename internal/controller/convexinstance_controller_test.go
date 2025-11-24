@@ -479,6 +479,105 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(upgradeCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
+		It("keeps upgrade marked in progress after import if the backend is unready", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+			makeGatewayReady()
+			makeRouteAccepted()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			current := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			current.Spec.Maintenance.UpgradeStrategy = strategyExportImport
+			current.Spec.Backend.Image = testBackendImageV2
+			current.Spec.Version = testVersionV2
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			exportJob := &batchv1.Job{}
+			Eventually(func() bool {
+				return k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-export", Namespace: "default"}, exportJob) == nil
+			}, 5*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			makeBackendReady()
+			now := metav1.Now()
+			exportJob.Status.Succeeded = 1
+			exportJob.Status.StartTime = &now
+			exportJob.Status.CompletionTime = &now
+			exportJob.Status.Conditions = []batchv1.JobCondition{{
+				Type:               batchv1.JobComplete,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				LastProbeTime:      now,
+			}, {
+				Type:               condSuccessCriteriaMet,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				LastProbeTime:      now,
+			}}
+			Expect(k8sClient.Status().Update(ctx, exportJob)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			sts.Spec.Template.Spec.Containers[0].Image = testBackendImageV2
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+			sts.Status.ReadyReplicas = 1
+			sts.Status.Replicas = 1
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.ObservedGeneration = sts.Generation
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			importJob := &batchv1.Job{}
+			Eventually(func() bool {
+				_, _ = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-upgrade-import", Namespace: "default"}, importJob)
+				return err == nil
+			}, 15*time.Second, 200*time.Millisecond).Should(BeTrue())
+			now = metav1.Now()
+			importJob.Status.Succeeded = 1
+			importJob.Status.StartTime = &now
+			importJob.Status.CompletionTime = &now
+			importJob.Status.Conditions = []batchv1.JobCondition{{
+				Type:               batchv1.JobComplete,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				LastProbeTime:      now,
+			}, {
+				Type:               condSuccessCriteriaMet,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				LastProbeTime:      now,
+			}}
+			Expect(k8sClient.Status().Update(ctx, importJob)).To(Succeed())
+
+			// Simulate backend becoming unready after import completion.
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			sts.Status.ReadyReplicas = 0
+			sts.Status.UpdatedReplicas = 0
+			sts.Status.ObservedGeneration = sts.Generation
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			pending := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, pending)).To(Succeed())
+			Expect(pending.Status.Phase).To(Equal("Upgrading"))
+			upgradeCond := meta.FindStatusCondition(pending.Status.Conditions, "UpgradeInProgress")
+			Expect(upgradeCond).NotTo(BeNil())
+			Expect(upgradeCond.Status).To(Equal(metav1.ConditionTrue))
+		})
+
 		It("should reconcile the dashboard deployment when enabled", func() {
 			controllerReconciler, _ := newReconciler()
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
