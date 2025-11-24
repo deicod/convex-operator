@@ -26,6 +26,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -68,11 +69,25 @@ const (
 	conditionDashboardSvc    = "DashboardServiceReady"
 	conditionGateway         = "GatewayReady"
 	conditionHTTPRoute       = "HTTPRouteReady"
+	conditionUpgrade         = "UpgradeInProgress"
+	conditionExport          = "ExportCompleted"
+	conditionImport          = "ImportCompleted"
+	conditionRollingUpdate   = "RollingUpdate"
+	conditionBackendReady    = "BackendReady"
+	msgInstanceReady         = "Instance ready"
+	msgBackendReady          = "Backend ready"
 	phasePending             = "Pending"
 	phaseReady               = "Ready"
+	phaseUpgrading           = "Upgrading"
 	phaseError               = "Error"
+	upgradeStrategyInPlace   = "inPlace"
+	upgradeStrategyExport    = "exportImport"
 	storageModeExternal      = "external"
 	defaultGatewayClassName  = "nginx"
+	upgradeExportJobSuffix   = "upgrade-export"
+	upgradeImportJobSuffix   = "upgrade-import"
+	upgradePVCNameSuffix     = "upgrade-pvc"
+	upgradeHashAnnotation    = "convex.icod.de/upgrade-hash"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -86,6 +101,8 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;services;persistentvolumeclaims;events,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
@@ -109,93 +126,65 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	oldPhase := instance.Status.Phase
 
-	if instance.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
-			controllerutil.AddFinalizer(instance, finalizerName)
-			if err := r.Update(ctx, instance); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-	} else {
-		controllerutil.RemoveFinalizer(instance, finalizerName)
-		if err := r.Update(ctx, instance); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	if stop, err := r.ensureFinalizer(ctx, instance); err != nil || stop {
+		return ctrl.Result{}, err
 	}
 
-	conds := []metav1.Condition{}
+	// Capture current backend/dashboard state to drive upgrade decisions.
+	var existingBackend appsv1.StatefulSet
+	backendExists := false
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, &existingBackend); err == nil {
+		backendExists = true
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	var existingDashboard appsv1.Deployment
+	dashboardExists := false
+	if err := r.Get(ctx, client.ObjectKey{Name: dashboardDeploymentName(instance), Namespace: instance.Namespace}, &existingDashboard); err == nil {
+		dashboardExists = true
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	currentBackendImage := ""
+	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
+		currentBackendImage = existingBackend.Spec.Template.Spec.Containers[0].Image
+	}
+	currentDashboardImage := ""
+	if dashboardExists && len(existingDashboard.Spec.Template.Spec.Containers) > 0 {
+		currentDashboardImage = existingDashboard.Spec.Template.Spec.Containers[0].Image
+	}
+	currentBackendVersion := ""
+	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
+		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
+	}
+
+	desiredHash := desiredUpgradeHash(instance)
+	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
+
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
+
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
 
-	if err := r.reconcileConfigMap(ctx, instance); err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "ConfigMapError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ConfigMapError", err, conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()))
+	coreRes, resErr := r.reconcileCoreResources(ctx, instance, plan, extVersions)
+	if resErr != nil {
+		r.recordEvent(instance, corev1.EventTypeWarning, resErr.reason, resErr.err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, resErr.reason, resErr.err, resErr.cond)
 	}
-	conds = append(conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
 
-	secretName, generatedSecretRV, err := r.reconcileSecrets(ctx, instance)
+	status, err := r.handleUpgrade(ctx, instance, plan, coreRes.backendReady, coreRes.dashboardReady, coreRes.gatewayReady, coreRes.routeReady, coreRes.serviceName, coreRes.secretName, coreRes.conds)
 	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "SecretError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "SecretError", err, conditionFalse(conditionSecrets, "SecretError", err.Error()))
-	}
-	conds = append(conds, conditionTrue(conditionSecrets, "Available", "Instance/admin secrets ensured"))
-
-	if err := r.reconcilePVC(ctx, instance); err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "PVCError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "PVCError", err, conditionFalse(conditionPVC, "PVCError", err.Error()))
-	}
-	if instance.Spec.Backend.Storage.Mode == storageModeExternal || !instance.Spec.Backend.Storage.PVC.Enabled {
-		conds = append(conds, conditionTrue(conditionPVC, "Skipped", "PVC not required"))
-	} else {
-		conds = append(conds, conditionTrue(conditionPVC, "Available", "PVC ensured"))
+		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
+		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
 	}
 
-	serviceName, err := r.reconcileService(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "ServiceError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ServiceError", err, conditionFalse(conditionService, "ServiceError", err.Error()))
-	}
-	conds = append(conds, conditionTrue(conditionService, "Available", "Backend service ready"))
-
-	dashboardServiceName, dashboardSvcCond, err := r.reconcileDashboardService(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardServiceError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardServiceError", err, conditionFalse(conditionDashboardSvc, "DashboardServiceError", err.Error()))
-	}
-	conds = append(conds, dashboardSvcCond)
-
-	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, generatedSecretRV)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "DashboardError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "DashboardError", err, conditionFalse(conditionDashboard, "DashboardError", err.Error()))
-	}
-	conds = append(conds, dashboardCond)
-
-	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, generatedSecretRV, extVersions); err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "StatefulSetError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "StatefulSetError", err, conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()))
-	}
-
-	gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "GatewayError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "GatewayError", err, conditionFalse(conditionGateway, "GatewayError", err.Error()))
-	}
-	conds = append(conds, gatewayCond)
-
-	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashboardServiceName)
-	if err != nil {
-		r.recordEvent(instance, corev1.EventTypeWarning, "HTTPRouteError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "HTTPRouteError", err, conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()))
-	}
-	conds = append(conds, routeCond)
-
-	phase, conditionReason, statusMsg, conds, readyEvent := r.calculateReadiness(ctx, instance, dashboardReady, gatewayReady, routeReady, conds, oldPhase)
-	if err := r.updateStatus(ctx, instance, phase, conditionReason, serviceName, statusMsg, gatewayReady && routeReady, conds...); err != nil {
+	readyEvent := status.phase == phaseReady && oldPhase != phaseReady
+	if err := r.updateStatus(ctx, instance, status.phase, status.reason, coreRes.serviceName, status.message, coreRes.gatewayReady && coreRes.routeReady, status.appliedHash, status.conditions...); err != nil {
 		if errors.IsConflict(err) {
 			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
 			return ctrl.Result{Requeue: true}, nil
@@ -206,7 +195,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
-	if phase != phaseReady || (!dashboardReady && instance.Spec.Dashboard.Enabled) || !gatewayReady || !routeReady {
+	if status.phase != phaseReady || (!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) || !coreRes.gatewayReady || !coreRes.routeReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -223,6 +212,7 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&batchv1.Job{}).
 		Owns(&gatewayv1.Gateway{}).
 		Owns(&gatewayv1.HTTPRoute{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -253,6 +243,99 @@ type externalSecretVersions struct {
 	dbResourceVersion  string
 	s3ResourceVersion  string
 	tlsResourceVersion string
+}
+
+type upgradePlan struct {
+	strategy                string
+	desiredHash             string
+	appliedHash             string
+	upgradePending          bool
+	upgradePlanned          bool
+	exportDone              bool
+	importDone              bool
+	exportFailed            bool
+	importFailed            bool
+	backendChanged          bool
+	dashboardChanged        bool
+	effectiveBackendImage   string
+	effectiveDashboardImage string
+	effectiveVersion        string
+	currentBackendImage     string
+	currentDashboardImage   string
+	currentBackendVersion   string
+}
+
+type upgradeStatus struct {
+	phase       string
+	reason      string
+	message     string
+	appliedHash string
+	conditions  []metav1.Condition
+}
+
+type reconcileOutcome struct {
+	serviceName          string
+	dashboardServiceName string
+	dashboardReady       bool
+	gatewayReady         bool
+	routeReady           bool
+	backendReady         bool
+	secretName           string
+	secretRV             string
+	conds                []metav1.Condition
+}
+
+type resourceErr struct {
+	reason string
+	cond   metav1.Condition
+	err    error
+}
+
+func (r *ConvexInstanceReconciler) observeUpgradeJobs(ctx context.Context, instance *convexv1alpha1.ConvexInstance, desiredHash string) (bool, bool, bool, bool) {
+	exportSucceeded := false
+	importSucceeded := false
+	exportFailed := false
+	importFailed := false
+
+	expJob := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}, expJob); err == nil {
+		matchesHash := expJob.Annotations != nil && expJob.Annotations[upgradeHashAnnotation] == desiredHash
+		if matchesHash && jobSucceeded(expJob) {
+			exportSucceeded = true
+		}
+		if matchesHash && jobFailed(expJob) {
+			exportFailed = true
+		}
+	}
+	impJob := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKey{Name: importJobName(instance), Namespace: instance.Namespace}, impJob); err == nil {
+		matchesHash := impJob.Annotations != nil && impJob.Annotations[upgradeHashAnnotation] == desiredHash
+		if matchesHash && jobSucceeded(impJob) {
+			importSucceeded = true
+		}
+		if matchesHash && jobFailed(impJob) {
+			importFailed = true
+		}
+	}
+	return exportSucceeded, importSucceeded, exportFailed, importFailed
+}
+
+// ensureFinalizer adds or removes the controller finalizer. It returns true when reconciliation should stop (during deletion) or when an update occurred.
+func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, error) {
+	if instance.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(instance, finalizerName) {
+			controllerutil.AddFinalizer(instance, finalizerName)
+			if err := r.Update(ctx, instance); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	}
+	controllerutil.RemoveFinalizer(instance, finalizerName)
+	if err := r.Update(ctx, instance); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
@@ -323,7 +406,7 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	return result, nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, instance *convexv1alpha1.ConvexInstance, version string) error {
 	cm := &corev1.ConfigMap{}
 	key := client.ObjectKey{Name: backendConfigMapName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, cm)
@@ -334,7 +417,7 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 				Namespace: instance.Namespace,
 			},
 			Data: map[string]string{
-				configMapKey: r.renderBackendConfig(instance),
+				configMapKey: r.renderBackendConfig(instance, version),
 			},
 		}
 		if err := controllerutil.SetControllerReference(instance, cm, r.Scheme); err != nil {
@@ -351,7 +434,7 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 		return err
 	}
 
-	expected := r.renderBackendConfig(instance)
+	expected := r.renderBackendConfig(instance, version)
 	if cm.Data == nil {
 		cm.Data = map[string]string{}
 	}
@@ -366,8 +449,8 @@ func (r *ConvexInstanceReconciler) reconcileConfigMap(ctx context.Context, insta
 	return nil
 }
 
-func (r *ConvexInstanceReconciler) renderBackendConfig(instance *convexv1alpha1.ConvexInstance) string {
-	return fmt.Sprintf("CONVEX_PORT=%d\nCONVEX_ENV=%s\nCONVEX_VERSION=%s\n", defaultBackendPort, instance.Spec.Environment, instance.Spec.Version)
+func (r *ConvexInstanceReconciler) renderBackendConfig(instance *convexv1alpha1.ConvexInstance, version string) string {
+	return fmt.Sprintf("CONVEX_PORT=%d\nCONVEX_ENV=%s\nCONVEX_VERSION=%s\n", defaultBackendPort, instance.Spec.Environment, version)
 }
 
 func configHash(content string, values ...string) string {
@@ -507,6 +590,63 @@ func (r *ConvexInstanceReconciler) reconcilePVC(ctx context.Context, instance *c
 		needsUpdate = true
 	}
 	if needsUpdate || ownerChanged {
+		return r.Update(ctx, pvc)
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileUpgradePVC(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	pvc := &corev1.PersistentVolumeClaim{}
+	key := client.ObjectKey{Name: upgradePVCName(instance), Namespace: instance.Namespace}
+	err := r.Get(ctx, key, pvc)
+	size := resource.MustParse("1Gi")
+	desiredSC := storageClassPtr(instance)
+	if errors.IsNotFound(err) {
+		pvc = &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      upgradePVCName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: desiredSC,
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: size,
+					},
+				},
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, pvc, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, pvc)
+	}
+	if err != nil {
+		return err
+	}
+
+	ownerChanged, err := ensureOwner(instance, pvc, r.Scheme)
+	if err != nil {
+		return err
+	}
+	needsUpdate := ownerChanged
+	currentSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if currentSize.IsZero() || currentSize.Cmp(size) < 0 {
+		if pvc.Spec.Resources.Requests == nil {
+			pvc.Spec.Resources.Requests = corev1.ResourceList{}
+		}
+		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = size
+		needsUpdate = true
+	}
+	if desiredSC != nil && !storageClassEqual(desiredSC, pvc.Spec.StorageClassName) {
+		if pvc.Spec.StorageClassName != nil {
+			return fmt.Errorf("upgrade pvc storageClassName is immutable: current=%s desired=%s", ptr.Deref(pvc.Spec.StorageClassName, ""), ptr.Deref(desiredSC, ""))
+		}
+		pvc.Spec.StorageClassName = desiredSC
+		needsUpdate = true
+	}
+	if needsUpdate {
 		return r.Update(ctx, pvc)
 	}
 	return nil
@@ -661,7 +801,7 @@ func (r *ConvexInstanceReconciler) reconcileDashboardService(ctx context.Context
 	return name, conditionTrue(conditionDashboardSvc, "Available", "Dashboard service ready"), nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, secretName, generatedSecretRV string) (bool, metav1.Condition, error) {
+func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
 
@@ -680,6 +820,9 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 	replicas := int32(1)
 	if instance.Spec.Dashboard.Replicas != nil {
 		replicas = *instance.Spec.Dashboard.Replicas
+	}
+	if dashboardImage == "" {
+		dashboardImage = instance.Spec.Dashboard.Image
 	}
 
 	labels := map[string]string{
@@ -719,7 +862,7 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 			Containers: []corev1.Container{
 				{
 					Name:            "dashboard",
-					Image:           instance.Spec.Dashboard.Image,
+					Image:           dashboardImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					Ports: []corev1.ContainerPort{{
 						Name:          defaultDashboardPortName,
@@ -783,11 +926,17 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 	return false, conditionFalse(conditionDashboard, "Provisioning", "Waiting for dashboard rollout"), nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV string, extVersions externalSecretVersions) error {
+func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV, backendImage, backendVersion string, extVersions externalSecretVersions) error {
 	sts := &appsv1.StatefulSet{}
 	key := client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, sts)
 	replicas := int32(1)
+	if backendImage == "" {
+		backendImage = instance.Spec.Backend.Image
+	}
+	if backendVersion == "" {
+		backendVersion = instance.Spec.Version
+	}
 	labels := map[string]string{
 		"app.kubernetes.io/name":      "convex-backend",
 		"app.kubernetes.io/instance":  instance.Name,
@@ -804,7 +953,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		},
 		{
 			Name:  "CONVEX_VERSION",
-			Value: instance.Spec.Version,
+			Value: backendVersion,
 		},
 		{
 			Name: "CONVEX_ADMIN_KEY",
@@ -898,7 +1047,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			Labels: labels,
 			Annotations: map[string]string{
 				"convex.icod.de/config-hash": configHash(
-					r.renderBackendConfig(instance),
+					r.renderBackendConfig(instance, backendVersion),
 					generatedSecretRV,
 					extVersions.dbResourceVersion,
 					extVersions.s3ResourceVersion,
@@ -912,7 +1061,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			Containers: []corev1.Container{
 				{
 					Name:            "backend",
-					Image:           instance.Spec.Backend.Image,
+					Image:           backendImage,
 					ImagePullPolicy: corev1.PullIfNotPresent,
 					Ports: []corev1.ContainerPort{{
 						Name:          defaultBackendPortName,
@@ -985,6 +1134,206 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		return r.Update(ctx, sts)
 	}
 	return nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image, upgradeHash string) (bool, error) {
+	if image == "" {
+		image = instance.Spec.Backend.Image
+	}
+	job := &batchv1.Job{}
+	key := client.ObjectKey{Name: exportJobName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, job); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, err
+		}
+		podSpec := corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: upgradePVCName(instance),
+					},
+				},
+			}},
+			Containers: []corev1.Container{{
+				Name:    "export",
+				Image:   image,
+				Command: []string{"/bin/sh", "-c", "convex export --url $API_URL --admin-key $ADMIN_KEY --output /data/export.tar.gz"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "API_URL",
+						Value: backendServiceURL(instance, serviceName),
+					},
+					{
+						Name: "ADMIN_KEY",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+								Key:                  adminKeyKey,
+							},
+						},
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "data",
+					MountPath: "/data",
+				}},
+			}},
+		}
+		job = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      exportJobName(instance),
+				Namespace: instance.Namespace,
+				Annotations: map[string]string{
+					upgradeHashAnnotation: upgradeHash,
+				},
+			},
+			Spec: batchv1.JobSpec{
+				BackoffLimit:            ptr.To(int32(3)),
+				TTLSecondsAfterFinished: ptr.To(int32(300)),
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app.kubernetes.io/instance":  instance.Name,
+							"app.kubernetes.io/component": "upgrade-export",
+						},
+					},
+					Spec: podSpec,
+				},
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, job, r.Scheme); err != nil {
+			return false, err
+		}
+		if err := r.Create(ctx, job); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if job.Annotations == nil || job.Annotations[upgradeHashAnnotation] != upgradeHash {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
+	}
+
+	if jobFailed(job) {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, fmt.Errorf("export job %q failed", job.Name)
+	}
+	if jobSucceeded(job) {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileImportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image, upgradeHash string) (bool, error) {
+	if image == "" {
+		image = instance.Spec.Backend.Image
+	}
+	job := &batchv1.Job{}
+	key := client.ObjectKey{Name: importJobName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, job); err != nil {
+		if !errors.IsNotFound(err) {
+			return false, err
+		}
+		podSpec := corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: upgradePVCName(instance),
+					},
+				},
+			}},
+			Containers: []corev1.Container{{
+				Name:    "import",
+				Image:   image,
+				Command: []string{"/bin/sh", "-c", "convex import --url $API_URL --admin-key $ADMIN_KEY --input /data/export.tar.gz"},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "API_URL",
+						Value: backendServiceURL(instance, serviceName),
+					},
+					{
+						Name: "ADMIN_KEY",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+								Key:                  adminKeyKey,
+							},
+						},
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "data",
+					MountPath: "/data",
+				}},
+			}},
+		}
+		job = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      importJobName(instance),
+				Namespace: instance.Namespace,
+				Annotations: map[string]string{
+					upgradeHashAnnotation: upgradeHash,
+				},
+			},
+			Spec: batchv1.JobSpec{
+				BackoffLimit:            ptr.To(int32(3)),
+				TTLSecondsAfterFinished: ptr.To(int32(300)),
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app.kubernetes.io/instance":  instance.Name,
+							"app.kubernetes.io/component": "upgrade-import",
+						},
+					},
+					Spec: podSpec,
+				},
+			},
+		}
+		if err := controllerutil.SetControllerReference(instance, job, r.Scheme); err != nil {
+			return false, err
+		}
+		if err := r.Create(ctx, job); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if job.Annotations == nil || job.Annotations[upgradeHashAnnotation] != upgradeHash {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, nil
+	}
+
+	if jobFailed(job) {
+		propagation := metav1.DeletePropagationBackground
+		_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		return false, fmt.Errorf("import job %q failed", job.Name)
+	}
+	if jobSucceeded(job) {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *ConvexInstanceReconciler) cleanupUpgradeArtifacts(ctx context.Context, instance *convexv1alpha1.ConvexInstance) {
+	propagation := metav1.DeletePropagationBackground
+	for _, name := range []string{exportJobName(instance), importJobName(instance)} {
+		job := &batchv1.Job{}
+		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: instance.Namespace}, job); err == nil {
+			_ = r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation})
+		}
+	}
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, client.ObjectKey{Name: upgradePVCName(instance), Namespace: instance.Namespace}, pvc); err == nil {
+		_ = r.Delete(ctx, pvc, &client.DeleteOptions{PropagationPolicy: &propagation})
+	}
 }
 
 func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
@@ -1224,7 +1573,58 @@ func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
 	return nil
 }
 
-func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason, serviceName, message string, routeReady bool, conds ...metav1.Condition) error {
+func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
+	dashboardImage := instance.Spec.Dashboard.Image
+	if !instance.Spec.Dashboard.Enabled {
+		dashboardImage = ""
+	}
+	return configHash(
+		instance.Spec.Version,
+		instance.Spec.Backend.Image,
+		dashboardImage,
+	)
+}
+
+func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string) string {
+	if currentBackendImage == "" && currentDashboardImage == "" {
+		return ""
+	}
+	if currentVersion == "" {
+		currentVersion = instance.Spec.Version
+	}
+	return configHash(currentVersion, currentBackendImage, currentDashboardImage)
+}
+
+func backendVersionFromStatefulSet(sts *appsv1.StatefulSet) string {
+	for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "CONVEX_VERSION" {
+			return env.Value
+		}
+	}
+	return ""
+}
+
+func conditionTrueForGeneration(conditions []metav1.Condition, condType string, generation int64) bool {
+	cond := meta.FindStatusCondition(conditions, condType)
+	if cond == nil {
+		return false
+	}
+	return cond.Status == metav1.ConditionTrue && cond.ObservedGeneration >= generation
+}
+
+func upgradePVCName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-%s", instance.Name, upgradePVCNameSuffix)
+}
+
+func exportJobName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-%s", instance.Name, upgradeExportJobSuffix)
+}
+
+func importJobName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-%s", instance.Name, upgradeImportJobSuffix)
+}
+
+func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, phase, reason, serviceName, message string, routeReady bool, upgradeHash string, conds ...metav1.Condition) error {
 	current := instance.DeepCopy()
 	current.Status.ObservedGeneration = instance.GetGeneration()
 	current.Status.Phase = phase
@@ -1234,6 +1634,10 @@ func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *c
 	} else {
 		current.Status.Endpoints.DashboardURL = ""
 	}
+	if upgradeHash == "" {
+		upgradeHash = instance.Status.UpgradeHash
+	}
+	current.Status.UpgradeHash = upgradeHash
 	conditionStatus := metav1.ConditionFalse
 	if phase == phaseReady {
 		conditionStatus = metav1.ConditionTrue
@@ -1257,7 +1661,7 @@ func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instan
 	if originalErr != nil {
 		msg = originalErr.Error()
 	}
-	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, conds...); err != nil {
+	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, instance.Status.UpgradeHash, conds...); err != nil {
 		return err
 	}
 	return originalErr
@@ -1324,41 +1728,21 @@ func externalScheme(instance *convexv1alpha1.ConvexInstance) string {
 	return "http"
 }
 
-func (r *ConvexInstanceReconciler) calculateReadiness(ctx context.Context, instance *convexv1alpha1.ConvexInstance, dashboardReady, gatewayReady, routeReady bool, conds []metav1.Condition, oldPhase string) (string, string, string, []metav1.Condition, bool) {
-	phase := phasePending
-	conditionReason := "WaitingForBackend"
+func (r *ConvexInstanceReconciler) backendStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
 	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err == nil {
-		observedUpToDate := sts.Status.ObservedGeneration >= sts.Generation &&
-			sts.Status.UpdatedReplicas == *sts.Spec.Replicas &&
-			sts.Status.ReadyReplicas == sts.Status.UpdatedReplicas
-		if observedUpToDate && sts.Status.ReadyReplicas > 0 {
-			phase = phaseReady
-			conditionReason = "BackendReady"
-			conds = append(conds, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"))
-		} else {
-			conds = append(conds, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"))
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err != nil {
+		if errors.IsNotFound(err) {
+			return false, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"), nil
 		}
+		return false, metav1.Condition{}, err
 	}
-
-	statusMsg := "Waiting for backend readiness"
-	if phase == phaseReady {
-		statusMsg = "Backend ready"
+	observedUpToDate := sts.Status.ObservedGeneration >= sts.Generation &&
+		sts.Status.UpdatedReplicas == ptr.Deref(sts.Spec.Replicas, 0) &&
+		sts.Status.ReadyReplicas == sts.Status.UpdatedReplicas
+	if observedUpToDate && sts.Status.ReadyReplicas > 0 {
+		return true, conditionTrue(conditionStatefulSet, phaseReady, "Backend pod ready"), nil
 	}
-	if instance.Spec.Dashboard.Enabled && !dashboardReady {
-		if phase == phaseReady {
-			phase = phasePending
-			conditionReason = "WaitingForDashboard"
-			statusMsg = "Waiting for dashboard readiness"
-		}
-	}
-	if phase == phaseReady && (!gatewayReady || !routeReady) {
-		phase = phasePending
-		conditionReason = "WaitingForGateway"
-		statusMsg = "Waiting for Gateway/HTTPRoute readiness"
-	}
-	readyEvent := phase == phaseReady && oldPhase != phaseReady
-	return phase, conditionReason, statusMsg, conds, readyEvent
+	return false, conditionFalse(conditionStatefulSet, "Provisioning", "Waiting for backend pod readiness"), nil
 }
 
 func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, scheme *runtime.Scheme) (bool, error) {
@@ -1408,6 +1792,206 @@ func gatewaySpecEqual(a, b gatewayv1.GatewaySpec) bool {
 
 func httpRouteSpecEqual(a, b gatewayv1.HTTPRouteSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
+}
+
+func jobSucceeded(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func jobFailed(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *ConvexInstanceReconciler) backendHasReadyReplica(ctx context.Context, instance *convexv1alpha1.ConvexInstance) bool {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts); err != nil {
+		return false
+	}
+	return sts.Status.ReadyReplicas > 0
+}
+
+func (r *ConvexInstanceReconciler) handleUpgrade(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, backendReady, dashboardReady, gatewayReady, routeReady bool, serviceName, secretName string, baseConds []metav1.Condition) (upgradeStatus, error) {
+	status := upgradeStatus{
+		phase:       phasePending,
+		reason:      "WaitingForBackend",
+		message:     "Waiting for backend readiness",
+		appliedHash: "",
+		conditions:  append([]metav1.Condition{}, baseConds...),
+	}
+
+	switch plan.strategy {
+	case upgradeStrategyExport:
+		if plan.backendChanged || plan.exportDone || plan.exportFailed || plan.importDone || plan.importFailed {
+			return r.handleExportImport(ctx, instance, plan, backendReady, dashboardReady, gatewayReady, routeReady, serviceName, secretName, status)
+		}
+		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
+			if plan.exportDone || plan.importDone {
+				r.cleanupUpgradeArtifacts(ctx, instance)
+			}
+		}), nil
+	default:
+		return handleInPlace(plan, instance, backendReady, dashboardReady, gatewayReady, routeReady, status, func() {
+			r.cleanupUpgradeArtifacts(ctx, instance)
+		}), nil
+	}
+}
+
+func handleInPlace(plan upgradePlan, instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool, status upgradeStatus, cleanup func()) upgradeStatus {
+	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
+	rolloutPending := plan.desiredHash != "" && plan.desiredHash == plan.appliedHash && !readyAll
+	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+	if plan.upgradePending || rolloutPending {
+		status.phase = phaseUpgrading
+		status.reason = conditionRollingUpdate
+		status.message = "Rolling out new version"
+		upgradeCond = conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress")
+	}
+
+	if readyAll {
+		status.phase = phaseReady
+		status.reason = conditionBackendReady
+		status.message = msgBackendReady
+		if plan.desiredHash != "" {
+			status.appliedHash = plan.desiredHash
+		}
+		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+		if cleanup != nil {
+			cleanup()
+		}
+	} else {
+		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+	}
+
+	status.conditions = append(status.conditions, upgradeCond)
+	return status
+}
+
+func (r *ConvexInstanceReconciler) handleExportImport(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, backendReady, dashboardReady, gatewayReady, routeReady bool, serviceName, secretName string, status upgradeStatus) (upgradeStatus, error) {
+	readyAll := backendReady && (!instance.Spec.Dashboard.Enabled || dashboardReady) && gatewayReady && routeReady
+	importPending := plan.exportDone && !plan.importDone
+
+	upgradeCond := conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+	exportCond := conditionFalse(conditionExport, "Pending", "Waiting for export job")
+	importCond := conditionFalse(conditionImport, "Pending", "Waiting for import job")
+	if plan.exportDone {
+		exportCond = conditionTrue(conditionExport, "Completed", "Export job completed")
+	}
+	if plan.importDone {
+		importCond = conditionTrue(conditionImport, "Completed", "Import job completed")
+	}
+	if plan.exportFailed {
+		exportCond = conditionFalse(conditionExport, "Failed", "Export job failed")
+	}
+	if plan.importFailed {
+		importCond = conditionFalse(conditionImport, "Failed", "Import job failed")
+	}
+
+	if !plan.upgradePending && !importPending {
+		r.cleanupUpgradeArtifacts(ctx, instance)
+		if readyAll {
+			status.phase = phaseReady
+			status.reason = conditionReady
+			status.message = msgInstanceReady
+			if plan.desiredHash != "" {
+				status.appliedHash = plan.desiredHash
+			}
+		} else {
+			status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+		}
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if err := r.reconcileUpgradePVC(ctx, instance); err != nil {
+		return status, err
+	}
+
+	upgradeCond = conditionTrue(conditionUpgrade, "InProgress", "Upgrade in progress")
+	exportComplete := plan.exportDone
+	importComplete := plan.importDone
+
+	if !backendReady && !r.backendHasReadyReplica(ctx, instance) {
+		status.phase = phaseUpgrading
+		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if !exportComplete {
+		complete, err := r.reconcileExportJob(ctx, instance, serviceName, secretName, plan.currentBackendImage, plan.desiredHash)
+		if err != nil {
+			status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+			return status, err
+		}
+		exportComplete = complete
+	}
+	if exportComplete {
+		exportCond = conditionTrue(conditionExport, "Completed", "Export job completed")
+	} else {
+		status.phase = phaseUpgrading
+		status.reason = "Exporting"
+		status.message = "Running export job"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if !backendReady {
+		status.phase = phaseUpgrading
+		status.reason = conditionRollingUpdate
+		status.message = "Rolling out new version after export"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+	if plan.currentBackendImage != instance.Spec.Backend.Image {
+		status.phase = phaseUpgrading
+		status.reason = conditionRollingUpdate
+		status.message = "Rolling out new version after export"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if !importComplete {
+		complete, err := r.reconcileImportJob(ctx, instance, serviceName, secretName, instance.Spec.Backend.Image, plan.desiredHash)
+		if err != nil {
+			status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+			return status, err
+		}
+		importComplete = complete
+	}
+	if importComplete {
+		importCond = conditionTrue(conditionImport, "Completed", "Import job completed")
+	} else {
+		status.phase = phaseUpgrading
+		status.reason = "Importing"
+		status.message = "Running import job"
+		status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+		return status, nil
+	}
+
+	if readyAll && importComplete {
+		status.phase = phaseReady
+		status.reason = conditionBackendReady
+		status.message = msgBackendReady
+		status.appliedHash = plan.desiredHash
+		upgradeCond = conditionFalse(conditionUpgrade, "Idle", "No upgrade in progress")
+		r.cleanupUpgradeArtifacts(ctx, instance)
+	} else {
+		status.phase = phaseUpgrading
+		status.reason, status.message = readinessReason(instance, backendReady, dashboardReady, gatewayReady, routeReady)
+	}
+
+	status.conditions = append(status.conditions, upgradeCond, exportCond, importCond)
+	return status, nil
 }
 
 // alignStatefulSetDefaults copies defaults from the current spec into the desired spec to avoid spurious updates.
@@ -1501,5 +2085,194 @@ func condition(condType, reason, message string, status metav1.ConditionStatus) 
 		Status:  status,
 		Reason:  reason,
 		Message: message,
+	}
+}
+
+func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dashboardReady, gatewayReady, routeReady bool) (string, string) {
+	if !backendReady {
+		return "WaitingForBackend", "Waiting for backend readiness"
+	}
+	if instance.Spec.Dashboard.Enabled && !dashboardReady {
+		return "WaitingForDashboard", "Waiting for dashboard readiness"
+	}
+	if !gatewayReady || !routeReady {
+		return "WaitingForGateway", "Waiting for Gateway/HTTPRoute readiness"
+	}
+	return "BackendReady", "Backend ready"
+}
+
+func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
+	result := reconcileOutcome{conds: []metav1.Condition{}}
+
+	if err := r.reconcileConfigMap(ctx, instance, plan.effectiveVersion); err != nil {
+		return result, &resourceErr{
+			reason: "ConfigMapError",
+			cond:   conditionFalse(conditionConfigMap, "ConfigMapError", err.Error()),
+			err:    err,
+		}
+	}
+	result.conds = append(result.conds, conditionTrue(conditionConfigMap, "Available", "Backend config rendered"))
+
+	secretName, secretRV, err := r.reconcileSecrets(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "SecretError",
+			cond:   conditionFalse(conditionSecrets, "SecretError", err.Error()),
+			err:    err,
+		}
+	}
+	result.secretName = secretName
+	result.secretRV = secretRV
+	result.conds = append(result.conds, conditionTrue(conditionSecrets, "Available", "Instance/admin secrets ensured"))
+
+	if err := r.reconcilePVC(ctx, instance); err != nil {
+		return result, &resourceErr{
+			reason: "PVCError",
+			cond:   conditionFalse(conditionPVC, "PVCError", err.Error()),
+			err:    err,
+		}
+	}
+	if instance.Spec.Backend.Storage.Mode == storageModeExternal || !instance.Spec.Backend.Storage.PVC.Enabled {
+		result.conds = append(result.conds, conditionTrue(conditionPVC, "Skipped", "PVC not required"))
+	} else {
+		result.conds = append(result.conds, conditionTrue(conditionPVC, "Available", "PVC ensured"))
+	}
+
+	serviceName, err := r.reconcileService(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "ServiceError",
+			cond:   conditionFalse(conditionService, "ServiceError", err.Error()),
+			err:    err,
+		}
+	}
+	result.serviceName = serviceName
+	result.conds = append(result.conds, conditionTrue(conditionService, "Available", "Backend service ready"))
+
+	dashSvcName, dashSvcCond, err := r.reconcileDashboardService(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "DashboardServiceError",
+			cond:   conditionFalse(conditionDashboardSvc, "DashboardServiceError", err.Error()),
+			err:    err,
+		}
+	}
+	result.dashboardServiceName = dashSvcName
+	result.conds = append(result.conds, dashSvcCond)
+
+	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, secretRV, plan.effectiveDashboardImage)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "DashboardError",
+			cond:   conditionFalse(conditionDashboard, "DashboardError", err.Error()),
+			err:    err,
+		}
+	}
+	result.dashboardReady = dashboardReady
+	result.conds = append(result.conds, dashboardCond)
+
+	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, secretRV, plan.effectiveBackendImage, plan.effectiveVersion, extVersions); err != nil {
+		return result, &resourceErr{
+			reason: "StatefulSetError",
+			cond:   conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()),
+			err:    err,
+		}
+	}
+
+	gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "GatewayError",
+			cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+			err:    err,
+		}
+	}
+	result.gatewayReady = gatewayReady
+	result.conds = append(result.conds, gatewayCond)
+
+	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "HTTPRouteError",
+			cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+			err:    err,
+		}
+	}
+	result.routeReady = routeReady
+	result.conds = append(result.conds, routeCond)
+
+	backendReady, backendCond, err := r.backendStatus(ctx, instance)
+	if err != nil {
+		return result, &resourceErr{
+			reason: "StatefulSetError",
+			cond:   conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()),
+			err:    err,
+		}
+	}
+	result.backendReady = backendReady
+	result.conds = append(result.conds, backendCond)
+
+	return result, nil
+}
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
+	strategy := instance.Spec.Maintenance.UpgradeStrategy
+	if strategy == "" {
+		strategy = upgradeStrategyInPlace
+	}
+	exportDone := conditionTrueForGeneration(instance.Status.Conditions, conditionExport, instance.GetGeneration())
+	importDone := conditionTrueForGeneration(instance.Status.Conditions, conditionImport, instance.GetGeneration())
+	if desiredHash != instance.Status.UpgradeHash {
+		exportDone = false
+		importDone = false
+	}
+	if exportSucceeded {
+		exportDone = true
+	}
+	if importSucceeded {
+		importDone = true
+	}
+	if exportFailed {
+		exportDone = false
+	}
+	if importFailed {
+		importDone = false
+	}
+	appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage)
+	upgradePlanned := backendExists && desiredHash != appliedHash
+	upgradePending := backendExists && (desiredHash != appliedHash || (exportDone && !importDone))
+
+	backendChanged := backendExists && (instance.Spec.Backend.Image != currentBackendImage || instance.Spec.Version != currentBackendVersion)
+	dashboardChanged := instance.Spec.Dashboard.Image != "" && instance.Spec.Dashboard.Image != currentDashboardImage
+
+	backendImage := instance.Spec.Backend.Image
+	dashboardImage := instance.Spec.Dashboard.Image
+	backendVersion := instance.Spec.Version
+	if strategy == upgradeStrategyExport && backendExists && !exportDone {
+		if currentBackendImage != "" {
+			backendImage = currentBackendImage
+		}
+		if currentBackendVersion != "" {
+			backendVersion = currentBackendVersion
+		}
+	}
+
+	return upgradePlan{
+		strategy:                strategy,
+		desiredHash:             desiredHash,
+		appliedHash:             appliedHash,
+		upgradePending:          upgradePending,
+		upgradePlanned:          upgradePlanned,
+		exportDone:              exportDone,
+		importDone:              importDone,
+		exportFailed:            exportFailed,
+		importFailed:            importFailed,
+		backendChanged:          backendChanged,
+		dashboardChanged:        dashboardChanged,
+		effectiveBackendImage:   backendImage,
+		effectiveDashboardImage: dashboardImage,
+		effectiveVersion:        backendVersion,
+		currentBackendImage:     currentBackendImage,
+		currentDashboardImage:   currentDashboardImage,
+		currentBackendVersion:   currentBackendVersion,
 	}
 }

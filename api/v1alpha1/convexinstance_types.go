@@ -207,6 +207,10 @@ type ConvexInstanceStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
+	// UpgradeHash tracks the last fully applied spec hash to gate future upgrades.
+	// +optional
+	UpgradeHash string `json:"upgradeHash,omitempty"`
+
 	// ObservedGeneration reflects the last processed spec generation.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
