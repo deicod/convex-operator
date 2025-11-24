@@ -2248,6 +2248,8 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 		upgradePlanned:          upgradePlanned,
 		exportDone:              exportDone,
 		importDone:              importDone,
+		exportFailed:            exportFailed,
+		importFailed:            importFailed,
 		backendChanged:          backendChanged,
 		dashboardChanged:        dashboardChanged,
 		effectiveBackendImage:   backendImage,

@@ -740,3 +740,38 @@ var _ = Describe("ConvexInstance Controller", func() {
 		})
 	})
 })
+
+var _ = Describe("upgrade plan helpers", func() {
+	It("propagates export/import failures into the plan", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "failure-propagation",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Version: "1.0.0",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine: "sqlite",
+					},
+				},
+				Dashboard: convexv1alpha1.DashboardSpec{
+					Enabled: true,
+					Image:   "ghcr.io/get-convex/convex-dashboard:1.0.0",
+				},
+				Maintenance: convexv1alpha1.MaintenanceSpec{
+					UpgradeStrategy: upgradeStrategyExport,
+				},
+			},
+		}
+		desiredHash := desiredUpgradeHash(instance)
+		instance.Status.UpgradeHash = desiredHash
+
+		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, instance.Spec.Dashboard.Image, instance.Spec.Version, false, false, true, true, desiredHash)
+
+		Expect(plan.exportFailed).To(BeTrue())
+		Expect(plan.importFailed).To(BeTrue())
+		Expect(plan.upgradePlanned).To(BeFalse())
+		Expect(plan.upgradePending).To(BeFalse())
+	})
+})
