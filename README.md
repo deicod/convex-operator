@@ -8,7 +8,7 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 - Tracks lifecycle through status phase/conditions and upgrade strategy (in-place or export/import).
 
 ## Referral
-Double your free quota by applying a referral for the Convex cloud service: https://convex.dev/referral/DARKOL3521
+[Double your free quota by applying a referral for the Convex cloud service](https://convex.dev/referral/DARKOL3521)
 
 ## Getting Started
 
