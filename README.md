@@ -7,6 +7,9 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 - Exposes traffic through Gateway API/ingress using the provided host, optional TLS secret, and configurable GatewayClass (default `nginx`).
 - Tracks lifecycle through status phase/conditions and upgrade strategy (in-place or export/import).
 
+## Referral
+Double your free quota by applying a referral for the Convex cloud service: https://convex.dev/referral/DARKOL3521
+
 ## Getting Started
 
 ### Prerequisites
