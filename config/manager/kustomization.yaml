@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: ghcr.io/deicod/convex-operator
-  newTag: sha-0ee90ed
+  newTag: latest
