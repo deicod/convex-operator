@@ -628,6 +628,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gw.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.HTTPProtocolType))
 			Expect(gw.Spec.Listeners[0].Hostname).NotTo(BeNil())
 			Expect(string(*gw.Spec.Listeners[0].Hostname)).To(Equal("convex-dev.example.com"))
+			Expect(gw.Annotations).To(HaveKeyWithValue("cert-manager.io/cluster-issuer", "letsencrypt-prod-rfc2136"))
 
 			route := &gatewayv1.HTTPRoute{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
@@ -651,6 +652,23 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(actionRule.Matches[0].Path).NotTo(BeNil())
 			Expect(actionRule.Matches[0].Path.Value).NotTo(BeNil())
 			Expect(*actionRule.Matches[0].Path.Value).To(Equal("/http_action/"))
+		})
+
+		It("should honor custom gateway annotations and override defaults", func() {
+			controllerReconciler, _ := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"gatewayAnnotations":{"cert-manager.io/cluster-issuer":"letsencrypt-staging-rfc2136","example.com/owner":"platform"}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
+			Expect(gw.Annotations).To(HaveKeyWithValue("cert-manager.io/cluster-issuer", "letsencrypt-staging-rfc2136"))
+			Expect(gw.Annotations).To(HaveKeyWithValue("example.com/owner", "platform"))
 		})
 
 		It("should remove the dashboard deployment when disabled", func() {

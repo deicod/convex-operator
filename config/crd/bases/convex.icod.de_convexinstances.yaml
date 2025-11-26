@@ -287,6 +287,14 @@ spec:
               networking:
                 description: Networking configures ingress and TLS wiring.
                 properties:
+                  gatewayAnnotations:
+                    additionalProperties:
+                      type: string
+                    default:
+                      cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136
+                    description: GatewayAnnotations are applied to the generated Gateway
+                      metadata.
+                    type: object
                   gatewayClassName:
                     default: nginx
                     description: GatewayClassName selects the GatewayClass for the

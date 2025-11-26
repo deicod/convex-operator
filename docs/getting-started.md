@@ -17,7 +17,7 @@ The examples use the latest Convex backend/dashboard images (`version: latest`).
 - Go toolchain (for `make` targets) and Docker permissions if building your own operator image.
 - Gateway API installed with a `GatewayClass` the operator can reference (default: `nginx`).
 - Postgres reachable at `pg-rw.postgres.svc.cluster.local:5432` with credentials.
-- Optional: TLS Secret for your hosts if you want HTTPS.
+- Optional: TLS Secret for your hosts if you want HTTPS. The operator creates a Gateway per `ConvexInstance` and, by default, annotates it with `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`; set `spec.networking.gatewayAnnotations` to override (or `{}` to disable) and point `spec.networking.tlsSecretRef` at the Secret name cert-manager should populate.
 
 ## 1) Clone the repo
 ```bash
@@ -51,11 +51,12 @@ kubectl -n convex create secret generic convex-prod-db \
   --from-literal=url='postgres://produser:prodpass@pg-rw.postgres.svc.cluster.local:5432/convex_prod?sslmode=require'
 ```
 
-If you plan to terminate TLS at the Gateway, create a TLS Secret in the same namespace (optional):
+If you plan to terminate TLS at the Gateway, create a TLS Secret in the same namespace (optional if you let cert-manager populate it):
 ```bash
 kubectl -n convex create secret tls convex-tls \
   --cert=/path/to/cert.pem --key=/path/to/key.pem
 ```
+Alternatively, keep `spec.networking.tlsSecretRef` set and rely on the default Gateway annotation (`cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`) or your own `gatewayAnnotations` to have cert-manager issue the certificate into that Secret.
 
 ## 4) Create the ConvexInstance resources
 Save the following manifests (adjust hosts, secrets, and TLS as needed) and apply them. These use the Postgres engine and point to the secrets created above.
@@ -84,7 +85,9 @@ spec:
   networking:
     host: api.todo.dev.convex.icod.de   # operator-managed host; add extra HTTPRoutes if you want app/dashboard on separate hosts
     gatewayClassName: nginx
-    # tlsSecretRef: convex-tls   # uncomment if you created a TLS secret
+    tlsSecretRef: convex-tls            # cert-manager will populate this by default; precreate if you are not using cert-manager
+    # gatewayAnnotations:               # optional: override the default cert-manager issuer or disable
+    #   cert-manager.io/cluster-issuer: letsencrypt-staging-rfc2136
   maintenance:
     upgradeStrategy: inPlace
 ```
@@ -113,7 +116,9 @@ spec:
   networking:
     host: api.todo.icod.de   # operator-managed host; add extra HTTPRoutes if you want app/dashboard on separate hosts
     gatewayClassName: nginx
-    # tlsSecretRef: convex-tls
+    tlsSecretRef: convex-tls
+    # gatewayAnnotations:
+    #   cert-manager.io/cluster-issuer: letsencrypt-staging-rfc2136
   maintenance:
     upgradeStrategy: inPlace
 ```
