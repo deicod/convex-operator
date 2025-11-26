@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.1
+
+- Add `spec.networking.gatewayAnnotations` with a default `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`, applied to each per-instance Gateway; users can override or disable by setting a custom map or `{}`.
+- Controller now upserts Gateway annotations on reconcile while keeping owner refs and spec in sync.
+- Docs refreshed (README, getting-started) to describe the per-instance Gateway behavior, cert-manager default, and how to override it in sample manifests.
+- Tests updated to cover default and custom gateway annotations.
+
 ## v0.1.0 (initial release)
 
 - ConvexInstance CRD with defaults/validation for backend, dashboard, networking, storage, and maintenance (upgrade strategy).
