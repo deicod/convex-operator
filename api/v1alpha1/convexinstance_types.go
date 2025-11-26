@@ -161,6 +161,11 @@ type NetworkingSpec struct {
 	// +optional
 	GatewayClassName string `json:"gatewayClassName,omitempty"`
 
+	// GatewayAnnotations are applied to the generated Gateway metadata.
+	// +kubebuilder:default:={"cert-manager.io/cluster-issuer":"letsencrypt-prod-rfc2136"}
+	// +optional
+	GatewayAnnotations map[string]string `json:"gatewayAnnotations,omitempty"`
+
 	// TLSSecretRef names the TLS secret used by Gateway/Ingress.
 	// +optional
 	TLSSecretRef string `json:"tlsSecretRef,omitempty"`

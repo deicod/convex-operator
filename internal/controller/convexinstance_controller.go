@@ -85,6 +85,8 @@ const (
 	upgradeStrategyExport    = "exportImport"
 	storageModeExternal      = "external"
 	defaultGatewayClassName  = "nginx"
+	defaultGatewayIssuerKey  = "cert-manager.io/cluster-issuer"
+	defaultGatewayIssuer     = "letsencrypt-prod-rfc2136"
 	upgradeExportJobSuffix   = "upgrade-export"
 	upgradeImportJobSuffix   = "upgrade-import"
 	upgradePVCNameSuffix     = "upgrade-pvc"
@@ -1349,8 +1351,9 @@ func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instanc
 	if errors.IsNotFound(err) {
 		gw = &gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      gatewayName(instance),
-				Namespace: instance.Namespace,
+				Name:        gatewayName(instance),
+				Namespace:   instance.Namespace,
+				Annotations: gatewayAnnotations(instance),
 			},
 			Spec: spec,
 		}
@@ -1370,7 +1373,8 @@ func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instanc
 	if err != nil {
 		return false, metav1.Condition{}, err
 	}
-	if ownerChanged || !gatewaySpecEqual(gw.Spec, spec) {
+	annotationsChanged := ensureGatewayAnnotations(gw, gatewayAnnotations(instance))
+	if ownerChanged || annotationsChanged || !gatewaySpecEqual(gw.Spec, spec) {
 		gw.Spec = spec
 		if err := r.Update(ctx, gw); err != nil {
 			return false, metav1.Condition{}, err
@@ -1446,6 +1450,13 @@ func gatewayClassName(instance *convexv1alpha1.ConvexInstance) string {
 		return instance.Spec.Networking.GatewayClassName
 	}
 	return defaultGatewayClassName
+}
+
+func gatewayAnnotations(instance *convexv1alpha1.ConvexInstance) map[string]string {
+	if instance.Spec.Networking.GatewayAnnotations != nil {
+		return copyStringMap(instance.Spec.Networking.GatewayAnnotations)
+	}
+	return defaultGatewayAnnotations()
 }
 
 func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
@@ -1720,6 +1731,43 @@ func dashboardEndpoint(instance *convexv1alpha1.ConvexInstance, routeReady bool)
 		return fmt.Sprintf("%s://%s/dashboard", externalScheme(instance), instance.Spec.Networking.Host)
 	}
 	return ""
+}
+
+func ensureGatewayAnnotations(gw *gatewayv1.Gateway, desired map[string]string) bool {
+	changed := false
+	if gw.Annotations == nil {
+		gw.Annotations = map[string]string{}
+	}
+	if _, wantDefault := desired[defaultGatewayIssuerKey]; !wantDefault {
+		if _, hasDefault := gw.Annotations[defaultGatewayIssuerKey]; hasDefault {
+			delete(gw.Annotations, defaultGatewayIssuerKey)
+			changed = true
+		}
+	}
+	for key, value := range desired {
+		if gw.Annotations[key] != value {
+			gw.Annotations[key] = value
+			changed = true
+		}
+	}
+	return changed
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func defaultGatewayAnnotations() map[string]string {
+	return map[string]string{
+		defaultGatewayIssuerKey: defaultGatewayIssuer,
+	}
 }
 
 func externalScheme(instance *convexv1alpha1.ConvexInstance) string {
