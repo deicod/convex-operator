@@ -71,6 +71,10 @@ type BackendSpec struct {
 	// S3 configures S3-compatible storage for blob usage.
 	// +kubebuilder:default:={}
 	S3 BackendS3Spec `json:"s3,omitempty"`
+
+	// Security allows overriding pod/container security contexts for the backend StatefulSet.
+	// +kubebuilder:default:={}
+	Security SecuritySpec `json:"security,omitempty"`
 }
 
 // BackendDatabaseSpec describes DB settings and secret references.
@@ -148,6 +152,10 @@ type DashboardSpec struct {
 
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Security allows overriding pod/container security contexts for the dashboard Deployment.
+	// +kubebuilder:default:={}
+	Security SecuritySpec `json:"security,omitempty"`
 }
 
 // NetworkingSpec captures external routing details.
@@ -188,6 +196,17 @@ type BackendScaleSpec struct {
 	// MaxMemory sets an upper bound for memory allocations (e.g., "8Gi").
 	// +optional
 	MaxMemory resource.Quantity `json:"maxMemory,omitempty"`
+}
+
+// SecuritySpec controls pod and container security contexts for a component.
+type SecuritySpec struct {
+	// Pod applies a pod-level security context to the workload.
+	// +optional
+	Pod *corev1.PodSecurityContext `json:"pod,omitempty"`
+
+	// Container applies a container-level security context to the main container.
+	// +optional
+	Container *corev1.SecurityContext `json:"container,omitempty"`
 }
 
 // MaintenanceSpec defines upgrade behavior.

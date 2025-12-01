@@ -804,6 +804,36 @@ func (r *ConvexInstanceReconciler) reconcileDashboardService(ctx context.Context
 	return name, conditionTrue(conditionDashboardSvc, "Available", "Dashboard service ready"), nil
 }
 
+func dashboardSecurityContexts(instance *convexv1alpha1.ConvexInstance) (*corev1.PodSecurityContext, *corev1.SecurityContext) {
+	pod := &corev1.PodSecurityContext{
+		RunAsNonRoot: ptr.To(true),
+		RunAsUser:    ptr.To(int64(1001)),
+	}
+	container := &corev1.SecurityContext{
+		RunAsNonRoot: ptr.To(true),
+		RunAsUser:    ptr.To(int64(1001)),
+	}
+	if instance.Spec.Dashboard.Security.Pod != nil {
+		pod = instance.Spec.Dashboard.Security.Pod.DeepCopy()
+	}
+	if instance.Spec.Dashboard.Security.Container != nil {
+		container = instance.Spec.Dashboard.Security.Container.DeepCopy()
+	}
+	return pod, container
+}
+
+func backendSecurityContexts(instance *convexv1alpha1.ConvexInstance) (*corev1.PodSecurityContext, *corev1.SecurityContext) {
+	pod := instance.Spec.Backend.Security.Pod
+	container := instance.Spec.Backend.Security.Container
+	if pod != nil {
+		pod = pod.DeepCopy()
+	}
+	if container != nil {
+		container = container.DeepCopy()
+	}
+	return pod, container
+}
+
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
@@ -851,6 +881,8 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 		},
 	}
 
+	podSC, containerSC := dashboardSecurityContexts(instance)
+
 	podSpec := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
@@ -859,9 +891,7 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 			},
 		},
 		Spec: corev1.PodSpec{
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot: ptr.To(true),
-			},
+			SecurityContext: podSC,
 			Containers: []corev1.Container{
 				{
 					Name:            "dashboard",
@@ -871,11 +901,9 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 						Name:          defaultDashboardPortName,
 						ContainerPort: defaultDashboardPort,
 					}},
-					Env:       env,
-					Resources: instance.Spec.Dashboard.Resources,
-					SecurityContext: &corev1.SecurityContext{
-						RunAsNonRoot: ptr.To(true),
-					},
+					Env:             env,
+					Resources:       instance.Spec.Dashboard.Resources,
+					SecurityContext: containerSC,
 				},
 			},
 		},
@@ -1045,6 +1073,8 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		})
 	}
 
+	podSC, containerSC := backendSecurityContexts(instance)
+
 	podSpec := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
@@ -1058,9 +1088,7 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			},
 		},
 		Spec: corev1.PodSpec{
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsNonRoot: ptr.To(true),
-			},
+			SecurityContext: podSC,
 			Containers: []corev1.Container{
 				{
 					Name:            "backend",
@@ -1091,10 +1119,8 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 							},
 						},
 					},
-					SecurityContext: &corev1.SecurityContext{
-						RunAsNonRoot: ptr.To(true),
-					},
-					VolumeMounts: volumeMounts,
+					SecurityContext: containerSC,
+					VolumeMounts:    volumeMounts,
 				},
 			},
 			Volumes: volumes,

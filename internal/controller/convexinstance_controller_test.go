@@ -202,6 +202,22 @@ var _ = Describe("ConvexInstance Controller", func() {
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers).NotTo(BeEmpty())
+			if sts.Spec.Template.Spec.SecurityContext != nil {
+				Expect(sts.Spec.Template.Spec.SecurityContext.RunAsUser).To(BeNil())
+				Expect(sts.Spec.Template.Spec.SecurityContext.RunAsNonRoot).To(BeNil())
+			}
+			if sts.Spec.Template.Spec.Containers[0].SecurityContext != nil {
+				Expect(sts.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser).To(BeNil())
+				Expect(sts.Spec.Template.Spec.Containers[0].SecurityContext.RunAsNonRoot).To(BeNil())
+			}
+
+			dashboardDep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dashboardDep)).To(Succeed())
+			Expect(dashboardDep.Spec.Template.Spec.SecurityContext).NotTo(BeNil())
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.SecurityContext.RunAsUser, int64(0))).To(Equal(int64(1001)))
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.SecurityContext.RunAsNonRoot, false)).To(BeTrue())
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser, int64(0))).To(Equal(int64(1001)))
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.Containers[0].SecurityContext.RunAsNonRoot, false)).To(BeTrue())
 
 			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
 			Expect(readyCond).NotTo(BeNil())
@@ -244,6 +260,51 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(stsReady).NotTo(BeNil())
 			Expect(stsReady.Status).To(Equal(metav1.ConditionFalse))
 			Expect(stsReady.Reason).To(Equal("Provisioning"))
+		})
+
+		It("applies security context overrides", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+
+			backendPodUser := int64(1337)
+			backendContainerUser := int64(1400)
+			dashboardPodUser := int64(2001)
+			updated.Spec.Backend.Security.Pod = &corev1.PodSecurityContext{
+				RunAsUser: &backendPodUser,
+			}
+			updated.Spec.Backend.Security.Container = &corev1.SecurityContext{
+				RunAsUser:    &backendContainerUser,
+				RunAsNonRoot: ptr.To(false),
+			}
+			updated.Spec.Dashboard.Security.Pod = &corev1.PodSecurityContext{
+				RunAsUser:    &dashboardPodUser,
+				RunAsNonRoot: ptr.To(false),
+			}
+			updated.Spec.Dashboard.Security.Container = &corev1.SecurityContext{
+				RunAsNonRoot: ptr.To(false),
+			}
+			Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			Expect(ptr.Deref(sts.Spec.Template.Spec.SecurityContext.RunAsUser, int64(0))).To(Equal(backendPodUser))
+			Expect(ptr.Deref(sts.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser, int64(0))).To(Equal(backendContainerUser))
+			Expect(ptr.Deref(sts.Spec.Template.Spec.Containers[0].SecurityContext.RunAsNonRoot, true)).To(BeFalse())
+
+			dashboardDep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dashboardDep)).To(Succeed())
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.SecurityContext.RunAsUser, int64(0))).To(Equal(dashboardPodUser))
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.SecurityContext.RunAsNonRoot, true)).To(BeFalse())
+			Expect(ptr.Deref(dashboardDep.Spec.Template.Spec.Containers[0].SecurityContext.RunAsNonRoot, true)).To(BeFalse())
 		})
 
 		It("should move to Ready once the StatefulSet reports ready replicas", func() {

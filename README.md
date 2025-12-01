@@ -20,8 +20,8 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 
 ### CRD quick reference (convex.icod.de/v1alpha1)
 - `spec.environment` (`dev|prod`) and `spec.version` (Convex image tag) are required.
-- `spec.backend`: image (defaults to Convex backend), `db.engine` (`postgres|mysql|sqlite`) plus Secret/key refs, `storage.mode` (`sqlite|external`) with optional PVC, S3 secret/key wiring.
-- `spec.dashboard`: enabled flag (default true), image (defaults to Convex dashboard), replicas/resources.
+- `spec.backend`: image (defaults to Convex backend), `db.engine` (`postgres|mysql|sqlite`) plus Secret/key refs, `storage.mode` (`sqlite|external`) with optional PVC, S3 secret/key wiring, and optional `security` overrides for pod/container contexts (defaults defer to the image user, avoiding forced `runAsNonRoot`).
+- `spec.dashboard`: enabled flag (default true), image (defaults to Convex dashboard), replicas/resources; defaults run the dashboard as UID `1001` with `runAsNonRoot: true` to match the official image, configurable via `security`.
 - `spec.networking`: hostname, `gatewayClassName` (defaults to `nginx`), optional `gatewayAnnotations` (defaults to `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`), and TLS secret reference. The default assumes NGINX Gateway Fabric and annotates the generated Gateway for cert-manager; set `gatewayAnnotations: {}` or provide your own map to override/disable.
 - `spec.maintenance.upgradeStrategy`: `inPlace` (default) or `exportImport`; `spec.scale.backend` provides CPU target/max memory hints.
 
@@ -49,6 +49,7 @@ Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the s
 - Writes are namespace-scoped: ConfigMaps, Secrets, Services/PVCs, Jobs, StatefulSets/Deployments, and Gateway/HTTPRoute are created only in the ConvexInstance namespace.
 - Secrets are only referenced (DB/S3/TLS) and generated admin/instance secrets live in the same namespace; managed objects carry owner references for cleanup on deletion.
 - Cluster-scoped access is limited to watching/listing ConvexInstances and Gateway API types via controller-runtime; no cluster-wide writes are requested.
+- Backend pods no longer force `runAsNonRoot`; dashboard pods default to `runAsUser: 1001`/`runAsNonRoot: true` to satisfy the official Convex images. Override pod/container security contexts via `spec.backend.security` and `spec.dashboard.security` if your images need different UIDs or policies.
 - Review `config/rbac/role.yaml` before install. Clusters with strict RBAC may require an admin to approve the manager Role/ClusterRole and bindings.
 - CRDs are under `config/crd/bases/`; regenerate via `make manifests` after API changes—avoid manual edits.
 
