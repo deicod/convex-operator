@@ -84,6 +84,9 @@ const (
 	upgradeStrategyInPlace   = "inPlace"
 	upgradeStrategyExport    = "exportImport"
 	storageModeExternal      = "external"
+	dbEnginePostgres         = "postgres"
+	dbEngineMySQL            = "mysql"
+	dbEngineSQLite           = "sqlite"
 	defaultGatewayClassName  = "nginx"
 	defaultGatewayIssuerKey  = "cert-manager.io/cluster-issuer"
 	defaultGatewayIssuer     = "letsencrypt-prod-rfc2136"
@@ -344,10 +347,10 @@ func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
 	result := externalSecretVersions{}
 	db := instance.Spec.Backend.DB
-	if db.Engine != "sqlite" && db.SecretRef == "" {
+	if db.Engine != dbEngineSQLite && db.SecretRef == "" {
 		return result, fmt.Errorf("db secret is required for engine %q", db.Engine)
 	}
-	if db.Engine != "sqlite" && db.URLKey == "" {
+	if db.Engine != dbEngineSQLite && db.URLKey == "" {
 		return result, fmt.Errorf("db urlKey is required for engine %q", db.Engine)
 	}
 	if ref := db.SecretRef; ref != "" {
@@ -841,9 +844,9 @@ func backendSecurityContexts(instance *convexv1alpha1.ConvexInstance) (*corev1.P
 
 func dbURLVarNames(engine string) []string {
 	switch engine {
-	case "postgres":
+	case dbEnginePostgres:
 		return []string{"POSTGRES_URL"}
-	case "mysql":
+	case dbEngineMySQL:
 		return []string{"MYSQL_URL"}
 	default:
 		return nil

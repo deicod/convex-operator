@@ -883,7 +883,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 		It("should fail validation when DB secret is missing the urlKey", func() {
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
-			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.Engine = dbEnginePostgres
 			instance.Spec.Backend.DB.SecretRef = "pg-secret-missing-key"
 			instance.Spec.Backend.DB.URLKey = "url"
 			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
@@ -917,7 +917,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 		It("should fail validation when DB engine is postgres and urlKey is missing", func() {
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
-			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.Engine = dbEnginePostgres
 			instance.Spec.Backend.DB.SecretRef = "pg-secret"
 			instance.Spec.Backend.DB.URLKey = ""
 			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
@@ -1293,7 +1293,7 @@ var _ = Describe("config and secret helpers", func() {
 				Backend: convexv1alpha1.BackendSpec{
 					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
 					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:    "postgres",
+						Engine:    dbEnginePostgres,
 						SecretRef: "db-secret",
 						URLKey:    "url",
 					},
@@ -1592,7 +1592,7 @@ var _ = Describe("envtest lifecycle suites", func() {
 				Backend: convexv1alpha1.BackendSpec{
 					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
 					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:    "postgres",
+						Engine:    dbEnginePostgres,
 						SecretRef: "absent-secret",
 						URLKey:    "url",
 					},
@@ -1798,7 +1798,7 @@ var _ = Describe("config and secret helpers", func() {
 				Backend: convexv1alpha1.BackendSpec{
 					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
 					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:    "postgres",
+						Engine:    dbEnginePostgres,
 						SecretRef: "db-secret",
 						URLKey:    "url",
 					},
