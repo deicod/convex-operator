@@ -2,8 +2,8 @@ name: Docker Build (GHCR)
 
 on:
   push:
-    branches: [ main ]
-    tags: [ "v*" ]
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -18,7 +18,7 @@ permissions:
 jobs:
   docker-build:
     name: Build and push image
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ubuntu-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
