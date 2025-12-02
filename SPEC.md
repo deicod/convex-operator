@@ -69,22 +69,22 @@
       endpoints:
         apiUrl: string
         dashboardUrl: string
-  - Architecture
-      - Controllers:
-          - ConvexInstanceReconciler handles full desired state, owner refs, finalizer for cleanup.
-          - Supporting packages for config rendering (ConfigMap), secrets wiring, Gateway API resources.
-      - Managed resources per instance:
+      - Architecture
+          - Controllers:
+              - ConvexInstanceReconciler handles full desired state, owner refs, finalizer for cleanup.
+              - Supporting packages for config rendering (ConfigMap), secrets wiring, Gateway API resources.
+          - Managed resources per instance:
           - ConfigMap for backend non-secret config (ports, feature flags, example defaults).
           - Secrets: Convex instance secret + admin key (generated if absent), plus existing DB/S3 Secret refs mounted/consumed.
           - PVC (if storage.pvc.enabled).
           - StatefulSet (backend, replicas=1) with probes, envs for DB URL, S3 creds, instance/admin secrets, storage mounts.
-          - Service (backend) exposing Convex API and HTTP action ports.
-          - Deployment (dashboard, optional) with Service; env points to backend Service.
-          - Gateway API Gateway (bound to existing gatewayClassName, example "nginx") and HTTPRoute routing host to backend/dashboard paths.
+              - Service (backend) exposing Convex API and HTTP action ports.
+              - Deployment (dashboard, optional) with Service; env points to backend Service.
+              - Gateway API Gateway (bound to existing gatewayClassName, example "nginx") and HTTPRoute routing host to backend/dashboard paths.
       - Interactions:
-          - DB: consume DB_URL (actual key from urlKey) via projected Secret; no schema management.
-          - S3: consume endpoint/access/secret/bucket keys when enabled; set Convex env vars accordingly.
-          - Storage: PVC mounted to backend pod for SQLite/local disk when required.
+              - DB: surface POSTGRES_URL (or MYSQL_URL for mysql engine) from db.urlKey via Secret; no schema management; fallback to SQLite when unset.
+              - S3: consume endpoint/region/access/secret/bucket keys when enabled; set AWS envs (AWS_REGION/ACCESS_KEY_ID/SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL/_S3) and S3_STORAGE_* bucket vars; fallback to local storage when missing.
+              - Storage: PVC mounted to backend pod for SQLite/local disk when required.
   - Reconciliation flows
       - Create/Initial
           - Add finalizer; validate spec (env values, required refs).

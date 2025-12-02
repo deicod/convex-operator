@@ -152,6 +152,10 @@ spec:
                         type: boolean
                       endpointKey:
                         type: string
+                      regionKey:
+                        description: RegionKey is the key inside the Secret containing
+                          the AWS region.
+                        type: string
                       secretAccessKeyKey:
                         type: string
                       secretRef:

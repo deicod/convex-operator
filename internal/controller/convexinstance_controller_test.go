@@ -883,7 +883,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 		It("should fail validation when DB secret is missing the urlKey", func() {
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
-			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.Engine = dbEnginePostgres
 			instance.Spec.Backend.DB.SecretRef = "pg-secret-missing-key"
 			instance.Spec.Backend.DB.URLKey = "url"
 			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
@@ -917,7 +917,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 		It("should fail validation when DB engine is postgres and urlKey is missing", func() {
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
-			instance.Spec.Backend.DB.Engine = "postgres"
+			instance.Spec.Backend.DB.Engine = dbEnginePostgres
 			instance.Spec.Backend.DB.SecretRef = "pg-secret"
 			instance.Spec.Backend.DB.URLKey = ""
 			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
@@ -942,6 +942,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 			instance.Spec.Backend.S3.Enabled = true
 			instance.Spec.Backend.S3.SecretRef = "s3-secret"
 			instance.Spec.Backend.S3.EndpointKey = ""
+			instance.Spec.Backend.S3.RegionKey = "region"
+			instance.Spec.Backend.S3.AccessKeyIDKey = "accessKeyId"
+			instance.Spec.Backend.S3.SecretAccessKeyKey = "secretAccessKey"
+			instance.Spec.Backend.S3.BucketKey = "bucket"
 			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
 
 			controllerReconciler, recorder := newReconciler()
@@ -965,6 +969,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			instance.Spec.Backend.S3.Enabled = true
 			instance.Spec.Backend.S3.SecretRef = "s3-secret-missing-key"
 			instance.Spec.Backend.S3.EndpointKey = "endpoint"
+			instance.Spec.Backend.S3.RegionKey = "region"
 			instance.Spec.Backend.S3.AccessKeyIDKey = "accessKeyId"
 			instance.Spec.Backend.S3.SecretAccessKeyKey = "secretAccessKey"
 			instance.Spec.Backend.S3.BucketKey = "bucket"
@@ -977,6 +982,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 				},
 				Data: map[string][]byte{
 					"endpoint":        []byte("https://s3.example.com"),
+					"region":          []byte("us-east-1"),
 					"accessKeyId":     []byte("id"),
 					"secretAccessKey": []byte("secret"),
 				},
@@ -1287,7 +1293,7 @@ var _ = Describe("config and secret helpers", func() {
 				Backend: convexv1alpha1.BackendSpec{
 					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
 					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:    "postgres",
+						Engine:    dbEnginePostgres,
 						SecretRef: "db-secret",
 						URLKey:    "url",
 					},
@@ -1295,6 +1301,7 @@ var _ = Describe("config and secret helpers", func() {
 						Enabled:            true,
 						SecretRef:          "s3-secret",
 						EndpointKey:        "endpoint",
+						RegionKey:          "region",
 						AccessKeyIDKey:     "accessKey",
 						SecretAccessKeyKey: "secretAccessKey",
 						BucketKey:          "bucket",
@@ -1355,22 +1362,102 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Name).To(Equal(generatedSecretName(instance)))
 		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Key).To(Equal(instanceSecretKey))
 
-		dbEnv := getEnv("CONVEX_DB_URL")
+		dbEnv := getEnv("POSTGRES_URL")
 		Expect(dbEnv).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("db-secret"))
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
 
-		Expect(getEnv("CONVEX_S3_ENDPOINT")).NotTo(BeNil())
-		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
-		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("accessKey"))
-		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("secretAccessKey"))
-		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("AWS_REGION")).NotTo(BeNil())
+		Expect(getEnv("AWS_REGION").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_REGION").ValueFrom.SecretKeyRef.Key).To(Equal("region"))
+		Expect(getEnv("AWS_ACCESS_KEY_ID")).NotTo(BeNil())
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("accessKey"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY")).NotTo(BeNil())
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("secretAccessKey"))
+		Expect(getEnv("AWS_ENDPOINT_URL_S3")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("AWS_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+	})
+
+	It("sets MYSQL_URL when mysql engine is configured", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "env-vars-mysql",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:    "mysql",
+						SecretRef: "mysql-secret",
+						URLKey:    "url",
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "env-vars-mysql.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+			dbResourceVersion: "db-rv",
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		dbEnv := getEnv("MYSQL_URL")
+		Expect(dbEnv).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("mysql-secret"))
+		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
+		Expect(getEnv("POSTGRES_URL")).To(BeNil())
 	})
 })
 
@@ -1505,7 +1592,7 @@ var _ = Describe("envtest lifecycle suites", func() {
 				Backend: convexv1alpha1.BackendSpec{
 					Image: "ghcr.io/get-convex/convex-backend:1.0.0",
 					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:    "postgres",
+						Engine:    dbEnginePostgres,
 						SecretRef: "absent-secret",
 						URLKey:    "url",
 					},
@@ -1711,7 +1798,7 @@ var _ = Describe("config and secret helpers", func() {
 				Backend: convexv1alpha1.BackendSpec{
 					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
 					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:    "postgres",
+						Engine:    dbEnginePostgres,
 						SecretRef: "db-secret",
 						URLKey:    "url",
 					},
@@ -1719,6 +1806,7 @@ var _ = Describe("config and secret helpers", func() {
 						Enabled:            true,
 						SecretRef:          "s3-secret",
 						EndpointKey:        "endpoint",
+						RegionKey:          "region",
 						AccessKeyIDKey:     "accessKey",
 						SecretAccessKeyKey: "secretAccessKey",
 						BucketKey:          "bucket",
@@ -1779,21 +1867,42 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Name).To(Equal(generatedSecretName(instance)))
 		Expect(instanceSecretEnv.ValueFrom.SecretKeyRef.Key).To(Equal(instanceSecretKey))
 
-		dbEnv := getEnv("CONVEX_DB_URL")
+		dbEnv := getEnv("POSTGRES_URL")
 		Expect(dbEnv).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("db-secret"))
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
 
-		Expect(getEnv("CONVEX_S3_ENDPOINT")).NotTo(BeNil())
-		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_ENDPOINT").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
-		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("accessKey"))
-		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("secretAccessKey"))
-		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
-		Expect(getEnv("CONVEX_S3_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("AWS_REGION")).NotTo(BeNil())
+		Expect(getEnv("AWS_REGION").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_REGION").ValueFrom.SecretKeyRef.Key).To(Equal("region"))
+		Expect(getEnv("AWS_ACCESS_KEY_ID")).NotTo(BeNil())
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("accessKey"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY")).NotTo(BeNil())
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("secretAccessKey"))
+		Expect(getEnv("AWS_ENDPOINT_URL_S3")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("AWS_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
 	})
 })
