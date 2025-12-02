@@ -65,12 +65,6 @@ spec:
                         - mysql
                         - sqlite
                         type: string
-                      requireSSL:
-                        default: true
-                        description: RequireSSL enforces TLS verification when connecting
-                          to the database. Defaults to true; set to false to allow
-                          self-signed certificates.
-                        type: boolean
                       secretRef:
                         description: SecretRef names the Secret holding the DB connection
                           URL.

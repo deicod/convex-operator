@@ -1368,7 +1368,6 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(dbEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("db-secret"))
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
-		Expect(getEnv("DO_NOT_REQUIRE_SSL")).To(BeNil())
 
 		Expect(getEnv("AWS_REGION")).NotTo(BeNil())
 		Expect(getEnv("AWS_REGION").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
@@ -1400,62 +1399,6 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET")).NotTo(BeNil())
 		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
 		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
-	})
-
-	It("sets DO_NOT_REQUIRE_SSL when db.requireSSL is false", func() {
-		requireSSL := false
-		instance := &convexv1alpha1.ConvexInstance{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "env-vars-no-db-ssl",
-				Namespace: "default",
-			},
-			Spec: convexv1alpha1.ConvexInstanceSpec{
-				Environment: "prod",
-				Version:     "9.9.9",
-				Backend: convexv1alpha1.BackendSpec{
-					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
-					DB: convexv1alpha1.BackendDatabaseSpec{
-						Engine:     "postgres",
-						SecretRef:  "db-secret",
-						URLKey:     "url",
-						RequireSSL: &requireSSL,
-					},
-				},
-				Networking: convexv1alpha1.NetworkingSpec{
-					Host: "env-vars-no-db-ssl.example.com",
-				},
-			},
-		}
-		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
-		DeferCleanup(func() {
-			_ = k8sClient.Delete(ctx, instance)
-		})
-
-		reconciler := &ConvexInstanceReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
-		}
-
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
-			dbResourceVersion: "db-rv",
-		})
-		Expect(err).NotTo(HaveOccurred())
-
-		sts := &appsv1.StatefulSet{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
-		envs := sts.Spec.Template.Spec.Containers[0].Env
-
-		getEnv := func(name string) *corev1.EnvVar {
-			for i := range envs {
-				if envs[i].Name == name {
-					return &envs[i]
-				}
-			}
-			return nil
-		}
-
-		Expect(getEnv("DO_NOT_REQUIRE_SSL")).NotTo(BeNil())
-		Expect(getEnv("DO_NOT_REQUIRE_SSL").Value).To(Equal("1"))
 	})
 
 	It("sets MYSQL_URL when mysql engine is configured", func() {
