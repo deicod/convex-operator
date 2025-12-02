@@ -853,6 +853,13 @@ func dbURLVarNames(engine string) []string {
 	}
 }
 
+func requireDBSSL(instance *convexv1alpha1.ConvexInstance) bool {
+	if instance.Spec.Backend.DB.RequireSSL == nil {
+		return true
+	}
+	return *instance.Spec.Backend.DB.RequireSSL
+}
+
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
@@ -1065,6 +1072,13 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 				ValueFrom: dbEnvSource,
 			})
 		}
+	}
+
+	if !requireDBSSL(instance) {
+		env = append(env, corev1.EnvVar{
+			Name:  "DO_NOT_REQUIRE_SSL",
+			Value: "1",
+		})
 	}
 
 	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {

@@ -89,6 +89,11 @@ type BackendDatabaseSpec struct {
 	// URLKey is the key inside the Secret containing the DB URL.
 	// +optional
 	URLKey string `json:"urlKey,omitempty"`
+
+	// RequireSSL enforces TLS verification when connecting to the database. Defaults to true; set to false to allow self-signed certificates.
+	// +kubebuilder:default:=true
+	// +optional
+	RequireSSL *bool `json:"requireSSL,omitempty"`
 }
 
 // BackendStorageSpec defines storage settings for Convex.
