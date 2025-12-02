@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -240,6 +241,29 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					inst.Spec.Networking.TLSSecretRef == secret.Name ||
 					generatedSecretName(&inst) == secret.Name {
 					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+					continue
+				}
+				secretRefs, _ := backendEnvRefs(&inst)
+				if _, ok := secretRefs[secret.Name]; ok {
+					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			cm, ok := obj.(*corev1.ConfigMap)
+			if !ok {
+				return nil
+			}
+			var instances convexv1alpha1.ConvexInstanceList
+			if err := r.List(ctx, &instances, client.InNamespace(cm.Namespace)); err != nil {
+				return nil
+			}
+			var requests []reconcile.Request
+			for _, inst := range instances.Items {
+				_, configRefs := backendEnvRefs(&inst)
+				if _, ok := configRefs[cm.Name]; ok {
+					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
 				}
 			}
 			return requests
@@ -252,6 +276,8 @@ type externalSecretVersions struct {
 	dbResourceVersion  string
 	s3ResourceVersion  string
 	tlsResourceVersion string
+	envSecretVersions  map[string]string
+	envConfigVersions  map[string]string
 }
 
 type upgradePlan struct {
@@ -349,6 +375,8 @@ func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
 	result := externalSecretVersions{}
+	result.envSecretVersions = map[string]string{}
+	result.envConfigVersions = map[string]string{}
 	db := instance.Spec.Backend.DB
 	if db.Engine != dbEngineSQLite && db.SecretRef == "" {
 		return result, fmt.Errorf("db secret is required for engine %q", db.Engine)
@@ -416,6 +444,32 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 			return result, fmt.Errorf("tls secret %q: %w", ref, err)
 		}
 		result.tlsResourceVersion = secret.ResourceVersion
+	}
+
+	secretRefs, configRefs := backendEnvRefs(instance)
+	for name, keys := range secretRefs {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: instance.Namespace}, secret); err != nil {
+			return result, fmt.Errorf("env secret %q: %w", name, err)
+		}
+		for key := range keys {
+			if _, ok := secret.Data[key]; !ok {
+				return result, fmt.Errorf("env secret %q missing key %q", name, key)
+			}
+		}
+		result.envSecretVersions[name] = secret.ResourceVersion
+	}
+	for name, keys := range configRefs {
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: instance.Namespace}, cm); err != nil {
+			return result, fmt.Errorf("env configmap %q: %w", name, err)
+		}
+		for key := range keys {
+			if _, ok := cm.Data[key]; !ok {
+				return result, fmt.Errorf("env configmap %q missing key %q", name, key)
+			}
+		}
+		result.envConfigVersions[name] = cm.ResourceVersion
 	}
 	return result, nil
 }
@@ -889,6 +943,29 @@ func deduplicateEnvs(env []corev1.EnvVar) []corev1.EnvVar {
 	return dedup
 }
 
+func backendEnvRefs(instance *convexv1alpha1.ConvexInstance) (map[string]map[string]bool, map[string]map[string]bool) {
+	secretRefs := map[string]map[string]bool{}
+	configRefs := map[string]map[string]bool{}
+	for _, env := range instance.Spec.Backend.Env {
+		if env.ValueFrom == nil {
+			continue
+		}
+		if ref := env.ValueFrom.SecretKeyRef; ref != nil && ref.Name != "" && ref.Key != "" {
+			if _, ok := secretRefs[ref.Name]; !ok {
+				secretRefs[ref.Name] = map[string]bool{}
+			}
+			secretRefs[ref.Name][ref.Key] = true
+		}
+		if ref := env.ValueFrom.ConfigMapKeyRef; ref != nil && ref.Name != "" && ref.Key != "" {
+			if _, ok := configRefs[ref.Name]; !ok {
+				configRefs[ref.Name] = map[string]bool{}
+			}
+			configRefs[ref.Name][ref.Key] = true
+		}
+	}
+	return secretRefs, configRefs
+}
+
 func backendEnv(instance *convexv1alpha1.ConvexInstance, backendVersion, secretName string) []corev1.EnvVar {
 	if backendVersion == "" {
 		backendVersion = instance.Spec.Version
@@ -1045,6 +1122,18 @@ func envSignature(env []corev1.EnvVar) string {
 		}
 	}
 	return configHash(parts[0], parts[1:]...)
+}
+
+func envResourceVersionSignature(ext externalSecretVersions) []string {
+	parts := []string{}
+	for name, rv := range ext.envSecretVersions {
+		parts = append(parts, fmt.Sprintf("secret:%s:%s", name, rv))
+	}
+	for name, rv := range ext.envConfigVersions {
+		parts = append(parts, fmt.Sprintf("config:%s:%s", name, rv))
+	}
+	sort.Strings(parts)
+	return parts
 }
 
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
@@ -1255,15 +1344,8 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 
 	podSpec := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: labels,
-			Annotations: map[string]string{
-				"convex.icod.de/config-hash": configHash(
-					r.renderBackendConfig(instance, backendVersion),
-					generatedSecretRV,
-					extVersions.dbResourceVersion,
-					extVersions.s3ResourceVersion,
-				),
-			},
+			Labels:      labels,
+			Annotations: map[string]string{},
 		},
 		Spec: corev1.PodSpec{
 			SecurityContext: podSC,
@@ -1304,6 +1386,16 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			Volumes: volumes,
 		},
 	}
+	hashValues := []string{
+		generatedSecretRV,
+		extVersions.dbResourceVersion,
+		extVersions.s3ResourceVersion,
+	}
+	hashValues = append(hashValues, envResourceVersionSignature(extVersions)...)
+	podSpec.Annotations["convex.icod.de/config-hash"] = configHash(
+		r.renderBackendConfig(instance, backendVersion),
+		hashValues...,
+	)
 
 	stsSpec := appsv1.StatefulSetSpec{
 		ServiceName: serviceName,
