@@ -1170,6 +1170,30 @@ spec:
                     description: Host is the external hostname routed to backend/dashboard.
                     minLength: 1
                     type: string
+                  parentRefs:
+                    description: ParentRefs overrides the operator-managed Gateway;
+                      when set, HTTPRoutes attach to these parent Gateways and the
+                      operator skips creating its own Gateway.
+                    items:
+                      description: ParentReference selects an existing Gateway for
+                        the HTTPRoute to attach to.
+                      properties:
+                        name:
+                          description: Name is the name of the parent Gateway.
+                          minLength: 1
+                          type: string
+                        namespace:
+                          description: Namespace is the namespace of the parent Gateway.
+                            Defaults to the ConvexInstance namespace.
+                          type: string
+                        sectionName:
+                          description: SectionName targets a specific listener on
+                            the parent Gateway.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
                   tlsSecretRef:
                     description: TLSSecretRef names the TLS secret used by Gateway/Ingress.
                     type: string

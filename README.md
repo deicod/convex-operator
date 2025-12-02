@@ -22,14 +22,14 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 - `spec.environment` (`dev|prod`) and `spec.version` (Convex image tag) are required.
 - `spec.backend`: image (defaults to Convex backend), `db.engine` (`postgres|mysql|sqlite`) plus Secret/key refs, `storage.mode` (`sqlite|external`) with optional PVC, S3 secret/key wiring, and optional `security` overrides for pod/container contexts (defaults defer to the image user, avoiding forced `runAsNonRoot`).
 - `spec.dashboard`: enabled flag (default true), image (defaults to Convex dashboard), replicas/resources; defaults run the dashboard as UID `1001` with `runAsNonRoot: true` to match the official image, configurable via `security`.
-- `spec.networking`: hostname, `gatewayClassName` (defaults to `nginx`), optional `gatewayAnnotations` (defaults to `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`), and TLS secret reference. The default assumes NGINX Gateway Fabric and annotates the generated Gateway for cert-manager; set `gatewayAnnotations: {}` or provide your own map to override/disable.
+- `spec.networking`: hostname, optional `parentRefs` to attach the HTTPRoute to an existing Gateway (skips creating a Gateway), `gatewayClassName` (defaults to `nginx`), optional `gatewayAnnotations` (defaults to `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`), and TLS secret reference. The default assumes NGINX Gateway Fabric and annotates the generated Gateway for cert-manager; set `gatewayAnnotations: {}` or provide your own map to override/disable.
 - `spec.maintenance.upgradeStrategy`: `inPlace` (default) or `exportImport`; `spec.scale.backend` provides CPU target/max memory hints.
 
 Samples live in `config/samples/` (`convex-dev`, `convex-prod`) and mirror the specification in `SPEC.md`.
 
 ### Gateway and TLS assumptions
 - The operator assumes a `GatewayClass` named `nginx` by default (see `spec.networking.gatewayClassName`). Change it in the ConvexInstance spec to match your installed Gateway implementation.
-- A Gateway and HTTPRoute are created per instance, using the provided `spec.networking.host` and optional `spec.networking.tlsSecretRef` for TLS. The generated Gateway is annotated by default with `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136` to let cert-manager issue the TLS Secret you reference; override with `gatewayAnnotations` or clear it via `gatewayAnnotations: {}` if you do not want cert-manager involved.
+- By default the operator creates a Gateway per instance using `spec.networking.gatewayClassName` and annotates it for cert-manager; set `parentRefs` to attach the HTTPRoute to an existing Gateway and skip Gateway reconciliation. TLS on the shared Gateway must then be handled externally.
 - If your cluster lacks the referenced GatewayClass, the `GatewayReady`/`HTTPRouteReady` conditions will stay `False`; install the class or update the spec to a class that exists.
 
 ### Status and Conditions

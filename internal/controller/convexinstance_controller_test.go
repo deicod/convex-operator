@@ -715,6 +715,43 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(*actionRule.Matches[0].Path.Value).To(Equal("/http_action/"))
 		})
 
+		It("should skip Gateway reconciliation and attach HTTPRoute to provided parentRef", func() {
+			controllerReconciler, _ := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"parentRefs":[{"name":"public","namespace":"nginx-gateway","sectionName":"web"}]}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			Expect(instance.Spec.Networking.ParentRefs).To(HaveLen(1))
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() bool {
+				gw := &gatewayv1.Gateway{}
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)
+				return errors.IsNotFound(err)
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			parent := route.Spec.ParentRefs[0]
+			Expect(parent.Name).To(Equal(gatewayv1.ObjectName("public")))
+			Expect(parent.Namespace).NotTo(BeNil())
+			Expect(string(*parent.Namespace)).To(Equal("nginx-gateway"))
+			Expect(parent.SectionName).NotTo(BeNil())
+			Expect(string(*parent.SectionName)).To(Equal("web"))
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			gwCond := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
+			Expect(gwCond).NotTo(BeNil())
+			Expect(gwCond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(gwCond.Reason).To(Equal("Skipped"))
+		})
+
 		It("should honor custom gateway annotations and override defaults", func() {
 			controllerReconciler, _ := newReconciler()
 
