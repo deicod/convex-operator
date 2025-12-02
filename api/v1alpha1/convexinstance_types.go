@@ -156,6 +156,10 @@ type DashboardSpec struct {
 	// Security allows overriding pod/container security contexts for the dashboard Deployment.
 	// +kubebuilder:default:={}
 	Security SecuritySpec `json:"security,omitempty"`
+
+	// PrefillAdminKey controls whether the dashboard receives NEXT_PUBLIC_ADMIN_KEY (default false to avoid exposing the key in the browser).
+	// +optional
+	PrefillAdminKey bool `json:"prefillAdminKey,omitempty"`
 }
 
 // NetworkingSpec captures external routing details.
@@ -163,6 +167,18 @@ type NetworkingSpec struct {
 	// Host is the external hostname routed to backend/dashboard.
 	// +kubebuilder:validation:MinLength=1
 	Host string `json:"host"`
+
+	// DeploymentURL sets NEXT_PUBLIC_DEPLOYMENT_URL for the dashboard; defaults to the external host (scheme derived from TLS).
+	// +optional
+	DeploymentURL string `json:"deploymentUrl,omitempty"`
+
+	// CloudOrigin sets CONVEX_CLOUD_ORIGIN; defaults to the external host (scheme derived from TLS).
+	// +optional
+	CloudOrigin string `json:"cloudOrigin,omitempty"`
+
+	// SiteOrigin sets CONVEX_SITE_ORIGIN; defaults to the external host (scheme derived from TLS).
+	// +optional
+	SiteOrigin string `json:"siteOrigin,omitempty"`
 
 	// ParentRefs overrides the operator-managed Gateway; when set, HTTPRoutes attach to these parent Gateways and the operator skips creating its own Gateway.
 	// +optional
