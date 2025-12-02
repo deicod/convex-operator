@@ -1121,7 +1121,8 @@ var _ = Describe("upgrade plan helpers", func() {
 		desiredHash := desiredUpgradeHash(instance)
 		instance.Status.UpgradeHash = desiredHash
 
-		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, instance.Spec.Dashboard.Image, instance.Spec.Version, false, false, true, true, desiredHash)
+		currentEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
+		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, instance.Spec.Dashboard.Image, instance.Spec.Version, currentEnv, false, false, true, true, desiredHash)
 
 		Expect(plan.exportFailed).To(BeTrue())
 		Expect(plan.importFailed).To(BeTrue())
@@ -1236,12 +1237,13 @@ var _ = Describe("upgrade plan helpers", func() {
 		currentBackendImage := "ghcr.io/get-convex/convex-backend:1.0.0"
 		currentDashboardImage := "ghcr.io/get-convex/convex-dashboard:1.0.0"
 		currentBackendVersion := "1.0.0"
+		currentEnv := backendEnv(instance, currentBackendVersion, generatedSecretName(instance))
 
-		appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage)
-		Expect(appliedHash).To(Equal(configHash(currentBackendVersion, currentBackendImage, currentDashboardImage)))
+		appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage, currentEnv)
+		Expect(appliedHash).To(Equal(configHash(currentBackendVersion, currentBackendImage, currentDashboardImage, envSignature(currentEnv))))
 		Expect(appliedHash).NotTo(Equal(desiredHash))
 
-		plan := buildUpgradePlan(instance, true, currentBackendImage, currentDashboardImage, currentBackendVersion, false, false, false, false, desiredHash)
+		plan := buildUpgradePlan(instance, true, currentBackendImage, currentDashboardImage, currentBackendVersion, currentEnv, false, false, false, false, desiredHash)
 		Expect(plan.upgradePlanned).To(BeTrue())
 		Expect(plan.upgradePending).To(BeTrue())
 		Expect(plan.currentBackendImage).To(Equal(currentBackendImage))
@@ -1269,10 +1271,11 @@ var _ = Describe("upgrade plan helpers", func() {
 		}
 
 		desiredHash := desiredUpgradeHash(instance)
-		appliedHash := observedUpgradeHash(instance, instance.Spec.Version, instance.Spec.Backend.Image, "")
+		currentEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
+		appliedHash := observedUpgradeHash(instance, instance.Spec.Version, instance.Spec.Backend.Image, "", currentEnv)
 		Expect(desiredHash).To(Equal(appliedHash))
 
-		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, "", instance.Spec.Version, false, false, false, false, desiredHash)
+		plan := buildUpgradePlan(instance, true, instance.Spec.Backend.Image, "", instance.Spec.Version, currentEnv, false, false, false, false, desiredHash)
 		Expect(plan.upgradePending).To(BeFalse())
 		Expect(plan.upgradePlanned).To(BeFalse())
 	})
@@ -1305,6 +1308,7 @@ var _ = Describe("config and secret helpers", func() {
 						AccessKeyIDKey:     "accessKey",
 						SecretAccessKeyKey: "secretAccessKey",
 						BucketKey:          "bucket",
+						EmitS3EndpointUrl:  true,
 					},
 				},
 				Networking: convexv1alpha1.NetworkingSpec{
@@ -1387,6 +1391,9 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(getEnv("AWS_ENDPOINT_URL")).NotTo(BeNil())
 		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
 		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
+		Expect(getEnv("S3_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("S3_ENDPOINT_URL").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("S3_ENDPOINT_URL").ValueFrom.SecretKeyRef.Key).To(Equal("endpoint"))
 		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET")).NotTo(BeNil())
 		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
 		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
@@ -1517,6 +1524,73 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("mysql-secret"))
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
 		Expect(getEnv("POSTGRES_URL")).To(BeNil())
+	})
+
+	It("renders telemetry/logging envs and merges custom env overrides", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "custom-envs",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine: "sqlite",
+					},
+					Telemetry: convexv1alpha1.BackendTelemetrySpec{
+						DisableBeacon: true,
+					},
+					Logging: convexv1alpha1.BackendLoggingSpec{
+						RedactLogsToClient: true,
+					},
+					Env: []corev1.EnvVar{
+						{Name: "CUSTOM_FLAG", Value: "on"},
+						{Name: "INSTANCE_NAME", Value: "override_name"},
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "custom-envs.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		Expect(getEnv("DISABLE_BEACON")).NotTo(BeNil())
+		Expect(getEnv("DISABLE_BEACON").Value).To(Equal("true"))
+		Expect(getEnv("REDACT_LOGS_TO_CLIENT")).NotTo(BeNil())
+		Expect(getEnv("REDACT_LOGS_TO_CLIENT").Value).To(Equal("true"))
+		Expect(getEnv("CUSTOM_FLAG")).NotTo(BeNil())
+		Expect(getEnv("CUSTOM_FLAG").Value).To(Equal("on"))
+		// User-supplied env should override the operator-provided INSTANCE_NAME.
+		Expect(getEnv("INSTANCE_NAME")).NotTo(BeNil())
+		Expect(getEnv("INSTANCE_NAME").Value).To(Equal("override_name"))
 	})
 
 	It("allows overriding INSTANCE_NAME via backend.db.databaseName", func() {

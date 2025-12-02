@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -155,6 +156,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	currentBackendImage := ""
+	currentBackendEnv := []corev1.EnvVar{}
 	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
 		currentBackendImage = existingBackend.Spec.Template.Spec.Containers[0].Image
 	}
@@ -165,12 +167,13 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	currentBackendVersion := ""
 	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
 		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
+		currentBackendEnv = deduplicateEnvs(existingBackend.Spec.Template.Spec.Containers[0].Env)
 	}
 
 	desiredHash := desiredUpgradeHash(instance)
 	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
 
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
@@ -238,6 +241,35 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					inst.Spec.Networking.TLSSecretRef == secret.Name ||
 					generatedSecretName(&inst) == secret.Name {
 					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+					continue
+				}
+				secretRefs, _ := backendEnvRefs(&inst)
+				for _, ref := range secretRefs {
+					if ref.name == secret.Name {
+						requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+						break
+					}
+				}
+			}
+			return requests
+		})).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			cm, ok := obj.(*corev1.ConfigMap)
+			if !ok {
+				return nil
+			}
+			var instances convexv1alpha1.ConvexInstanceList
+			if err := r.List(ctx, &instances, client.InNamespace(cm.Namespace)); err != nil {
+				return nil
+			}
+			var requests []reconcile.Request
+			for _, inst := range instances.Items {
+				_, configRefs := backendEnvRefs(&inst)
+				for _, ref := range configRefs {
+					if ref.name == cm.Name {
+						requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+						break
+					}
 				}
 			}
 			return requests
@@ -250,6 +282,130 @@ type externalSecretVersions struct {
 	dbResourceVersion  string
 	s3ResourceVersion  string
 	tlsResourceVersion string
+	envSecretVersions  map[string]string
+	envConfigVersions  map[string]string
+}
+
+type envRef struct {
+	name     string
+	key      string
+	optional bool
+}
+
+func (r *ConvexInstanceReconciler) validateDBRef(ctx context.Context, namespace string, db convexv1alpha1.BackendDatabaseSpec) (string, error) {
+	if db.Engine != dbEngineSQLite && db.SecretRef == "" {
+		return "", fmt.Errorf("db secret is required for engine %q", db.Engine)
+	}
+	if db.Engine != dbEngineSQLite && db.URLKey == "" {
+		return "", fmt.Errorf("db urlKey is required for engine %q", db.Engine)
+	}
+	if ref := db.SecretRef; ref != "" {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: namespace}, secret); err != nil {
+			return "", fmt.Errorf("db secret %q: %w", ref, err)
+		}
+		if db.URLKey != "" {
+			if _, ok := secret.Data[db.URLKey]; !ok {
+				return "", fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
+			}
+		}
+		return secret.ResourceVersion, nil
+	}
+	return "", nil
+}
+
+func (r *ConvexInstanceReconciler) validateS3Ref(ctx context.Context, namespace string, s3 convexv1alpha1.BackendS3Spec) (string, error) {
+	if !s3.Enabled {
+		return "", nil
+	}
+	if s3.SecretRef == "" {
+		return "", fmt.Errorf("s3 secret is required when s3 is enabled")
+	}
+	requiredS3Keys := []struct {
+		field string
+		value string
+	}{
+		{field: "endpointKey", value: s3.EndpointKey},
+		{field: "accessKeyIdKey", value: s3.AccessKeyIDKey},
+		{field: "secretAccessKeyKey", value: s3.SecretAccessKeyKey},
+		{field: "bucketKey", value: s3.BucketKey},
+		{field: "regionKey", value: s3.RegionKey},
+	}
+	for _, key := range requiredS3Keys {
+		if key.value == "" {
+			return "", fmt.Errorf("s3 %s is required when s3 is enabled", key.field)
+		}
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: s3.SecretRef, Namespace: namespace}, secret); err != nil {
+		return "", fmt.Errorf("s3 secret %q: %w", s3.SecretRef, err)
+	}
+	keys := []string{
+		s3.EndpointKey,
+		s3.RegionKey,
+		s3.AccessKeyIDKey,
+		s3.SecretAccessKeyKey,
+		s3.BucketKey,
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, ok := secret.Data[key]; !ok {
+			return "", fmt.Errorf("s3 secret %q missing key %q", s3.SecretRef, key)
+		}
+	}
+	return secret.ResourceVersion, nil
+}
+
+func (r *ConvexInstanceReconciler) validateTLSRef(ctx context.Context, namespace, ref string) (string, error) {
+	if ref == "" {
+		return "", nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: namespace}, secret); err != nil {
+		return "", fmt.Errorf("tls secret %q: %w", ref, err)
+	}
+	return secret.ResourceVersion, nil
+}
+
+func (r *ConvexInstanceReconciler) validateBackendEnvRefs(ctx context.Context, namespace string, instance *convexv1alpha1.ConvexInstance) (map[string]string, map[string]string, error) {
+	secretVersions := map[string]string{}
+	configVersions := map[string]string{}
+	secretRefs, configRefs := backendEnvRefs(instance)
+	for _, ref := range secretRefs {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: namespace}, secret); err != nil {
+			if ref.optional && errors.IsNotFound(err) {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env secret %q: %w", ref.name, err)
+		}
+		if _, ok := secret.Data[ref.key]; !ok {
+			if ref.optional {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env secret %q missing key %q", ref.name, ref.key)
+		}
+		secretVersions[ref.name] = secret.ResourceVersion
+	}
+	for _, ref := range configRefs {
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: namespace}, cm); err != nil {
+			if ref.optional && errors.IsNotFound(err) {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env configmap %q: %w", ref.name, err)
+		}
+		if _, ok := cm.Data[ref.key]; !ok {
+			if ref.optional {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env configmap %q missing key %q", ref.name, ref.key)
+		}
+		configVersions[ref.name] = cm.ResourceVersion
+	}
+	return secretVersions, configVersions, nil
 }
 
 type upgradePlan struct {
@@ -347,73 +503,20 @@ func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
 	result := externalSecretVersions{}
-	db := instance.Spec.Backend.DB
-	if db.Engine != dbEngineSQLite && db.SecretRef == "" {
-		return result, fmt.Errorf("db secret is required for engine %q", db.Engine)
+	result.envSecretVersions = map[string]string{}
+	result.envConfigVersions = map[string]string{}
+	var err error
+	if result.dbResourceVersion, err = r.validateDBRef(ctx, instance.Namespace, instance.Spec.Backend.DB); err != nil {
+		return result, err
 	}
-	if db.Engine != dbEngineSQLite && db.URLKey == "" {
-		return result, fmt.Errorf("db urlKey is required for engine %q", db.Engine)
+	if result.s3ResourceVersion, err = r.validateS3Ref(ctx, instance.Namespace, instance.Spec.Backend.S3); err != nil {
+		return result, err
 	}
-	if ref := db.SecretRef; ref != "" {
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-			return result, fmt.Errorf("db secret %q: %w", ref, err)
-		}
-		if db.URLKey != "" {
-			if _, ok := secret.Data[db.URLKey]; !ok {
-				return result, fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
-			}
-		}
-		result.dbResourceVersion = secret.ResourceVersion
+	if result.tlsResourceVersion, err = r.validateTLSRef(ctx, instance.Namespace, instance.Spec.Networking.TLSSecretRef); err != nil {
+		return result, err
 	}
-	if instance.Spec.Backend.S3.Enabled {
-		if instance.Spec.Backend.S3.SecretRef == "" {
-			return result, fmt.Errorf("s3 secret is required when s3 is enabled")
-		}
-		requiredS3Keys := []struct {
-			field string
-			value string
-		}{
-			{field: "endpointKey", value: instance.Spec.Backend.S3.EndpointKey},
-			{field: "accessKeyIdKey", value: instance.Spec.Backend.S3.AccessKeyIDKey},
-			{field: "secretAccessKeyKey", value: instance.Spec.Backend.S3.SecretAccessKeyKey},
-			{field: "bucketKey", value: instance.Spec.Backend.S3.BucketKey},
-			{field: "regionKey", value: instance.Spec.Backend.S3.RegionKey},
-		}
-		for _, key := range requiredS3Keys {
-			if key.value == "" {
-				return result, fmt.Errorf("s3 %s is required when s3 is enabled", key.field)
-			}
-		}
-		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
-			secret := &corev1.Secret{}
-			if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-				return result, fmt.Errorf("s3 secret %q: %w", ref, err)
-			}
-			keys := []string{
-				instance.Spec.Backend.S3.EndpointKey,
-				instance.Spec.Backend.S3.RegionKey,
-				instance.Spec.Backend.S3.AccessKeyIDKey,
-				instance.Spec.Backend.S3.SecretAccessKeyKey,
-				instance.Spec.Backend.S3.BucketKey,
-			}
-			for _, key := range keys {
-				if key == "" {
-					continue
-				}
-				if _, ok := secret.Data[key]; !ok {
-					return result, fmt.Errorf("s3 secret %q missing key %q", ref, key)
-				}
-			}
-			result.s3ResourceVersion = secret.ResourceVersion
-		}
-	}
-	if ref := instance.Spec.Networking.TLSSecretRef; ref != "" {
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-			return result, fmt.Errorf("tls secret %q: %w", ref, err)
-		}
-		result.tlsResourceVersion = secret.ResourceVersion
+	if result.envSecretVersions, result.envConfigVersions, err = r.validateBackendEnvRefs(ctx, instance.Namespace, instance); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -868,6 +971,212 @@ func backendInstanceName(instance *convexv1alpha1.ConvexInstance) string {
 	return strings.ReplaceAll(instance.Name, "-", "_")
 }
 
+func deduplicateEnvs(env []corev1.EnvVar) []corev1.EnvVar {
+	if len(env) == 0 {
+		return env
+	}
+	seen := map[string]bool{}
+	dedup := make([]corev1.EnvVar, 0, len(env))
+	for i := len(env) - 1; i >= 0; i-- {
+		if seen[env[i].Name] {
+			continue
+		}
+		seen[env[i].Name] = true
+		dedup = append(dedup, env[i])
+	}
+	for i, j := 0, len(dedup)-1; i < j; i, j = i+1, j-1 {
+		dedup[i], dedup[j] = dedup[j], dedup[i]
+	}
+	return dedup
+}
+
+func backendEnvRefs(instance *convexv1alpha1.ConvexInstance) ([]envRef, []envRef) {
+	var secretRefs []envRef
+	var configRefs []envRef
+	for _, env := range instance.Spec.Backend.Env {
+		if env.ValueFrom == nil {
+			continue
+		}
+		if ref := env.ValueFrom.SecretKeyRef; ref != nil && ref.Name != "" && ref.Key != "" {
+			secretRefs = append(secretRefs, envRef{name: ref.Name, key: ref.Key, optional: ptr.Deref(ref.Optional, false)})
+		}
+		if ref := env.ValueFrom.ConfigMapKeyRef; ref != nil && ref.Name != "" && ref.Key != "" {
+			configRefs = append(configRefs, envRef{name: ref.Name, key: ref.Key, optional: ptr.Deref(ref.Optional, false)})
+		}
+	}
+	return secretRefs, configRefs
+}
+
+func backendEnv(instance *convexv1alpha1.ConvexInstance, backendVersion, secretName string) []corev1.EnvVar {
+	if backendVersion == "" {
+		backendVersion = instance.Spec.Version
+	}
+	env := []corev1.EnvVar{}
+	addEnv := func(e corev1.EnvVar) {
+		env = append(env, e)
+	}
+	addEnv(corev1.EnvVar{
+		Name:  "CONVEX_PORT",
+		Value: fmt.Sprintf("%d", defaultBackendPort),
+	})
+	addEnv(corev1.EnvVar{
+		Name:  "CONVEX_ENV",
+		Value: instance.Spec.Environment,
+	})
+	addEnv(corev1.EnvVar{
+		Name:  "CONVEX_VERSION",
+		Value: backendVersion,
+	})
+	addEnv(corev1.EnvVar{
+		Name:  "INSTANCE_NAME",
+		Value: backendInstanceName(instance),
+	})
+	addEnv(corev1.EnvVar{
+		Name: "CONVEX_ADMIN_KEY",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  adminKeyKey,
+			},
+		},
+	})
+	addEnv(corev1.EnvVar{
+		Name: "CONVEX_INSTANCE_SECRET",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  instanceSecretKey,
+			},
+		},
+	})
+
+	if co := cloudOrigin(instance); co != "" {
+		addEnv(corev1.EnvVar{
+			Name:  "CONVEX_CLOUD_ORIGIN",
+			Value: co,
+		})
+	}
+	if so := siteOrigin(instance); so != "" {
+		addEnv(corev1.EnvVar{
+			Name:  "CONVEX_SITE_ORIGIN",
+			Value: so,
+		})
+	}
+
+	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
+		dbEnvSource := &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: ref},
+				Key:                  instance.Spec.Backend.DB.URLKey,
+			},
+		}
+		for _, name := range dbURLVarNames(instance.Spec.Backend.DB.Engine) {
+			addEnv(corev1.EnvVar{
+				Name:      name,
+				ValueFrom: dbEnvSource,
+			})
+		}
+	}
+
+	if !requireDBSSL(instance) {
+		addEnv(corev1.EnvVar{
+			Name:  "DO_NOT_REQUIRE_SSL",
+			Value: "1",
+		})
+	}
+
+	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
+		s3 := instance.Spec.Backend.S3
+		appendS3Env := func(name, key string) {
+			if key == "" {
+				return
+			}
+			addEnv(corev1.EnvVar{
+				Name: name,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: s3.SecretRef},
+						Key:                  key,
+					},
+				},
+			})
+		}
+		appendS3Env("AWS_REGION", s3.RegionKey)
+		appendS3Env("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
+		appendS3Env("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
+		appendS3Env("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
+		appendS3Env("AWS_ENDPOINT_URL", s3.EndpointKey)
+		if s3.EmitS3EndpointUrl {
+			appendS3Env("S3_ENDPOINT_URL", s3.EndpointKey)
+		}
+		appendS3Env("S3_STORAGE_EXPORTS_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_MODULES_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_FILES_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_SEARCH_BUCKET", s3.BucketKey)
+	}
+
+	if instance.Spec.Backend.Telemetry.DisableBeacon {
+		addEnv(corev1.EnvVar{
+			Name:  "DISABLE_BEACON",
+			Value: "true",
+		})
+	}
+	if instance.Spec.Backend.Logging.RedactLogsToClient {
+		addEnv(corev1.EnvVar{
+			Name:  "REDACT_LOGS_TO_CLIENT",
+			Value: "true",
+		})
+	}
+
+	if len(instance.Spec.Backend.Env) > 0 {
+		env = append(env, instance.Spec.Backend.Env...)
+	}
+
+	return deduplicateEnvs(env)
+}
+
+func envSignature(env []corev1.EnvVar) string {
+	if len(env) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(env)*2)
+	for _, e := range env {
+		parts = append(parts, e.Name)
+		switch {
+		case e.Value != "":
+			parts = append(parts, "val:"+e.Value)
+		case e.ValueFrom != nil:
+			if ref := e.ValueFrom.SecretKeyRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("secret:%s/%s", ref.Name, ref.Key))
+			} else if ref := e.ValueFrom.ConfigMapKeyRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("cm:%s/%s", ref.Name, ref.Key))
+			} else if ref := e.ValueFrom.FieldRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("field:%s", ref.FieldPath))
+			} else if ref := e.ValueFrom.ResourceFieldRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("resource:%s", ref.Resource))
+			} else {
+				parts = append(parts, "valueFrom")
+			}
+		default:
+			parts = append(parts, "empty")
+		}
+	}
+	return configHash(parts[0], parts[1:]...)
+}
+
+func envResourceVersionSignature(ext externalSecretVersions) []string {
+	parts := []string{}
+	for name, rv := range ext.envSecretVersions {
+		parts = append(parts, fmt.Sprintf("secret:%s:%s", name, rv))
+	}
+	for name, rv := range ext.envConfigVersions {
+		parts = append(parts, fmt.Sprintf("config:%s:%s", name, rv))
+	}
+	sort.Strings(parts)
+	return parts
+}
+
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
@@ -1021,104 +1330,22 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		"app.kubernetes.io/instance":  instance.Name,
 		"app.kubernetes.io/component": "backend",
 	}
-	env := []corev1.EnvVar{
-		{
-			Name:  "CONVEX_PORT",
-			Value: fmt.Sprintf("%d", defaultBackendPort),
-		},
-		{
-			Name:  "CONVEX_ENV",
-			Value: instance.Spec.Environment,
-		},
-		{
-			Name:  "CONVEX_VERSION",
-			Value: backendVersion,
-		},
-		{
-			Name:  "INSTANCE_NAME",
-			Value: backendInstanceName(instance),
-		},
-		{
-			Name: "CONVEX_ADMIN_KEY",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-					Key:                  adminKeyKey,
-				},
-			},
-		},
-		{
-			Name: "CONVEX_INSTANCE_SECRET",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-					Key:                  instanceSecretKey,
-				},
-			},
-		},
-	}
+	env := backendEnv(instance, backendVersion, secretName)
 
-	if co := cloudOrigin(instance); co != "" {
-		env = append(env, corev1.EnvVar{
-			Name:  "CONVEX_CLOUD_ORIGIN",
-			Value: co,
-		})
-	}
-	if so := siteOrigin(instance); so != "" {
-		env = append(env, corev1.EnvVar{
-			Name:  "CONVEX_SITE_ORIGIN",
-			Value: so,
-		})
-	}
-
-	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
-		dbEnvSource := &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: ref},
-				Key:                  instance.Spec.Backend.DB.URLKey,
-			},
-		}
-		for _, name := range dbURLVarNames(instance.Spec.Backend.DB.Engine) {
-			env = append(env, corev1.EnvVar{
-				Name:      name,
-				ValueFrom: dbEnvSource,
-			})
-		}
-	}
-
-	if !requireDBSSL(instance) {
-		env = append(env, corev1.EnvVar{
-			Name:  "DO_NOT_REQUIRE_SSL",
-			Value: "1",
-		})
-	}
-
-	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
-		s3 := instance.Spec.Backend.S3
-		appendS3Env := func(name, key string) {
-			if key == "" {
-				return
+	if len(env) > 0 {
+		seen := map[string]bool{}
+		dedup := make([]corev1.EnvVar, 0, len(env))
+		for i := len(env) - 1; i >= 0; i-- {
+			if seen[env[i].Name] {
+				continue
 			}
-			env = append(env, corev1.EnvVar{
-				Name: name,
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: s3.SecretRef},
-						Key:                  key,
-					},
-				},
-			})
+			seen[env[i].Name] = true
+			dedup = append(dedup, env[i])
 		}
-		appendS3Env("AWS_REGION", s3.RegionKey)
-		appendS3Env("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
-		appendS3Env("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
-		appendS3Env("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
-		appendS3Env("AWS_ENDPOINT_URL", s3.EndpointKey)
-		appendS3Env("S3_STORAGE_EXPORTS_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_MODULES_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_FILES_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_SEARCH_BUCKET", s3.BucketKey)
+		for i, j := 0, len(dedup)-1; i < j; i, j = i+1, j-1 {
+			dedup[i], dedup[j] = dedup[j], dedup[i]
+		}
+		env = dedup
 	}
 
 	volumes := []corev1.Volume{
@@ -1158,15 +1385,8 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 
 	podSpec := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: labels,
-			Annotations: map[string]string{
-				"convex.icod.de/config-hash": configHash(
-					r.renderBackendConfig(instance, backendVersion),
-					generatedSecretRV,
-					extVersions.dbResourceVersion,
-					extVersions.s3ResourceVersion,
-				),
-			},
+			Labels:      labels,
+			Annotations: map[string]string{},
 		},
 		Spec: corev1.PodSpec{
 			SecurityContext: podSC,
@@ -1207,6 +1427,16 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			Volumes: volumes,
 		},
 	}
+	hashValues := []string{
+		generatedSecretRV,
+		extVersions.dbResourceVersion,
+		extVersions.s3ResourceVersion,
+	}
+	hashValues = append(hashValues, envResourceVersionSignature(extVersions)...)
+	podSpec.Annotations["convex.icod.de/config-hash"] = configHash(
+		r.renderBackendConfig(instance, backendVersion),
+		hashValues...,
+	)
 
 	stsSpec := appsv1.StatefulSetSpec{
 		ServiceName: serviceName,
@@ -1771,21 +2001,24 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 	if !instance.Spec.Dashboard.Enabled {
 		dashboardImage = ""
 	}
+	envSig := envSignature(backendEnv(instance, instance.Spec.Version, generatedSecretName(instance)))
 	return configHash(
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,
 		dashboardImage,
+		envSig,
 	)
 }
 
-func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string) string {
+func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string, currentEnv []corev1.EnvVar) string {
 	if currentBackendImage == "" && currentDashboardImage == "" {
 		return ""
 	}
 	if currentVersion == "" {
 		currentVersion = instance.Spec.Version
 	}
-	return configHash(currentVersion, currentBackendImage, currentDashboardImage)
+	envSig := envSignature(deduplicateEnvs(currentEnv))
+	return configHash(currentVersion, currentBackendImage, currentDashboardImage, envSig)
 }
 
 func backendVersionFromStatefulSet(sts *appsv1.StatefulSet) string {
@@ -2456,7 +2689,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
-func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, currentBackendEnv []corev1.EnvVar, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {
 		strategy = upgradeStrategyInPlace
@@ -2479,7 +2712,7 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	if importFailed {
 		importDone = false
 	}
-	appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage)
+	appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage, currentBackendEnv)
 	upgradePlanned := backendExists && desiredHash != appliedHash
 	upgradePending := backendExists && (desiredHash != appliedHash || (exportDone && !importDone))
 

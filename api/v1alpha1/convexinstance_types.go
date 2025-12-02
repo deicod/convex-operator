@@ -72,9 +72,21 @@ type BackendSpec struct {
 	// +kubebuilder:default:={}
 	S3 BackendS3Spec `json:"s3,omitempty"`
 
+	// Telemetry configures optional beaconing.
+	// +kubebuilder:default:={}
+	Telemetry BackendTelemetrySpec `json:"telemetry,omitempty"`
+
+	// Logging toggles log redaction.
+	// +kubebuilder:default:={}
+	Logging BackendLoggingSpec `json:"logging,omitempty"`
+
 	// Security allows overriding pod/container security contexts for the backend StatefulSet.
 	// +kubebuilder:default:={}
 	Security SecuritySpec `json:"security,omitempty"`
+
+	// Env appends additional environment variables to the backend container. Later entries override earlier ones.
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
 }
 
 // BackendDatabaseSpec describes DB settings and secret references.
@@ -149,6 +161,26 @@ type BackendS3Spec struct {
 	// RegionKey is the key inside the Secret containing the AWS region.
 	// +optional
 	RegionKey string `json:"regionKey,omitempty"`
+
+	// EmitS3EndpointUrl sets S3_ENDPOINT_URL alongside AWS endpoint env vars.
+	// +optional
+	EmitS3EndpointUrl bool `json:"emitS3EndpointUrl,omitempty"`
+}
+
+// BackendTelemetrySpec controls optional beaconing.
+type BackendTelemetrySpec struct {
+	// DisableBeacon opts out of the self-hosted usage beacon.
+	// +kubebuilder:default:=false
+	// +optional
+	DisableBeacon bool `json:"disableBeacon,omitempty"`
+}
+
+// BackendLoggingSpec controls backend logging behaviour.
+type BackendLoggingSpec struct {
+	// RedactLogsToClient enables log redaction before sending logs to clients.
+	// +kubebuilder:default:=false
+	// +optional
+	RedactLogsToClient bool `json:"redactLogsToClient,omitempty"`
 }
 
 // DashboardSpec configures the Convex dashboard deployment.

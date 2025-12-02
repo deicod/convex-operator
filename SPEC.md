@@ -34,6 +34,11 @@
           secretRef: string             # Secret name containing DB URL
           urlKey: string                # key in Secret for DB URL
           databaseName: string          # optional override for INSTANCE_NAME (defaults to instance name with '-' -> '_')
+        telemetry:
+          disableBeacon: bool           # opt-out of anonymous beaconing
+        logging:
+          redactLogsToClient: bool      # redact logs before sending to clients
+        env: []EnvVar                   # optional passthrough; later entries override earlier ones
         storage:
           mode: string                  # "sqlite" | "external"
           pvc:
@@ -44,6 +49,7 @@
           enabled: bool
           secretRef: string
           endpointKey: string
+          emitS3EndpointUrl: bool       # optionally emit S3_ENDPOINT_URL alias
           accessKeyIdKey: string
           secretAccessKeyKey: string
           bucketKey: string
