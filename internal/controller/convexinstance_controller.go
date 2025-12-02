@@ -1365,6 +1365,23 @@ func (r *ConvexInstanceReconciler) cleanupUpgradeArtifacts(ctx context.Context, 
 	}
 }
 
+func (r *ConvexInstanceReconciler) deleteManagedGateway(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	gw := &gatewayv1.Gateway{}
+	key := client.ObjectKey{Name: gatewayName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, gw); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if owner := metav1.GetControllerOf(gw); owner != nil {
+		if owner.UID == instance.UID || (owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name) {
+			return r.Delete(ctx, gw)
+		}
+	}
+	return nil
+}
+
 func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
 	gw := &gatewayv1.Gateway{}
 	key := client.ObjectKey{Name: gatewayName(instance), Namespace: instance.Namespace}
@@ -1418,10 +1435,7 @@ func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, insta
 	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
 	spec := gatewayv1.HTTPRouteSpec{
 		CommonRouteSpec: gatewayv1.CommonRouteSpec{
-			ParentRefs: []gatewayv1.ParentReference{{
-				Name:      gatewayv1.ObjectName(gatewayName(instance)),
-				Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
-			}},
+			ParentRefs: routeParentRefs(instance),
 		},
 		Hostnames: []gatewayv1.Hostname{gatewayv1.Hostname(instance.Spec.Networking.Host)},
 		Rules:     httpRouteRules(instance, backendServiceName, dashboardServiceName),
@@ -1483,6 +1497,35 @@ func gatewayAnnotations(instance *convexv1alpha1.ConvexInstance) map[string]stri
 		return copyStringMap(instance.Spec.Networking.GatewayAnnotations)
 	}
 	return defaultGatewayAnnotations()
+}
+
+func useCustomParentRefs(instance *convexv1alpha1.ConvexInstance) bool {
+	return len(instance.Spec.Networking.ParentRefs) > 0
+}
+
+func routeParentRefs(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ParentReference {
+	if !useCustomParentRefs(instance) {
+		return []gatewayv1.ParentReference{{
+			Name:      gatewayv1.ObjectName(gatewayName(instance)),
+			Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+		}}
+	}
+	refs := make([]gatewayv1.ParentReference, 0, len(instance.Spec.Networking.ParentRefs))
+	for _, ref := range instance.Spec.Networking.ParentRefs {
+		ns := ref.Namespace
+		if ns == "" {
+			ns = instance.Namespace
+		}
+		parent := gatewayv1.ParentReference{
+			Name:      gatewayv1.ObjectName(ref.Name),
+			Namespace: ptr.To(gatewayv1.Namespace(ns)),
+		}
+		if ref.SectionName != "" {
+			parent.SectionName = ptr.To(gatewayv1.SectionName(ref.SectionName))
+		}
+		refs = append(refs, parent)
+	}
+	return refs
 }
 
 func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
@@ -2254,16 +2297,28 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 		}
 	}
 
-	gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
-	if err != nil {
-		return result, &resourceErr{
-			reason: "GatewayError",
-			cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
-			err:    err,
+	if useCustomParentRefs(instance) {
+		if err := r.deleteManagedGateway(ctx, instance); err != nil {
+			return result, &resourceErr{
+				reason: "GatewayError",
+				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+				err:    err,
+			}
 		}
+		result.gatewayReady = true
+		result.conds = append(result.conds, conditionTrue(conditionGateway, "Skipped", "Using provided parentRefs"))
+	} else {
+		gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
+		if err != nil {
+			return result, &resourceErr{
+				reason: "GatewayError",
+				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+				err:    err,
+			}
+		}
+		result.gatewayReady = gatewayReady
+		result.conds = append(result.conds, gatewayCond)
 	}
-	result.gatewayReady = gatewayReady
-	result.conds = append(result.conds, gatewayCond)
 
 	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
 	if err != nil {

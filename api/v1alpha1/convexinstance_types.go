@@ -164,6 +164,10 @@ type NetworkingSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Host string `json:"host"`
 
+	// ParentRefs overrides the operator-managed Gateway; when set, HTTPRoutes attach to these parent Gateways and the operator skips creating its own Gateway.
+	// +optional
+	ParentRefs []ParentReference `json:"parentRefs,omitempty"`
+
 	// GatewayClassName selects the GatewayClass for the generated Gateway.
 	// +kubebuilder:default:=nginx
 	// +optional
@@ -177,6 +181,21 @@ type NetworkingSpec struct {
 	// TLSSecretRef names the TLS secret used by Gateway/Ingress.
 	// +optional
 	TLSSecretRef string `json:"tlsSecretRef,omitempty"`
+}
+
+// ParentReference selects an existing Gateway for the HTTPRoute to attach to.
+type ParentReference struct {
+	// Name is the name of the parent Gateway.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace is the namespace of the parent Gateway. Defaults to the ConvexInstance namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// SectionName targets a specific listener on the parent Gateway.
+	// +optional
+	SectionName string `json:"sectionName,omitempty"`
 }
 
 // ScaleSpec defines scaling hints for the backend.
