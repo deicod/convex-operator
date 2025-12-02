@@ -136,6 +136,10 @@ type BackendS3Spec struct {
 
 	// +optional
 	BucketKey string `json:"bucketKey,omitempty"`
+
+	// RegionKey is the key inside the Secret containing the AWS region.
+	// +optional
+	RegionKey string `json:"regionKey,omitempty"`
 }
 
 // DashboardSpec configures the Convex dashboard deployment.

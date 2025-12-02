@@ -29,6 +29,7 @@ spec:
       enabled: true
       secretRef: convex-prod-s3
       endpointKey: endpoint
+      regionKey: region
       accessKeyIdKey: accessKeyId
       secretAccessKeyKey: secretAccessKey
       bucketKey: bucket

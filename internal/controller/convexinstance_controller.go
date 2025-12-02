@@ -366,15 +366,19 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 		if instance.Spec.Backend.S3.SecretRef == "" {
 			return result, fmt.Errorf("s3 secret is required when s3 is enabled")
 		}
-		requiredS3Keys := map[string]string{
-			"endpointKey":        instance.Spec.Backend.S3.EndpointKey,
-			"accessKeyIdKey":     instance.Spec.Backend.S3.AccessKeyIDKey,
-			"secretAccessKeyKey": instance.Spec.Backend.S3.SecretAccessKeyKey,
-			"bucketKey":          instance.Spec.Backend.S3.BucketKey,
+		requiredS3Keys := []struct {
+			field string
+			value string
+		}{
+			{field: "endpointKey", value: instance.Spec.Backend.S3.EndpointKey},
+			{field: "accessKeyIdKey", value: instance.Spec.Backend.S3.AccessKeyIDKey},
+			{field: "secretAccessKeyKey", value: instance.Spec.Backend.S3.SecretAccessKeyKey},
+			{field: "bucketKey", value: instance.Spec.Backend.S3.BucketKey},
+			{field: "regionKey", value: instance.Spec.Backend.S3.RegionKey},
 		}
-		for field, val := range requiredS3Keys {
-			if val == "" {
-				return result, fmt.Errorf("s3 %s is required when s3 is enabled", field)
+		for _, key := range requiredS3Keys {
+			if key.value == "" {
+				return result, fmt.Errorf("s3 %s is required when s3 is enabled", key.field)
 			}
 		}
 		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
@@ -384,6 +388,7 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 			}
 			keys := []string{
 				instance.Spec.Backend.S3.EndpointKey,
+				instance.Spec.Backend.S3.RegionKey,
 				instance.Spec.Backend.S3.AccessKeyIDKey,
 				instance.Spec.Backend.S3.SecretAccessKeyKey,
 				instance.Spec.Backend.S3.BucketKey,
@@ -834,6 +839,17 @@ func backendSecurityContexts(instance *convexv1alpha1.ConvexInstance) (*corev1.P
 	return pod, container
 }
 
+func dbURLVarNames(engine string) []string {
+	switch engine {
+	case "postgres":
+		return []string{"POSTGRES_URL"}
+	case "mysql":
+		return []string{"MYSQL_URL"}
+	default:
+		return nil
+	}
+}
+
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
@@ -1034,15 +1050,18 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 	}
 
 	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
-		env = append(env, corev1.EnvVar{
-			Name: "CONVEX_DB_URL",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: ref},
-					Key:                  instance.Spec.Backend.DB.URLKey,
-				},
+		dbEnvSource := &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: ref},
+				Key:                  instance.Spec.Backend.DB.URLKey,
 			},
-		})
+		}
+		for _, name := range dbURLVarNames(instance.Spec.Backend.DB.Engine) {
+			env = append(env, corev1.EnvVar{
+				Name:      name,
+				ValueFrom: dbEnvSource,
+			})
+		}
 	}
 
 	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
@@ -1061,10 +1080,16 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 				},
 			})
 		}
-		appendS3Env("CONVEX_S3_ENDPOINT", s3.EndpointKey)
-		appendS3Env("CONVEX_S3_ACCESS_KEY_ID", s3.AccessKeyIDKey)
-		appendS3Env("CONVEX_S3_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
-		appendS3Env("CONVEX_S3_BUCKET", s3.BucketKey)
+		appendS3Env("AWS_REGION", s3.RegionKey)
+		appendS3Env("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
+		appendS3Env("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
+		appendS3Env("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
+		appendS3Env("AWS_ENDPOINT_URL", s3.EndpointKey)
+		appendS3Env("S3_STORAGE_EXPORTS_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_MODULES_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_FILES_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_SEARCH_BUCKET", s3.BucketKey)
 	}
 
 	volumes := []corev1.Volume{
