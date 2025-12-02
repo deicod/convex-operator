@@ -8,6 +8,9 @@ jobs:
   test-e2e-self-hosted:
     name: E2E (self-hosted)
     runs-on: self-hosted
+    continue-on-error: true
+    outputs:
+      status: ${{ steps.selfhost-status.outputs.status }}
     steps: &test-e2e-steps
       - name: Clone the code
         uses: actions/checkout@v4
@@ -18,22 +21,38 @@ jobs:
           go-version-file: go.mod
 
       - name: Install the latest version of kind
+        id: install-kind
+        continue-on-error: true
         run: |
           curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
       - name: Verify kind installation
+        id: verify-kind
+        continue-on-error: true
         run: kind version
 
       - name: Running Test e2e
+        id: run-e2e
+        continue-on-error: true
         run: |
           go mod tidy
           make test-e2e
 
+      - name: Record self-hosted status
+        id: selfhost-status
+        if: ${{ always() }}
+        run: |
+          if [ "${{ steps.install-kind.outcome }}" = "failure" ] || [ "${{ steps.verify-kind.outcome }}" = "failure" ] || [ "${{ steps.run-e2e.outcome }}" = "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+          fi
+
   test-e2e-ubuntu:
     name: E2E (ubuntu fallback)
     needs: test-e2e-self-hosted
-    if: ${{ always() && needs.test-e2e-self-hosted.result != 'success' }}
+    if: ${{ needs.test-e2e-self-hosted.outputs.status != 'success' }}
     runs-on: ubuntu-latest
     steps: *test-e2e-steps

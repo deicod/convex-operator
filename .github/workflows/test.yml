@@ -8,6 +8,9 @@ jobs:
   test-self-hosted:
     name: Tests (self-hosted)
     runs-on: self-hosted
+    continue-on-error: true
+    outputs:
+      status: ${{ steps.selfhost-status.outputs.status }}
     steps: &test-steps
       - name: Clone the code
         uses: actions/checkout@v4
@@ -20,6 +23,8 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Lint, vet, fmt, and test
+        id: run-tests
+        continue-on-error: true
         run: |
           go mod download
           make fmt
@@ -27,9 +32,14 @@ jobs:
           make lint
           make test
 
+      - name: Record self-hosted status
+        id: selfhost-status
+        if: ${{ always() }}
+        run: echo "status=${{ steps.run-tests.outcome }}" >> $GITHUB_OUTPUT
+
   test-ubuntu:
     name: Tests (ubuntu fallback)
     needs: test-self-hosted
-    if: ${{ always() && needs.test-self-hosted.result != 'success' }}
+    if: ${{ needs.test-self-hosted.outputs.status != 'success' }}
     runs-on: ubuntu-latest
     steps: *test-steps

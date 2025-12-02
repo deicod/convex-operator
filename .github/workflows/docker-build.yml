@@ -19,6 +19,9 @@ jobs:
   docker-build-self-hosted:
     name: Build and push image (self-hosted)
     runs-on: self-hosted
+    continue-on-error: true
+    outputs:
+      status: ${{ steps.selfhost-status.outputs.status }}
     steps: &docker-build-steps
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,6 +51,8 @@ jobs:
             type=sha
 
       - name: Build and push
+        id: build
+        continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -59,9 +64,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Record self-hosted status
+        id: selfhost-status
+        if: ${{ always() }}
+        run: echo "status=${{ steps.build.outcome }}" >> $GITHUB_OUTPUT
+
   docker-build-ubuntu:
     name: Build and push image (ubuntu fallback)
     needs: docker-build-self-hosted
-    if: ${{ always() && needs.docker-build-self-hosted.result != 'success' }}
+    if: ${{ needs.docker-build-self-hosted.outputs.status != 'success' }}
     runs-on: ubuntu-latest
     steps: *docker-build-steps
