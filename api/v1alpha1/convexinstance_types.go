@@ -90,6 +90,10 @@ type BackendDatabaseSpec struct {
 	// +optional
 	URLKey string `json:"urlKey,omitempty"`
 
+	// DatabaseName overrides the default database name derived from the ConvexInstance name; used to populate INSTANCE_NAME.
+	// +optional
+	DatabaseName string `json:"databaseName,omitempty"`
+
 	// RequireSSL enforces TLS verification when connecting to the database. Defaults to true; set to false to allow self-signed certificates.
 	// +kubebuilder:default:=true
 	// +optional

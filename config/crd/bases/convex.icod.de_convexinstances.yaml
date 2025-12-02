@@ -59,6 +59,10 @@ spec:
                     description: DB references the database connection secret and
                       driver.
                     properties:
+                      databaseName:
+                        description: DatabaseName overrides the default database name
+                          derived from the ConvexInstance name; used to populate INSTANCE_NAME.
+                        type: string
                       engine:
                         enum:
                         - postgres

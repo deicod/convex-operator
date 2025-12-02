@@ -1347,6 +1347,8 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(getEnv("CONVEX_ENV").Value).To(Equal("prod"))
 		Expect(getEnv("CONVEX_VERSION")).NotTo(BeNil())
 		Expect(getEnv("CONVEX_VERSION").Value).To(Equal("9.9.9"))
+		Expect(getEnv("INSTANCE_NAME")).NotTo(BeNil())
+		Expect(getEnv("INSTANCE_NAME").Value).To(Equal("env_vars"))
 
 		adminKeyEnv := getEnv("CONVEX_ADMIN_KEY")
 		Expect(adminKeyEnv).NotTo(BeNil())
@@ -1515,6 +1517,57 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Name).To(Equal("mysql-secret"))
 		Expect(dbEnv.ValueFrom.SecretKeyRef.Key).To(Equal("url"))
 		Expect(getEnv("POSTGRES_URL")).To(BeNil())
+	})
+
+	It("allows overriding INSTANCE_NAME via backend.db.databaseName", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "custom-name",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:       "sqlite",
+						DatabaseName: "override_db",
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "custom-name.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		Expect(getEnv("INSTANCE_NAME")).NotTo(BeNil())
+		Expect(getEnv("INSTANCE_NAME").Value).To(Equal("override_db"))
 	})
 })
 
