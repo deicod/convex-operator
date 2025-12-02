@@ -863,14 +863,16 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 		"app.kubernetes.io/instance":  instance.Name,
 		"app.kubernetes.io/component": "dashboard",
 	}
-	backendURL := backendServiceURL(instance, backendServiceName)
+	publicBackendURL := deploymentURL(instance)
 
 	env := []corev1.EnvVar{
 		{
 			Name:  "NEXT_PUBLIC_DEPLOYMENT_URL",
-			Value: backendURL,
+			Value: publicBackendURL,
 		},
-		{
+	}
+	if instance.Spec.Dashboard.PrefillAdminKey {
+		env = append(env, corev1.EnvVar{
 			Name: "NEXT_PUBLIC_ADMIN_KEY",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
@@ -878,7 +880,19 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 					Key:                  adminKeyKey,
 				},
 			},
-		},
+		})
+	}
+	if co := cloudOrigin(instance); co != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "CONVEX_CLOUD_ORIGIN",
+			Value: co,
+		})
+	}
+	if so := siteOrigin(instance); so != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "CONVEX_SITE_ORIGIN",
+			Value: so,
+		})
 	}
 
 	podSC, containerSC := dashboardSecurityContexts(instance)
@@ -887,7 +901,7 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
 			Annotations: map[string]string{
-				"convex.icod.de/dashboard-hash": configHash(backendURL, generatedSecretRV),
+				"convex.icod.de/dashboard-hash": configHash(publicBackendURL, generatedSecretRV),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -1004,6 +1018,19 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 				},
 			},
 		},
+	}
+
+	if co := cloudOrigin(instance); co != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "CONVEX_CLOUD_ORIGIN",
+			Value: co,
+		})
+	}
+	if so := siteOrigin(instance); so != "" {
+		env = append(env, corev1.EnvVar{
+			Name:  "CONVEX_SITE_ORIGIN",
+			Value: so,
+		})
 	}
 
 	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
@@ -1497,6 +1524,37 @@ func gatewayAnnotations(instance *convexv1alpha1.ConvexInstance) map[string]stri
 		return copyStringMap(instance.Spec.Networking.GatewayAnnotations)
 	}
 	return defaultGatewayAnnotations()
+}
+
+func externalHostURL(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Networking.Host == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s://%s", externalScheme(instance), instance.Spec.Networking.Host)
+}
+
+func deploymentURL(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Networking.DeploymentURL != "" {
+		return instance.Spec.Networking.DeploymentURL
+	}
+	if url := externalHostURL(instance); url != "" {
+		return url
+	}
+	return backendServiceURL(instance, backendServiceName(instance))
+}
+
+func cloudOrigin(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Networking.CloudOrigin != "" {
+		return instance.Spec.Networking.CloudOrigin
+	}
+	return externalHostURL(instance)
+}
+
+func siteOrigin(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Networking.SiteOrigin != "" {
+		return instance.Spec.Networking.SiteOrigin
+	}
+	return externalHostURL(instance)
 }
 
 func useCustomParentRefs(instance *convexv1alpha1.ConvexInstance) bool {

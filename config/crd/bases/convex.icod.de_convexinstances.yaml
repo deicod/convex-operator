@@ -635,6 +635,11 @@ spec:
                   image:
                     default: ghcr.io/get-convex/convex-dashboard:latest
                     type: string
+                  prefillAdminKey:
+                    description: PrefillAdminKey controls whether the dashboard receives
+                      NEXT_PUBLIC_ADMIN_KEY (default false to avoid exposing the key
+                      in the browser).
+                    type: boolean
                   replicas:
                     default: 1
                     format: int32
@@ -1153,6 +1158,15 @@ spec:
               networking:
                 description: Networking configures ingress and TLS wiring.
                 properties:
+                  cloudOrigin:
+                    description: CloudOrigin sets CONVEX_CLOUD_ORIGIN; defaults to
+                      the external host (scheme derived from TLS).
+                    type: string
+                  deploymentUrl:
+                    description: DeploymentURL sets NEXT_PUBLIC_DEPLOYMENT_URL for
+                      the dashboard; defaults to the external host (scheme derived
+                      from TLS).
+                    type: string
                   gatewayAnnotations:
                     additionalProperties:
                       type: string
@@ -1194,6 +1208,10 @@ spec:
                       - name
                       type: object
                     type: array
+                  siteOrigin:
+                    description: SiteOrigin sets CONVEX_SITE_ORIGIN; defaults to the
+                      external host (scheme derived from TLS).
+                    type: string
                   tlsSecretRef:
                     description: TLSSecretRef names the TLS secret used by Gateway/Ingress.
                     type: string

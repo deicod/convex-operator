@@ -660,21 +660,52 @@ var _ = Describe("ConvexInstance Controller", func() {
 			container := dep.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal("ghcr.io/get-convex/convex-dashboard:latest"))
 
-			var adminKeyEnv *corev1.EnvVar
 			envValues := map[string]string{}
 			for i := range container.Env {
 				env := container.Env[i]
 				envValues[env.Name] = env.Value
-				if env.Name == "NEXT_PUBLIC_ADMIN_KEY" {
-					adminKeyEnv = &env
-				}
 			}
-			Expect(envValues).To(HaveKeyWithValue("NEXT_PUBLIC_DEPLOYMENT_URL", "http://test-resource-backend.default.svc.cluster.local:3210"))
-			Expect(adminKeyEnv).NotTo(BeNil())
-			Expect(adminKeyEnv.ValueFrom).NotTo(BeNil())
-			Expect(adminKeyEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
-			Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Name).To(Equal("test-resource-convex-secrets"))
-			Expect(adminKeyEnv.ValueFrom.SecretKeyRef.Key).To(Equal("adminKey"))
+			Expect(envValues).To(HaveKeyWithValue("NEXT_PUBLIC_DEPLOYMENT_URL", "http://convex-dev.example.com"))
+			Expect(envValues).To(HaveKeyWithValue("CONVEX_CLOUD_ORIGIN", "http://convex-dev.example.com"))
+			Expect(envValues).To(HaveKeyWithValue("CONVEX_SITE_ORIGIN", "http://convex-dev.example.com"))
+			for i := range container.Env {
+				Expect(container.Env[i].Name).NotTo(Equal("NEXT_PUBLIC_ADMIN_KEY"))
+			}
+		})
+
+		It("should allow overriding deployment URL/origins and optionally prefill admin key", func() {
+			controllerReconciler, _ := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"deploymentUrl":"https://api.example.com","cloudOrigin":"https://cloud.example.com","siteOrigin":"https://app.example.com"},"dashboard":{"prefillAdminKey":true}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-dashboard", Namespace: "default"}, dep)).To(Succeed())
+			container := dep.Spec.Template.Spec.Containers[0]
+
+			envMap := map[string]corev1.EnvVar{}
+			for i := range container.Env {
+				env := container.Env[i]
+				envMap[env.Name] = env
+			}
+
+			Expect(envMap).To(HaveKey("NEXT_PUBLIC_DEPLOYMENT_URL"))
+			Expect(envMap["NEXT_PUBLIC_DEPLOYMENT_URL"].Value).To(Equal("https://api.example.com"))
+			Expect(envMap).To(HaveKey("CONVEX_CLOUD_ORIGIN"))
+			Expect(envMap["CONVEX_CLOUD_ORIGIN"].Value).To(Equal("https://cloud.example.com"))
+			Expect(envMap).To(HaveKey("CONVEX_SITE_ORIGIN"))
+			Expect(envMap["CONVEX_SITE_ORIGIN"].Value).To(Equal("https://app.example.com"))
+			Expect(envMap).To(HaveKey("NEXT_PUBLIC_ADMIN_KEY"))
+			adminEnv := envMap["NEXT_PUBLIC_ADMIN_KEY"]
+			Expect(adminEnv.ValueFrom).NotTo(BeNil())
+			Expect(adminEnv.ValueFrom.SecretKeyRef).NotTo(BeNil())
+			Expect(adminEnv.ValueFrom.SecretKeyRef.Name).To(Equal("test-resource-convex-secrets"))
+			Expect(adminEnv.ValueFrom.SecretKeyRef.Key).To(Equal("adminKey"))
 		})
 
 		It("should create Gateway and HTTPRoute with expected wiring", func() {
