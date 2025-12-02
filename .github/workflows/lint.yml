@@ -8,7 +8,6 @@ jobs:
   lint-self-hosted:
     name: Lint (self-hosted)
     runs-on: self-hosted
-    continue-on-error: true
     steps: &lint-steps
       - name: Clone the code
         uses: actions/checkout@v4
@@ -28,6 +27,6 @@ jobs:
   lint-ubuntu:
     name: Lint (ubuntu fallback)
     needs: lint-self-hosted
-    if: needs.lint-self-hosted.result != 'success'
+    if: ${{ always() && needs.lint-self-hosted.result != 'success' }}
     runs-on: ubuntu-latest
     steps: *lint-steps

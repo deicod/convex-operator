@@ -8,7 +8,6 @@ jobs:
   test-self-hosted:
     name: Tests (self-hosted)
     runs-on: self-hosted
-    continue-on-error: true
     steps: &test-steps
       - name: Clone the code
         uses: actions/checkout@v4
@@ -31,6 +30,6 @@ jobs:
   test-ubuntu:
     name: Tests (ubuntu fallback)
     needs: test-self-hosted
-    if: needs.test-self-hosted.result != 'success'
+    if: ${{ always() && needs.test-self-hosted.result != 'success' }}
     runs-on: ubuntu-latest
     steps: *test-steps

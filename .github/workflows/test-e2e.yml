@@ -8,7 +8,6 @@ jobs:
   test-e2e-self-hosted:
     name: E2E (self-hosted)
     runs-on: self-hosted
-    continue-on-error: true
     steps: &test-e2e-steps
       - name: Clone the code
         uses: actions/checkout@v4
@@ -35,6 +34,6 @@ jobs:
   test-e2e-ubuntu:
     name: E2E (ubuntu fallback)
     needs: test-e2e-self-hosted
-    if: needs.test-e2e-self-hosted.result != 'success'
+    if: ${{ always() && needs.test-e2e-self-hosted.result != 'success' }}
     runs-on: ubuntu-latest
     steps: *test-e2e-steps
