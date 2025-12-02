@@ -16,10 +16,11 @@ permissions:
   packages: write
 
 jobs:
-  docker-build:
-    name: Build and push image
-    runs-on: [self-hosted, ubuntu-latest]
-    steps:
+  docker-build-self-hosted:
+    name: Build and push image (self-hosted)
+    runs-on: self-hosted
+    continue-on-error: true
+    steps: &docker-build-steps
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -58,3 +59,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  docker-build-ubuntu:
+    name: Build and push image (ubuntu fallback)
+    needs: docker-build-self-hosted
+    if: needs.docker-build-self-hosted.result != 'success'
+    runs-on: ubuntu-latest
+    steps: *docker-build-steps

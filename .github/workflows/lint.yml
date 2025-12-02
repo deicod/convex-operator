@@ -5,10 +5,11 @@ on:
   pull_request:
 
 jobs:
-  lint:
-    name: Run on Ubuntu
-    runs-on: [self-hosted, ubuntu-latest]
-    steps:
+  lint-self-hosted:
+    name: Lint (self-hosted)
+    runs-on: self-hosted
+    continue-on-error: true
+    steps: &lint-steps
       - name: Clone the code
         uses: actions/checkout@v4
 
@@ -23,3 +24,10 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.5.0
+
+  lint-ubuntu:
+    name: Lint (ubuntu fallback)
+    needs: lint-self-hosted
+    if: needs.lint-self-hosted.result != 'success'
+    runs-on: ubuntu-latest
+    steps: *lint-steps
