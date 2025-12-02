@@ -33,6 +33,7 @@
           engine: string                # "postgres" | "mysql" | "sqlite"
           secretRef: string             # Secret name containing DB URL
           urlKey: string                # key in Secret for DB URL
+          databaseName: string          # optional override for INSTANCE_NAME (defaults to instance name with '-' -> '_')
         storage:
           mode: string                  # "sqlite" | "external"
           pvc:

@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -860,6 +861,13 @@ func requireDBSSL(instance *convexv1alpha1.ConvexInstance) bool {
 	return *instance.Spec.Backend.DB.RequireSSL
 }
 
+func backendInstanceName(instance *convexv1alpha1.ConvexInstance) string {
+	if instance.Spec.Backend.DB.DatabaseName != "" {
+		return instance.Spec.Backend.DB.DatabaseName
+	}
+	return strings.ReplaceAll(instance.Name, "-", "_")
+}
+
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
@@ -1025,6 +1033,10 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		{
 			Name:  "CONVEX_VERSION",
 			Value: backendVersion,
+		},
+		{
+			Name:  "INSTANCE_NAME",
+			Value: backendInstanceName(instance),
 		},
 		{
 			Name: "CONVEX_ADMIN_KEY",

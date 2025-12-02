@@ -21,6 +21,7 @@ spec:
       engine: postgres
       secretRef: convex-prod-db
       urlKey: url
+      databaseName: convex_prod
     storage:
       mode: external
       pvc:
