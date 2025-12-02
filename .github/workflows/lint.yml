@@ -5,13 +5,10 @@ on:
   pull_request:
 
 jobs:
-  lint-self-hosted:
-    name: Lint (self-hosted)
-    runs-on: self-hosted
-    continue-on-error: true
-    outputs:
-      status: ${{ steps.selfhost-status.outputs.status }}
-    steps: &lint-steps
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
       - name: Clone the code
         uses: actions/checkout@v4
 
@@ -23,20 +20,6 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Run linter
-        id: run-lint
-        continue-on-error: true
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.5.0
-
-      - name: Record self-hosted status
-        id: selfhost-status
-        if: ${{ always() }}
-        run: echo "status=${{ steps.run-lint.outcome }}" >> $GITHUB_OUTPUT
-
-  lint-ubuntu:
-    name: Lint (ubuntu fallback)
-    needs: lint-self-hosted
-    if: ${{ needs.lint-self-hosted.outputs.status != 'success' }}
-    runs-on: ubuntu-latest
-    steps: *lint-steps
