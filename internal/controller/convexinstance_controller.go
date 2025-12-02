@@ -244,8 +244,11 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					continue
 				}
 				secretRefs, _ := backendEnvRefs(&inst)
-				if _, ok := secretRefs[secret.Name]; ok {
-					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+				for _, ref := range secretRefs {
+					if ref.name == secret.Name {
+						requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+						break
+					}
 				}
 			}
 			return requests
@@ -262,8 +265,11 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			var requests []reconcile.Request
 			for _, inst := range instances.Items {
 				_, configRefs := backendEnvRefs(&inst)
-				if _, ok := configRefs[cm.Name]; ok {
-					requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+				for _, ref := range configRefs {
+					if ref.name == cm.Name {
+						requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+						break
+					}
 				}
 			}
 			return requests
@@ -278,6 +284,12 @@ type externalSecretVersions struct {
 	tlsResourceVersion string
 	envSecretVersions  map[string]string
 	envConfigVersions  map[string]string
+}
+
+type envRef struct {
+	name     string
+	key      string
+	optional bool
 }
 
 type upgradePlan struct {
@@ -447,29 +459,37 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	}
 
 	secretRefs, configRefs := backendEnvRefs(instance)
-	for name, keys := range secretRefs {
+	for _, ref := range secretRefs {
 		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: instance.Namespace}, secret); err != nil {
-			return result, fmt.Errorf("env secret %q: %w", name, err)
-		}
-		for key := range keys {
-			if _, ok := secret.Data[key]; !ok {
-				return result, fmt.Errorf("env secret %q missing key %q", name, key)
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: instance.Namespace}, secret); err != nil {
+			if ref.optional && errors.IsNotFound(err) {
+				continue
 			}
+			return result, fmt.Errorf("env secret %q: %w", ref.name, err)
 		}
-		result.envSecretVersions[name] = secret.ResourceVersion
+		if _, ok := secret.Data[ref.key]; !ok {
+			if ref.optional {
+				continue
+			}
+			return result, fmt.Errorf("env secret %q missing key %q", ref.name, ref.key)
+		}
+		result.envSecretVersions[ref.name] = secret.ResourceVersion
 	}
-	for name, keys := range configRefs {
+	for _, ref := range configRefs {
 		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: instance.Namespace}, cm); err != nil {
-			return result, fmt.Errorf("env configmap %q: %w", name, err)
-		}
-		for key := range keys {
-			if _, ok := cm.Data[key]; !ok {
-				return result, fmt.Errorf("env configmap %q missing key %q", name, key)
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: instance.Namespace}, cm); err != nil {
+			if ref.optional && errors.IsNotFound(err) {
+				continue
 			}
+			return result, fmt.Errorf("env configmap %q: %w", ref.name, err)
 		}
-		result.envConfigVersions[name] = cm.ResourceVersion
+		if _, ok := cm.Data[ref.key]; !ok {
+			if ref.optional {
+				continue
+			}
+			return result, fmt.Errorf("env configmap %q missing key %q", ref.name, ref.key)
+		}
+		result.envConfigVersions[ref.name] = cm.ResourceVersion
 	}
 	return result, nil
 }
@@ -943,24 +963,18 @@ func deduplicateEnvs(env []corev1.EnvVar) []corev1.EnvVar {
 	return dedup
 }
 
-func backendEnvRefs(instance *convexv1alpha1.ConvexInstance) (map[string]map[string]bool, map[string]map[string]bool) {
-	secretRefs := map[string]map[string]bool{}
-	configRefs := map[string]map[string]bool{}
+func backendEnvRefs(instance *convexv1alpha1.ConvexInstance) ([]envRef, []envRef) {
+	var secretRefs []envRef
+	var configRefs []envRef
 	for _, env := range instance.Spec.Backend.Env {
 		if env.ValueFrom == nil {
 			continue
 		}
 		if ref := env.ValueFrom.SecretKeyRef; ref != nil && ref.Name != "" && ref.Key != "" {
-			if _, ok := secretRefs[ref.Name]; !ok {
-				secretRefs[ref.Name] = map[string]bool{}
-			}
-			secretRefs[ref.Name][ref.Key] = true
+			secretRefs = append(secretRefs, envRef{name: ref.Name, key: ref.Key, optional: ptr.Deref(ref.Optional, false)})
 		}
 		if ref := env.ValueFrom.ConfigMapKeyRef; ref != nil && ref.Name != "" && ref.Key != "" {
-			if _, ok := configRefs[ref.Name]; !ok {
-				configRefs[ref.Name] = map[string]bool{}
-			}
-			configRefs[ref.Name][ref.Key] = true
+			configRefs = append(configRefs, envRef{name: ref.Name, key: ref.Key, optional: ptr.Deref(ref.Optional, false)})
 		}
 	}
 	return secretRefs, configRefs
