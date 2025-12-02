@@ -834,7 +834,7 @@ func backendSecurityContexts(instance *convexv1alpha1.ConvexInstance) (*corev1.P
 	return pod, container
 }
 
-func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
+func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
 
@@ -2336,7 +2336,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	result.dashboardServiceName = dashSvcName
 	result.conds = append(result.conds, dashSvcCond)
 
-	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, serviceName, secretName, secretRV, plan.effectiveDashboardImage)
+	dashboardReady, dashboardCond, err := r.reconcileDashboardDeployment(ctx, instance, secretName, secretRV, plan.effectiveDashboardImage)
 	if err != nil {
 		return result, &resourceErr{
 			reason: "DashboardError",
