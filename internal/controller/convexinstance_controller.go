@@ -292,6 +292,122 @@ type envRef struct {
 	optional bool
 }
 
+func (r *ConvexInstanceReconciler) validateDBRef(ctx context.Context, namespace string, db convexv1alpha1.BackendDatabaseSpec) (string, error) {
+	if db.Engine != dbEngineSQLite && db.SecretRef == "" {
+		return "", fmt.Errorf("db secret is required for engine %q", db.Engine)
+	}
+	if db.Engine != dbEngineSQLite && db.URLKey == "" {
+		return "", fmt.Errorf("db urlKey is required for engine %q", db.Engine)
+	}
+	if ref := db.SecretRef; ref != "" {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: namespace}, secret); err != nil {
+			return "", fmt.Errorf("db secret %q: %w", ref, err)
+		}
+		if db.URLKey != "" {
+			if _, ok := secret.Data[db.URLKey]; !ok {
+				return "", fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
+			}
+		}
+		return secret.ResourceVersion, nil
+	}
+	return "", nil
+}
+
+func (r *ConvexInstanceReconciler) validateS3Ref(ctx context.Context, namespace string, s3 convexv1alpha1.BackendS3Spec) (string, error) {
+	if !s3.Enabled {
+		return "", nil
+	}
+	if s3.SecretRef == "" {
+		return "", fmt.Errorf("s3 secret is required when s3 is enabled")
+	}
+	requiredS3Keys := []struct {
+		field string
+		value string
+	}{
+		{field: "endpointKey", value: s3.EndpointKey},
+		{field: "accessKeyIdKey", value: s3.AccessKeyIDKey},
+		{field: "secretAccessKeyKey", value: s3.SecretAccessKeyKey},
+		{field: "bucketKey", value: s3.BucketKey},
+		{field: "regionKey", value: s3.RegionKey},
+	}
+	for _, key := range requiredS3Keys {
+		if key.value == "" {
+			return "", fmt.Errorf("s3 %s is required when s3 is enabled", key.field)
+		}
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: s3.SecretRef, Namespace: namespace}, secret); err != nil {
+		return "", fmt.Errorf("s3 secret %q: %w", s3.SecretRef, err)
+	}
+	keys := []string{
+		s3.EndpointKey,
+		s3.RegionKey,
+		s3.AccessKeyIDKey,
+		s3.SecretAccessKeyKey,
+		s3.BucketKey,
+	}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, ok := secret.Data[key]; !ok {
+			return "", fmt.Errorf("s3 secret %q missing key %q", s3.SecretRef, key)
+		}
+	}
+	return secret.ResourceVersion, nil
+}
+
+func (r *ConvexInstanceReconciler) validateTLSRef(ctx context.Context, namespace, ref string) (string, error) {
+	if ref == "" {
+		return "", nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: namespace}, secret); err != nil {
+		return "", fmt.Errorf("tls secret %q: %w", ref, err)
+	}
+	return secret.ResourceVersion, nil
+}
+
+func (r *ConvexInstanceReconciler) validateBackendEnvRefs(ctx context.Context, namespace string, instance *convexv1alpha1.ConvexInstance) (map[string]string, map[string]string, error) {
+	secretVersions := map[string]string{}
+	configVersions := map[string]string{}
+	secretRefs, configRefs := backendEnvRefs(instance)
+	for _, ref := range secretRefs {
+		secret := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: namespace}, secret); err != nil {
+			if ref.optional && errors.IsNotFound(err) {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env secret %q: %w", ref.name, err)
+		}
+		if _, ok := secret.Data[ref.key]; !ok {
+			if ref.optional {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env secret %q missing key %q", ref.name, ref.key)
+		}
+		secretVersions[ref.name] = secret.ResourceVersion
+	}
+	for _, ref := range configRefs {
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: namespace}, cm); err != nil {
+			if ref.optional && errors.IsNotFound(err) {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env configmap %q: %w", ref.name, err)
+		}
+		if _, ok := cm.Data[ref.key]; !ok {
+			if ref.optional {
+				continue
+			}
+			return secretVersions, configVersions, fmt.Errorf("env configmap %q missing key %q", ref.name, ref.key)
+		}
+		configVersions[ref.name] = cm.ResourceVersion
+	}
+	return secretVersions, configVersions, nil
+}
+
 type upgradePlan struct {
 	strategy                string
 	desiredHash             string
@@ -389,107 +505,18 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	result := externalSecretVersions{}
 	result.envSecretVersions = map[string]string{}
 	result.envConfigVersions = map[string]string{}
-	db := instance.Spec.Backend.DB
-	if db.Engine != dbEngineSQLite && db.SecretRef == "" {
-		return result, fmt.Errorf("db secret is required for engine %q", db.Engine)
+	var err error
+	if result.dbResourceVersion, err = r.validateDBRef(ctx, instance.Namespace, instance.Spec.Backend.DB); err != nil {
+		return result, err
 	}
-	if db.Engine != dbEngineSQLite && db.URLKey == "" {
-		return result, fmt.Errorf("db urlKey is required for engine %q", db.Engine)
+	if result.s3ResourceVersion, err = r.validateS3Ref(ctx, instance.Namespace, instance.Spec.Backend.S3); err != nil {
+		return result, err
 	}
-	if ref := db.SecretRef; ref != "" {
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-			return result, fmt.Errorf("db secret %q: %w", ref, err)
-		}
-		if db.URLKey != "" {
-			if _, ok := secret.Data[db.URLKey]; !ok {
-				return result, fmt.Errorf("db secret %q missing key %q", ref, db.URLKey)
-			}
-		}
-		result.dbResourceVersion = secret.ResourceVersion
+	if result.tlsResourceVersion, err = r.validateTLSRef(ctx, instance.Namespace, instance.Spec.Networking.TLSSecretRef); err != nil {
+		return result, err
 	}
-	if instance.Spec.Backend.S3.Enabled {
-		if instance.Spec.Backend.S3.SecretRef == "" {
-			return result, fmt.Errorf("s3 secret is required when s3 is enabled")
-		}
-		requiredS3Keys := []struct {
-			field string
-			value string
-		}{
-			{field: "endpointKey", value: instance.Spec.Backend.S3.EndpointKey},
-			{field: "accessKeyIdKey", value: instance.Spec.Backend.S3.AccessKeyIDKey},
-			{field: "secretAccessKeyKey", value: instance.Spec.Backend.S3.SecretAccessKeyKey},
-			{field: "bucketKey", value: instance.Spec.Backend.S3.BucketKey},
-			{field: "regionKey", value: instance.Spec.Backend.S3.RegionKey},
-		}
-		for _, key := range requiredS3Keys {
-			if key.value == "" {
-				return result, fmt.Errorf("s3 %s is required when s3 is enabled", key.field)
-			}
-		}
-		if ref := instance.Spec.Backend.S3.SecretRef; ref != "" {
-			secret := &corev1.Secret{}
-			if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-				return result, fmt.Errorf("s3 secret %q: %w", ref, err)
-			}
-			keys := []string{
-				instance.Spec.Backend.S3.EndpointKey,
-				instance.Spec.Backend.S3.RegionKey,
-				instance.Spec.Backend.S3.AccessKeyIDKey,
-				instance.Spec.Backend.S3.SecretAccessKeyKey,
-				instance.Spec.Backend.S3.BucketKey,
-			}
-			for _, key := range keys {
-				if key == "" {
-					continue
-				}
-				if _, ok := secret.Data[key]; !ok {
-					return result, fmt.Errorf("s3 secret %q missing key %q", ref, key)
-				}
-			}
-			result.s3ResourceVersion = secret.ResourceVersion
-		}
-	}
-	if ref := instance.Spec.Networking.TLSSecretRef; ref != "" {
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref, Namespace: instance.Namespace}, secret); err != nil {
-			return result, fmt.Errorf("tls secret %q: %w", ref, err)
-		}
-		result.tlsResourceVersion = secret.ResourceVersion
-	}
-
-	secretRefs, configRefs := backendEnvRefs(instance)
-	for _, ref := range secretRefs {
-		secret := &corev1.Secret{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: instance.Namespace}, secret); err != nil {
-			if ref.optional && errors.IsNotFound(err) {
-				continue
-			}
-			return result, fmt.Errorf("env secret %q: %w", ref.name, err)
-		}
-		if _, ok := secret.Data[ref.key]; !ok {
-			if ref.optional {
-				continue
-			}
-			return result, fmt.Errorf("env secret %q missing key %q", ref.name, ref.key)
-		}
-		result.envSecretVersions[ref.name] = secret.ResourceVersion
-	}
-	for _, ref := range configRefs {
-		cm := &corev1.ConfigMap{}
-		if err := r.Get(ctx, client.ObjectKey{Name: ref.name, Namespace: instance.Namespace}, cm); err != nil {
-			if ref.optional && errors.IsNotFound(err) {
-				continue
-			}
-			return result, fmt.Errorf("env configmap %q: %w", ref.name, err)
-		}
-		if _, ok := cm.Data[ref.key]; !ok {
-			if ref.optional {
-				continue
-			}
-			return result, fmt.Errorf("env configmap %q missing key %q", ref.name, ref.key)
-		}
-		result.envConfigVersions[ref.name] = cm.ResourceVersion
+	if result.envSecretVersions, result.envConfigVersions, err = r.validateBackendEnvRefs(ctx, instance.Namespace, instance); err != nil {
+		return result, err
 	}
 	return result, nil
 }
