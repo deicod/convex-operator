@@ -155,6 +155,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	currentBackendImage := ""
+	currentBackendEnv := []corev1.EnvVar{}
 	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
 		currentBackendImage = existingBackend.Spec.Template.Spec.Containers[0].Image
 	}
@@ -165,12 +166,13 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	currentBackendVersion := ""
 	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
 		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
+		currentBackendEnv = deduplicateEnvs(existingBackend.Spec.Template.Spec.Containers[0].Env)
 	}
 
 	desiredHash := desiredUpgradeHash(instance)
 	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
 
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
@@ -868,6 +870,183 @@ func backendInstanceName(instance *convexv1alpha1.ConvexInstance) string {
 	return strings.ReplaceAll(instance.Name, "-", "_")
 }
 
+func deduplicateEnvs(env []corev1.EnvVar) []corev1.EnvVar {
+	if len(env) == 0 {
+		return env
+	}
+	seen := map[string]bool{}
+	dedup := make([]corev1.EnvVar, 0, len(env))
+	for i := len(env) - 1; i >= 0; i-- {
+		if seen[env[i].Name] {
+			continue
+		}
+		seen[env[i].Name] = true
+		dedup = append(dedup, env[i])
+	}
+	for i, j := 0, len(dedup)-1; i < j; i, j = i+1, j-1 {
+		dedup[i], dedup[j] = dedup[j], dedup[i]
+	}
+	return dedup
+}
+
+func backendEnv(instance *convexv1alpha1.ConvexInstance, backendVersion, secretName string) []corev1.EnvVar {
+	if backendVersion == "" {
+		backendVersion = instance.Spec.Version
+	}
+	env := []corev1.EnvVar{}
+	addEnv := func(e corev1.EnvVar) {
+		env = append(env, e)
+	}
+	addEnv(corev1.EnvVar{
+		Name:  "CONVEX_PORT",
+		Value: fmt.Sprintf("%d", defaultBackendPort),
+	})
+	addEnv(corev1.EnvVar{
+		Name:  "CONVEX_ENV",
+		Value: instance.Spec.Environment,
+	})
+	addEnv(corev1.EnvVar{
+		Name:  "CONVEX_VERSION",
+		Value: backendVersion,
+	})
+	addEnv(corev1.EnvVar{
+		Name:  "INSTANCE_NAME",
+		Value: backendInstanceName(instance),
+	})
+	addEnv(corev1.EnvVar{
+		Name: "CONVEX_ADMIN_KEY",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  adminKeyKey,
+			},
+		},
+	})
+	addEnv(corev1.EnvVar{
+		Name: "CONVEX_INSTANCE_SECRET",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  instanceSecretKey,
+			},
+		},
+	})
+
+	if co := cloudOrigin(instance); co != "" {
+		addEnv(corev1.EnvVar{
+			Name:  "CONVEX_CLOUD_ORIGIN",
+			Value: co,
+		})
+	}
+	if so := siteOrigin(instance); so != "" {
+		addEnv(corev1.EnvVar{
+			Name:  "CONVEX_SITE_ORIGIN",
+			Value: so,
+		})
+	}
+
+	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
+		dbEnvSource := &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: ref},
+				Key:                  instance.Spec.Backend.DB.URLKey,
+			},
+		}
+		for _, name := range dbURLVarNames(instance.Spec.Backend.DB.Engine) {
+			addEnv(corev1.EnvVar{
+				Name:      name,
+				ValueFrom: dbEnvSource,
+			})
+		}
+	}
+
+	if !requireDBSSL(instance) {
+		addEnv(corev1.EnvVar{
+			Name:  "DO_NOT_REQUIRE_SSL",
+			Value: "1",
+		})
+	}
+
+	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
+		s3 := instance.Spec.Backend.S3
+		appendS3Env := func(name, key string) {
+			if key == "" {
+				return
+			}
+			addEnv(corev1.EnvVar{
+				Name: name,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: s3.SecretRef},
+						Key:                  key,
+					},
+				},
+			})
+		}
+		appendS3Env("AWS_REGION", s3.RegionKey)
+		appendS3Env("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
+		appendS3Env("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
+		appendS3Env("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
+		appendS3Env("AWS_ENDPOINT_URL", s3.EndpointKey)
+		if s3.EmitS3EndpointUrl {
+			appendS3Env("S3_ENDPOINT_URL", s3.EndpointKey)
+		}
+		appendS3Env("S3_STORAGE_EXPORTS_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_MODULES_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_FILES_BUCKET", s3.BucketKey)
+		appendS3Env("S3_STORAGE_SEARCH_BUCKET", s3.BucketKey)
+	}
+
+	if instance.Spec.Backend.Telemetry.DisableBeacon {
+		addEnv(corev1.EnvVar{
+			Name:  "DISABLE_BEACON",
+			Value: "true",
+		})
+	}
+	if instance.Spec.Backend.Logging.RedactLogsToClient {
+		addEnv(corev1.EnvVar{
+			Name:  "REDACT_LOGS_TO_CLIENT",
+			Value: "true",
+		})
+	}
+
+	if len(instance.Spec.Backend.Env) > 0 {
+		env = append(env, instance.Spec.Backend.Env...)
+	}
+
+	return deduplicateEnvs(env)
+}
+
+func envSignature(env []corev1.EnvVar) string {
+	if len(env) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(env)*2)
+	for _, e := range env {
+		parts = append(parts, e.Name)
+		switch {
+		case e.Value != "":
+			parts = append(parts, "val:"+e.Value)
+		case e.ValueFrom != nil:
+			if ref := e.ValueFrom.SecretKeyRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("secret:%s/%s", ref.Name, ref.Key))
+			} else if ref := e.ValueFrom.ConfigMapKeyRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("cm:%s/%s", ref.Name, ref.Key))
+			} else if ref := e.ValueFrom.FieldRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("field:%s", ref.FieldPath))
+			} else if ref := e.ValueFrom.ResourceFieldRef; ref != nil {
+				parts = append(parts, fmt.Sprintf("resource:%s", ref.Resource))
+			} else {
+				parts = append(parts, "valueFrom")
+			}
+		default:
+			parts = append(parts, "empty")
+		}
+	}
+	return configHash(parts[0], parts[1:]...)
+}
+
 func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Context, instance *convexv1alpha1.ConvexInstance, secretName, generatedSecretRV, dashboardImage string) (bool, metav1.Condition, error) {
 	name := dashboardDeploymentName(instance)
 	key := client.ObjectKey{Name: name, Namespace: instance.Namespace}
@@ -1021,104 +1200,22 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		"app.kubernetes.io/instance":  instance.Name,
 		"app.kubernetes.io/component": "backend",
 	}
-	env := []corev1.EnvVar{
-		{
-			Name:  "CONVEX_PORT",
-			Value: fmt.Sprintf("%d", defaultBackendPort),
-		},
-		{
-			Name:  "CONVEX_ENV",
-			Value: instance.Spec.Environment,
-		},
-		{
-			Name:  "CONVEX_VERSION",
-			Value: backendVersion,
-		},
-		{
-			Name:  "INSTANCE_NAME",
-			Value: backendInstanceName(instance),
-		},
-		{
-			Name: "CONVEX_ADMIN_KEY",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-					Key:                  adminKeyKey,
-				},
-			},
-		},
-		{
-			Name: "CONVEX_INSTANCE_SECRET",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-					Key:                  instanceSecretKey,
-				},
-			},
-		},
-	}
+	env := backendEnv(instance, backendVersion, secretName)
 
-	if co := cloudOrigin(instance); co != "" {
-		env = append(env, corev1.EnvVar{
-			Name:  "CONVEX_CLOUD_ORIGIN",
-			Value: co,
-		})
-	}
-	if so := siteOrigin(instance); so != "" {
-		env = append(env, corev1.EnvVar{
-			Name:  "CONVEX_SITE_ORIGIN",
-			Value: so,
-		})
-	}
-
-	if ref := instance.Spec.Backend.DB.SecretRef; ref != "" && instance.Spec.Backend.DB.URLKey != "" {
-		dbEnvSource := &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: ref},
-				Key:                  instance.Spec.Backend.DB.URLKey,
-			},
-		}
-		for _, name := range dbURLVarNames(instance.Spec.Backend.DB.Engine) {
-			env = append(env, corev1.EnvVar{
-				Name:      name,
-				ValueFrom: dbEnvSource,
-			})
-		}
-	}
-
-	if !requireDBSSL(instance) {
-		env = append(env, corev1.EnvVar{
-			Name:  "DO_NOT_REQUIRE_SSL",
-			Value: "1",
-		})
-	}
-
-	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
-		s3 := instance.Spec.Backend.S3
-		appendS3Env := func(name, key string) {
-			if key == "" {
-				return
+	if len(env) > 0 {
+		seen := map[string]bool{}
+		dedup := make([]corev1.EnvVar, 0, len(env))
+		for i := len(env) - 1; i >= 0; i-- {
+			if seen[env[i].Name] {
+				continue
 			}
-			env = append(env, corev1.EnvVar{
-				Name: name,
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: s3.SecretRef},
-						Key:                  key,
-					},
-				},
-			})
+			seen[env[i].Name] = true
+			dedup = append(dedup, env[i])
 		}
-		appendS3Env("AWS_REGION", s3.RegionKey)
-		appendS3Env("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
-		appendS3Env("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
-		appendS3Env("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
-		appendS3Env("AWS_ENDPOINT_URL", s3.EndpointKey)
-		appendS3Env("S3_STORAGE_EXPORTS_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_MODULES_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_FILES_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_SEARCH_BUCKET", s3.BucketKey)
+		for i, j := 0, len(dedup)-1; i < j; i, j = i+1, j-1 {
+			dedup[i], dedup[j] = dedup[j], dedup[i]
+		}
+		env = dedup
 	}
 
 	volumes := []corev1.Volume{
@@ -1771,21 +1868,24 @@ func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
 	if !instance.Spec.Dashboard.Enabled {
 		dashboardImage = ""
 	}
+	envSig := envSignature(backendEnv(instance, instance.Spec.Version, generatedSecretName(instance)))
 	return configHash(
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,
 		dashboardImage,
+		envSig,
 	)
 }
 
-func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string) string {
+func observedUpgradeHash(instance *convexv1alpha1.ConvexInstance, currentVersion, currentBackendImage, currentDashboardImage string, currentEnv []corev1.EnvVar) string {
 	if currentBackendImage == "" && currentDashboardImage == "" {
 		return ""
 	}
 	if currentVersion == "" {
 		currentVersion = instance.Spec.Version
 	}
-	return configHash(currentVersion, currentBackendImage, currentDashboardImage)
+	envSig := envSignature(deduplicateEnvs(currentEnv))
+	return configHash(currentVersion, currentBackendImage, currentDashboardImage, envSig)
 }
 
 func backendVersionFromStatefulSet(sts *appsv1.StatefulSet) string {
@@ -2456,7 +2556,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
-func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
+func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, currentBackendEnv []corev1.EnvVar, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {
 		strategy = upgradeStrategyInPlace
@@ -2479,7 +2579,7 @@ func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists boo
 	if importFailed {
 		importDone = false
 	}
-	appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage)
+	appliedHash := observedUpgradeHash(instance, currentBackendVersion, currentBackendImage, currentDashboardImage, currentBackendEnv)
 	upgradePlanned := backendExists && desiredHash != appliedHash
 	upgradePending := backendExists && (desiredHash != appliedHash || (exportDone && !importDone))
 
