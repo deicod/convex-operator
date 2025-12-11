@@ -36,3 +36,4 @@ spec:
     tlsSecretRef: convex-dev-tls
   maintenance:
     upgradeStrategy: inPlace
+    restartInterval: 168h

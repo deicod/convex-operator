@@ -89,6 +89,8 @@ const (
 	dbEnginePostgres         = "postgres"
 	dbEngineMySQL            = "mysql"
 	dbEngineSQLite           = "sqlite"
+	restartTriggerAnnotation = "convex.icod.de/restart-trigger"
+	lastRestartAnnotation    = "convex.icod.de/last-restart"
 	defaultGatewayClassName  = "nginx"
 	defaultGatewayIssuerKey  = "cert-manager.io/cluster-issuer"
 	defaultGatewayIssuer     = "letsencrypt-prod-rfc2136"
@@ -96,6 +98,7 @@ const (
 	upgradeImportJobSuffix   = "upgrade-import"
 	upgradePVCNameSuffix     = "upgrade-pvc"
 	upgradeHashAnnotation    = "convex.icod.de/upgrade-hash"
+	defaultRestartInterval   = 7 * 24 * time.Hour
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -205,11 +208,17 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
 
+	requeueAfter := time.Duration(0)
 	if status.phase != phaseReady || (!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) || !coreRes.gatewayReady || !coreRes.routeReady {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		requeueAfter = 5 * time.Second
+	}
+	if coreRes.nextRestartIn > 0 {
+		if requeueAfter == 0 || coreRes.nextRestartIn < requeueAfter {
+			requeueAfter = coreRes.nextRestartIn
+		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -446,6 +455,7 @@ type reconcileOutcome struct {
 	secretName           string
 	secretRV             string
 	conds                []metav1.Condition
+	nextRestartIn        time.Duration
 }
 
 type resourceErr struct {
@@ -971,6 +981,107 @@ func backendInstanceName(instance *convexv1alpha1.ConvexInstance) string {
 	return strings.ReplaceAll(instance.Name, "-", "_")
 }
 
+func restartInterval(instance *convexv1alpha1.ConvexInstance) time.Duration {
+	interval := defaultRestartInterval
+	if instance.Spec.Maintenance.RestartInterval != nil {
+		interval = instance.Spec.Maintenance.RestartInterval.Duration
+	}
+	if interval <= 0 {
+		return 0
+	}
+	return interval
+}
+
+func annotationValue(annotations map[string]string, key string) string {
+	if annotations == nil {
+		return ""
+	}
+	return annotations[key]
+}
+
+func parseRestartTimestamp(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	ts, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return ts
+}
+
+func resolveLastRestart(sts *appsv1.StatefulSet, now time.Time) time.Time {
+	if sts == nil {
+		return now
+	}
+	if ts := parseRestartTimestamp(annotationValue(sts.Annotations, lastRestartAnnotation)); !ts.IsZero() {
+		return ts
+	}
+	if ts := parseRestartTimestamp(annotationValue(sts.Spec.Template.Annotations, restartTriggerAnnotation)); !ts.IsZero() {
+		return ts
+	}
+	if !sts.CreationTimestamp.IsZero() {
+		return sts.CreationTimestamp.Time
+	}
+	return now
+}
+
+type restartPlan struct {
+	enabled               bool
+	nextRestartIn         time.Duration
+	desiredLastRestart    time.Time
+	desiredRestartTrigger string
+}
+
+func computeRestartPlan(instance *convexv1alpha1.ConvexInstance, sts *appsv1.StatefulSet, now time.Time) restartPlan {
+	interval := restartInterval(instance)
+	plan := restartPlan{
+		desiredLastRestart: now,
+	}
+	templateAnnotations := map[string]string{}
+	if sts != nil && sts.Spec.Template.Annotations != nil {
+		templateAnnotations = sts.Spec.Template.Annotations
+	}
+	if sts != nil {
+		plan.desiredLastRestart = resolveLastRestart(sts, now)
+	}
+
+	if interval <= 0 {
+		plan.desiredRestartTrigger = annotationValue(templateAnnotations, restartTriggerAnnotation)
+		return plan
+	}
+
+	plan.enabled = true
+	lastRestart := plan.desiredLastRestart
+	if lastRestart.IsZero() {
+		lastRestart = now
+	}
+	restartDue := now.Sub(lastRestart) >= interval
+	if restartDue {
+		plan.desiredLastRestart = now
+	}
+
+	if restartDue {
+		plan.nextRestartIn = interval
+	} else {
+		plan.nextRestartIn = time.Until(lastRestart.Add(interval))
+		if plan.nextRestartIn < 0 {
+			plan.nextRestartIn = interval
+		}
+	}
+
+	switch {
+	case restartDue:
+		plan.desiredRestartTrigger = plan.desiredLastRestart.Format(time.RFC3339)
+	case sts == nil:
+		plan.desiredRestartTrigger = plan.desiredLastRestart.Format(time.RFC3339)
+	default:
+		plan.desiredRestartTrigger = annotationValue(templateAnnotations, restartTriggerAnnotation)
+	}
+
+	return plan
+}
+
 func deduplicateEnvs(env []corev1.EnvVar) []corev1.EnvVar {
 	if len(env) == 0 {
 		return env
@@ -1314,10 +1425,23 @@ func (r *ConvexInstanceReconciler) reconcileDashboardDeployment(ctx context.Cont
 	return false, conditionFalse(conditionDashboard, "Provisioning", "Waiting for dashboard rollout"), nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV, backendImage, backendVersion string, extVersions externalSecretVersions) error {
+func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, generatedSecretRV, backendImage, backendVersion string, extVersions externalSecretVersions) (time.Duration, error) {
 	sts := &appsv1.StatefulSet{}
 	key := client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}
 	err := r.Get(ctx, key, sts)
+	stsExists := err == nil
+	if err != nil && !errors.IsNotFound(err) {
+		return 0, err
+	}
+
+	now := time.Now().UTC()
+	var plan restartPlan
+	if stsExists {
+		plan = computeRestartPlan(instance, sts, now)
+	} else {
+		plan = computeRestartPlan(instance, nil, now)
+	}
+
 	replicas := int32(1)
 	if backendImage == "" {
 		backendImage = instance.Spec.Backend.Image
@@ -1382,11 +1506,12 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 	}
 
 	podSC, containerSC := backendSecurityContexts(instance)
+	podAnnotations := map[string]string{}
 
 	podSpec := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      labels,
-			Annotations: map[string]string{},
+			Annotations: podAnnotations,
 		},
 		Spec: corev1.PodSpec{
 			SecurityContext: podSC,
@@ -1433,10 +1558,13 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		extVersions.s3ResourceVersion,
 	}
 	hashValues = append(hashValues, envResourceVersionSignature(extVersions)...)
-	podSpec.Annotations["convex.icod.de/config-hash"] = configHash(
+	podAnnotations["convex.icod.de/config-hash"] = configHash(
 		r.renderBackendConfig(instance, backendVersion),
 		hashValues...,
 	)
+	if plan.desiredRestartTrigger != "" {
+		podAnnotations[restartTriggerAnnotation] = plan.desiredRestartTrigger
+	}
 
 	stsSpec := appsv1.StatefulSetSpec{
 		ServiceName: serviceName,
@@ -1447,33 +1575,48 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		Template: podSpec,
 	}
 
-	if errors.IsNotFound(err) {
+	if !stsExists {
+		var annotations map[string]string
+		if plan.enabled {
+			annotations = map[string]string{
+				lastRestartAnnotation: plan.desiredLastRestart.Format(time.RFC3339),
+			}
+		}
 		sts = &appsv1.StatefulSet{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      backendStatefulSetName(instance),
-				Namespace: instance.Namespace,
+				Name:        backendStatefulSetName(instance),
+				Namespace:   instance.Namespace,
+				Annotations: annotations,
 			},
 			Spec: stsSpec,
 		}
 		if err := controllerutil.SetControllerReference(instance, sts, r.Scheme); err != nil {
-			return err
+			return 0, err
 		}
-		return r.Create(ctx, sts)
-	}
-	if err != nil {
-		return err
+		return plan.nextRestartIn, r.Create(ctx, sts)
 	}
 
 	ownerChanged, err := ensureOwner(instance, sts, r.Scheme)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	metaChanged := false
+	if plan.enabled {
+		if sts.Annotations == nil {
+			sts.Annotations = map[string]string{}
+		}
+		desiredLast := plan.desiredLastRestart.Format(time.RFC3339)
+		if sts.Annotations[lastRestartAnnotation] != desiredLast {
+			sts.Annotations[lastRestartAnnotation] = desiredLast
+			metaChanged = true
+		}
 	}
 	alignStatefulSetDefaults(&sts.Spec, &stsSpec)
-	if ownerChanged || !statefulSetSpecEqual(sts.Spec, stsSpec) {
+	if ownerChanged || metaChanged || !statefulSetSpecEqual(sts.Spec, stsSpec) {
 		sts.Spec = stsSpec
-		return r.Update(ctx, sts)
+		return plan.nextRestartIn, r.Update(ctx, sts)
 	}
-	return nil
+	return plan.nextRestartIn, nil
 }
 
 func (r *ConvexInstanceReconciler) reconcileExportJob(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, secretName, image, upgradeHash string) (bool, error) {
@@ -2634,13 +2777,15 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	result.dashboardReady = dashboardReady
 	result.conds = append(result.conds, dashboardCond)
 
-	if err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, secretRV, plan.effectiveBackendImage, plan.effectiveVersion, extVersions); err != nil {
+	nextRestartIn, err := r.reconcileStatefulSet(ctx, instance, serviceName, secretName, secretRV, plan.effectiveBackendImage, plan.effectiveVersion, extVersions)
+	if err != nil {
 		return result, &resourceErr{
 			reason: "StatefulSetError",
 			cond:   conditionFalse(conditionStatefulSet, "StatefulSetError", err.Error()),
 			err:    err,
 		}
 	}
+	result.nextRestartIn = nextRestartIn
 
 	if useCustomParentRefs(instance) {
 		if err := r.deleteManagedGateway(ctx, instance); err != nil {

@@ -208,6 +208,7 @@
   - [x] Add safeguards preventing multiple concurrent upgrade flows per instance; serialize by finalizer/condition locks.
   - [x] Extend status/conditions to reflect upgrade progress (e.g., UpgradeInProgress, ExportCompleted, ImportCompleted) with timestamps/messages for observability.
   - [x] Add tests simulating version bumps for both strategies, verifying state transitions and resource mutations without breaking singleton backend constraint.
+  - [x] Add optional periodic backend restart interval (default 7d, disable with 0s) under maintenance to mitigate long-running memory leaks.
 
   ### M5: Testing, CI, Docs
 

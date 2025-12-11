@@ -294,6 +294,11 @@ type MaintenanceSpec struct {
 	// +kubebuilder:default:=inPlace
 	// +kubebuilder:validation:Enum=inPlace;exportImport
 	UpgradeStrategy string `json:"upgradeStrategy,omitempty"`
+
+	// RestartInterval triggers a rolling restart after the specified duration to mitigate slow resource leaks. Set to "0s" to disable.
+	// +kubebuilder:default:="168h"
+	// +optional
+	RestartInterval *metav1.Duration `json:"restartInterval,omitempty"`
 }
 
 // InstanceEndpoints describes externally reachable URLs.

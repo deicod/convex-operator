@@ -1345,6 +1345,12 @@ spec:
               maintenance:
                 description: Maintenance configures upgrade handling.
                 properties:
+                  restartInterval:
+                    default: 168h
+                    description: RestartInterval triggers a rolling restart after
+                      the specified duration to mitigate slow resource leaks. Set
+                      to "0s" to disable.
+                    type: string
                   upgradeStrategy:
                     default: inPlace
                     enum:

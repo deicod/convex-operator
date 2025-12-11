@@ -353,6 +353,48 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Normal Ready Backend is ready")))
 		})
 
+		It("triggers periodic restarts when the interval elapses", func() {
+			controllerReconciler, _ := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+			makeGatewayReady()
+			makeRouteAccepted()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			current := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, current)).To(Succeed())
+			current.Spec.Maintenance.RestartInterval = &metav1.Duration{Duration: time.Second}
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, sts)).To(Succeed())
+			oldTimestamp := time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339)
+			if sts.Annotations == nil {
+				sts.Annotations = map[string]string{}
+			}
+			sts.Annotations[lastRestartAnnotation] = oldTimestamp
+			if sts.Spec.Template.Annotations == nil {
+				sts.Spec.Template.Annotations = map[string]string{}
+			}
+			sts.Spec.Template.Annotations[restartTriggerAnnotation] = oldTimestamp
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 3*time.Second))
+
+			updatedSTS := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, updatedSTS)).To(Succeed())
+			newTrigger := updatedSTS.Spec.Template.Annotations[restartTriggerAnnotation]
+			Expect(newTrigger).NotTo(Equal(oldTimestamp))
+			Expect(updatedSTS.Annotations[lastRestartAnnotation]).To(Equal(newTrigger))
+		})
+
 		It("should handle an in-place upgrade rollout", func() {
 			controllerReconciler, _ := newReconciler()
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -1326,7 +1368,7 @@ var _ = Describe("config and secret helpers", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
 			dbResourceVersion: "db-rv",
 			s3ResourceVersion: "s3-rv",
 		})
@@ -1445,7 +1487,7 @@ var _ = Describe("config and secret helpers", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
 			dbResourceVersion: "db-rv",
 		})
 		Expect(err).NotTo(HaveOccurred())
@@ -1499,7 +1541,7 @@ var _ = Describe("config and secret helpers", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
 			dbResourceVersion: "db-rv",
 		})
 		Expect(err).NotTo(HaveOccurred())
@@ -1566,7 +1608,7 @@ var _ = Describe("config and secret helpers", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{})
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		sts := &appsv1.StatefulSet{}
@@ -1624,7 +1666,7 @@ var _ = Describe("config and secret helpers", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{})
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		sts := &appsv1.StatefulSet{}
@@ -2011,7 +2053,7 @@ var _ = Describe("config and secret helpers", func() {
 			Scheme: k8sClient.Scheme(),
 		}
 
-		err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
 			dbResourceVersion: "db-rv",
 			s3ResourceVersion: "s3-rv",
 		})
