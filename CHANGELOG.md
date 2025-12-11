@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Implemented backend environment variable extensibility features.
+- Added `spec.backend.telemetry.disableBeacon` to toggle the usage beacon.
+- Added `spec.backend.logging.redactLogsToClient` to enable log redaction.
+- Added support for `S3_ENDPOINT_URL` via `spec.backend.s3.emitS3EndpointUrl`.
+- Added generic `spec.backend.env` passthrough to inject custom environment variables.
+- Updated `docs/env-extensibility-plan.md` to reflect completion.
+
 ## v0.1.1
 
 - Add `spec.networking.gatewayAnnotations` with a default `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`, applied to each per-instance Gateway; users can override or disable by setting a custom map or `{}`.

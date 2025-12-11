@@ -23,6 +23,6 @@ Track implementation work to expose all backend environment variables referenced
 - [ ] Samples & docs
   - [x] Update samples to demonstrate `disableBeacon` and `env` passthrough usage.
   - [x] Update README/SPEC to document new fields, precedence, and S3 endpoint alias.
-- [ ] Rollup
+- [x] Rollup
   - [x] Run `make test`.
-  - [ ] Prepare changelog/notes for PR.
+  - [x] Prepare changelog/notes for PR.
