@@ -12,18 +12,68 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 
 ## Getting Started
 
+#### Hello World
+
+Here is a minimal example of a Convex instance using SQLite for local development:
+
+```yaml
+apiVersion: convex.icod.de/v1alpha1
+kind: ConvexInstance
+metadata:
+  name: convex-sample
+  namespace: default
+spec:
+  environment: dev
+  version: "0.19.0"
+  backend:
+    db:
+      engine: sqlite
+    storage:
+      pvc:
+        enabled: true
+        size: 1Gi
+  networking:
+    host: convex.local # Ensure this resolves to your Gateway/Ingress IP
+```
+
+Apply it with:
+```sh
+kubectl apply -f convex-sample.yaml
+```
+
 ### Prerequisites
 - go version v1.24.6+
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
 
-### CRD quick reference (convex.icod.de/v1alpha1)
-- `spec.environment` (`dev|prod`) and `spec.version` (Convex image tag) are required.
-- `spec.backend`: image (defaults to Convex backend); `db.engine` (`postgres|mysql|sqlite`) plus Secret/key refs and optional `databaseName` override for `INSTANCE_NAME`; telemetry/logging toggles (`telemetry.disableBeacon`, `logging.redactLogsToClient`); `env` passthrough (later entries override earlier ones); `storage.mode` (`sqlite|external`) with optional PVC; S3 secret/key wiring (`endpointKey`, `regionKey`, `accessKeyIdKey`, `secretAccessKeyKey`, `bucketKey`, optional `emitS3EndpointUrl` alias); optional `security` overrides for pod/container contexts (defaults defer to the image user, avoiding forced `runAsNonRoot`).
-- `spec.dashboard`: enabled flag (default true), image (defaults to Convex dashboard), replicas/resources; defaults run the dashboard as UID `1001` with `runAsNonRoot: true` to match the official image, configurable via `security`. Set `dashboard.prefillAdminKey: true` only if you explicitly want the admin key injected into the browser (default is false for safety).
-- `spec.networking`: hostname, optional `deploymentUrl` (sets `NEXT_PUBLIC_DEPLOYMENT_URL`), `cloudOrigin` (`CONVEX_CLOUD_ORIGIN`), `siteOrigin` (`CONVEX_SITE_ORIGIN`), optional `parentRefs` to attach the HTTPRoute to an existing Gateway (skips creating a Gateway), `gatewayClassName` (defaults to `nginx`), optional `gatewayAnnotations` (defaults to `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`), and TLS secret reference. The default assumes NGINX Gateway Fabric and annotates the generated Gateway for cert-manager; set `gatewayAnnotations: {}` or provide your own map to override/disable.
-- `spec.maintenance`: `upgradeStrategy` (`inPlace` default or `exportImport`) and `restartInterval` (default `168h`, set `0s` to disable periodic restarts); `spec.scale.backend` provides CPU target/max memory hints.
+### CRD Configuration Guide
+
+**Required Fields:**
+- `spec.environment`: Deployment tier (`dev` or `prod`).
+- `spec.version`: Convex image tag (e.g., "0.19.0").
+- `spec.networking.host`: External hostname (e.g., "convex.example.com").
+- `spec.backend.db.engine`: Database type (`postgres`, `mysql`, or `sqlite`).
+
+**Backend Configuration (`spec.backend`):**
+- **Database:** For `postgres` or `mysql`, you must provide `db.secretRef` and `db.urlKey`.
+- **Storage:** Use `storage.mode: sqlite` with `storage.pvc.enabled: true` for local persistence.
+- **S3:** Configure `s3` block with `secretRef` and keys to enable blob storage (required for prod).
+- **Security:** Use `security` to override pod/container security contexts if needed.
+
+**Dashboard Configuration (`spec.dashboard`):**
+- Enabled by default. Disable with `enabled: false`.
+- **Security:** Defaults to `runAsNonRoot` (UID 1001).
+- **Admin Key:** Set `prefillAdminKey: true` to inject the admin key into the browser (use with caution).
+
+**Networking (`spec.networking`):**
+- **Gateway:** Defaults to creating a Gateway using `gatewayClassName: nginx`.
+- **Custom Gateway:** Use `parentRefs` to attach to an existing Gateway instead of creating one.
+- **TLS:** Reference a TLS secret via `tlsSecretRef`.
+
+**Maintenance (`spec.maintenance`):**
+- **Upgrade Strategy:** `inPlace` (rolling update) or `exportImport` (data migration job).
+- **Restarts:** `restartInterval` defaults to `168h` (7 days) to mitigate memory leaks. Set to `0s` to disable.
 
 ### Environment variables
 - Backend pods receive `CONVEX_PORT` (3210), `CONVEX_ENV` (spec.environment), `CONVEX_VERSION` (spec.version), `INSTANCE_NAME` (defaults to the ConvexInstance name with `-` -> `_`, override via `spec.backend.db.databaseName`), telemetry/logging toggles when set (`DISABLE_BEACON`, `REDACT_LOGS_TO_CLIENT`), plus secret-derived `CONVEX_ADMIN_KEY`/`CONVEX_INSTANCE_SECRET`, `POSTGRES_URL` (or `MYSQL_URL` when `spec.backend.db.engine: mysql`) from the referenced `urlKey`, and S3 wiring (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_ENDPOINT_URL`/`AWS_ENDPOINT_URL_S3` and `S3_ENDPOINT_URL` when enabled via `emitS3EndpointUrl`, `S3_STORAGE_*` buckets) when enabled. If set in the spec, `spec.networking.cloudOrigin` and `spec.networking.siteOrigin` populate `CONVEX_CLOUD_ORIGIN`/`CONVEX_SITE_ORIGIN`; otherwise they default to the external host (`scheme://spec.networking.host`). Additional env vars can be appended via `spec.backend.env` and will override earlier/operator-set entries when names overlap.

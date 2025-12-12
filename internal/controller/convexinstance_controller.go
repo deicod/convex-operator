@@ -119,15 +119,16 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status,verbs=get
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the ConvexInstance object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
+// Reconcile moves the cluster state toward the desired ConvexInstance state.
 //
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/reconcile
+// The flow is:
+// 1. Resolve the ConvexInstance and handle finalizers.
+// 2. Observe current backend/dashboard state (images, versions).
+// 3. Determine the upgrade plan (in-place vs export-import) based on spec changes and current job status.
+// 4. Validate external references (DB/S3 secrets) to fail fast if missing.
+// 5. Reconcile core resources (ConfigMap, Secrets, PVC, Services, Dashboard, StatefulSet, Gateway/Route).
+// 6. Execute the upgrade plan (rolling update or export/import orchestration).
+// 7. Update status conditions and phase.
 func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -176,6 +177,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	desiredHash := desiredUpgradeHash(instance)
 	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
 
+	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
+	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
 	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
@@ -190,6 +193,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, resErr.reason, resErr.err, resErr.cond)
 	}
 
+	// handleUpgrade executes the state transitions for upgrades (e.g. launching export jobs, blocking rollouts).
+	// It returns the resulting status phase and conditions.
 	status, err := r.handleUpgrade(ctx, instance, plan, coreRes.backendReady, coreRes.dashboardReady, coreRes.gatewayReady, coreRes.routeReady, coreRes.serviceName, coreRes.secretName, coreRes.conds)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
@@ -1033,6 +1038,8 @@ type restartPlan struct {
 	desiredRestartTrigger string
 }
 
+// computeRestartPlan calculates whether a rolling restart is due based on the RestartInterval.
+// It checks the last restart timestamp (from annotations) and returns the next scheduled restart time.
 func computeRestartPlan(instance *convexv1alpha1.ConvexInstance, sts *appsv1.StatefulSet, now time.Time) restartPlan {
 	interval := restartInterval(instance)
 	plan := restartPlan{

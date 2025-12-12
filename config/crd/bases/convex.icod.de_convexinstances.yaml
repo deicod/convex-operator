@@ -60,10 +60,14 @@ spec:
                       driver.
                     properties:
                       databaseName:
-                        description: DatabaseName overrides the default database name
-                          derived from the ConvexInstance name; used to populate INSTANCE_NAME.
+                        description: |-
+                          DatabaseName overrides the default database name derived from the ConvexInstance name; used to populate INSTANCE_NAME.
+                          Use this if your external database has a specific name requirement or if you are pointing multiple instances to different logical databases.
                         type: string
                       engine:
+                        description: Engine selects the database type. Use "sqlite"
+                          for local development (requires persistence via PVC if not
+                          ephemeral) or "postgres"/"mysql" for production.
                         enum:
                         - postgres
                         - mysql
@@ -71,17 +75,19 @@ spec:
                         type: string
                       requireSSL:
                         default: true
-                        description: RequireSSL enforces TLS verification when connecting
-                          to the database. Defaults to true; set to false to allow
-                          self-signed certificates.
+                        description: |-
+                          RequireSSL enforces TLS verification when connecting to the database. Defaults to true.
+                          Set to false only if your database does not support TLS or uses self-signed certificates that cannot be verified (e.g., some local dev setups).
                         type: boolean
                       secretRef:
-                        description: SecretRef names the Secret holding the DB connection
-                          URL.
+                        description: |-
+                          SecretRef names the Secret holding the DB connection URL.
+                          Required for "postgres" and "mysql" engines.
                         type: string
                       urlKey:
-                        description: URLKey is the key inside the Secret containing
-                          the DB URL.
+                        description: |-
+                          URLKey is the key inside the Secret containing the DB URL (e.g., "postgresql://user:pass@host/db").
+                          Required for "postgres" and "mysql" engines.
                         type: string
                     required:
                     - engine
@@ -1353,6 +1359,10 @@ spec:
                     type: string
                   upgradeStrategy:
                     default: inPlace
+                    description: |-
+                      UpgradeStrategy controls how the backend is updated when the version or image changes.
+                      "inPlace" (default) performs a rolling update of the StatefulSet.
+                      "exportImport" runs a job to export data, updates the backend, and then imports the data; use this for major version upgrades that require data migration.
                     enum:
                     - inPlace
                     - exportImport
@@ -1384,13 +1394,15 @@ spec:
                       generated Gateway.
                     type: string
                   host:
-                    description: Host is the external hostname routed to backend/dashboard.
+                    description: |-
+                      Host is the external hostname routed to backend/dashboard (e.g., "convex.example.com").
+                      This host must resolve to the Ingress/Gateway IP.
                     minLength: 1
                     type: string
                   parentRefs:
-                    description: ParentRefs overrides the operator-managed Gateway;
-                      when set, HTTPRoutes attach to these parent Gateways and the
-                      operator skips creating its own Gateway.
+                    description: |-
+                      ParentRefs overrides the operator-managed Gateway; when set, HTTPRoutes attach to these parent Gateways and the operator skips creating its own Gateway.
+                      Use this to share a single Gateway across multiple ConvexInstances or to use a pre-provisioned Gateway.
                     items:
                       description: ParentReference selects an existing Gateway for
                         the HTTPRoute to attach to.
