@@ -91,22 +91,27 @@ type BackendSpec struct {
 
 // BackendDatabaseSpec describes DB settings and secret references.
 type BackendDatabaseSpec struct {
+	// Engine selects the database type. Use "sqlite" for local development (requires persistence via PVC if not ephemeral) or "postgres"/"mysql" for production.
 	// +kubebuilder:validation:Enum=postgres;mysql;sqlite
 	Engine string `json:"engine"`
 
 	// SecretRef names the Secret holding the DB connection URL.
+	// Required for "postgres" and "mysql" engines.
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
 
-	// URLKey is the key inside the Secret containing the DB URL.
+	// URLKey is the key inside the Secret containing the DB URL (e.g., "postgresql://user:pass@host/db").
+	// Required for "postgres" and "mysql" engines.
 	// +optional
 	URLKey string `json:"urlKey,omitempty"`
 
 	// DatabaseName overrides the default database name derived from the ConvexInstance name; used to populate INSTANCE_NAME.
+	// Use this if your external database has a specific name requirement or if you are pointing multiple instances to different logical databases.
 	// +optional
 	DatabaseName string `json:"databaseName,omitempty"`
 
-	// RequireSSL enforces TLS verification when connecting to the database. Defaults to true; set to false to allow self-signed certificates.
+	// RequireSSL enforces TLS verification when connecting to the database. Defaults to true.
+	// Set to false only if your database does not support TLS or uses self-signed certificates that cannot be verified (e.g., some local dev setups).
 	// +kubebuilder:default:=true
 	// +optional
 	RequireSSL *bool `json:"requireSSL,omitempty"`
@@ -209,7 +214,8 @@ type DashboardSpec struct {
 
 // NetworkingSpec captures external routing details.
 type NetworkingSpec struct {
-	// Host is the external hostname routed to backend/dashboard.
+	// Host is the external hostname routed to backend/dashboard (e.g., "convex.example.com").
+	// This host must resolve to the Ingress/Gateway IP.
 	// +kubebuilder:validation:MinLength=1
 	Host string `json:"host"`
 
@@ -226,6 +232,7 @@ type NetworkingSpec struct {
 	SiteOrigin string `json:"siteOrigin,omitempty"`
 
 	// ParentRefs overrides the operator-managed Gateway; when set, HTTPRoutes attach to these parent Gateways and the operator skips creating its own Gateway.
+	// Use this to share a single Gateway across multiple ConvexInstances or to use a pre-provisioned Gateway.
 	// +optional
 	ParentRefs []ParentReference `json:"parentRefs,omitempty"`
 
@@ -291,6 +298,9 @@ type SecuritySpec struct {
 
 // MaintenanceSpec defines upgrade behavior.
 type MaintenanceSpec struct {
+	// UpgradeStrategy controls how the backend is updated when the version or image changes.
+	// "inPlace" (default) performs a rolling update of the StatefulSet.
+	// "exportImport" runs a job to export data, updates the backend, and then imports the data; use this for major version upgrades that require data migration.
 	// +kubebuilder:default:=inPlace
 	// +kubebuilder:validation:Enum=inPlace;exportImport
 	UpgradeStrategy string `json:"upgradeStrategy,omitempty"`
