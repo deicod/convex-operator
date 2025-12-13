@@ -9,6 +9,7 @@ Kubernetes operator that manages self-hosted Convex deployments through the `Con
 
 ## Referral
 [Double your free quota by applying a referral for the Convex cloud service](https://convex.dev/referral/DARKOL3521)
+[Don't have a Kubernetes Cluster yet? Set one up at Hetzner](https://hetzner.cloud/?ref=p8DSeX0ZVH63)
 
 ## Getting Started
 
