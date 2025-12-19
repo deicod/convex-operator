@@ -197,10 +197,10 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(adminKeyParts[0]).To(Equal(strings.ReplaceAll(resourceName, "-", "_")))
 			Expect(adminKeyParts[1]).NotTo(BeEmpty())
 			instanceSecret := string(secret.Data[instanceSecretKey])
-			Expect(len(instanceSecret)).To(Equal(instanceSecretHexLen))
+			Expect(instanceSecret).To(HaveLen(instanceSecretHexLen))
 			decodedSecret, err := hex.DecodeString(instanceSecret)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(len(decodedSecret)).To(Equal(instanceSecretBytes))
+			Expect(decodedSecret).To(HaveLen(instanceSecretBytes))
 
 			service := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, service)).To(Succeed())

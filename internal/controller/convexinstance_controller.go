@@ -3049,7 +3049,7 @@ func encodeAdminKeyProto(issuedS uint64, memberID uint64, isReadOnly bool) []byt
 }
 
 func appendVarintField(buf []byte, fieldNum int, value uint64) []byte {
-	tag := uint64(fieldNum<<3 | 0)
+	tag := uint64(fieldNum << 3)
 	buf = appendVarint(buf, tag)
 	return appendVarint(buf, value)
 }
