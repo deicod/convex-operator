@@ -2,9 +2,7 @@ name: Docker Build (GHCR)
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 env:
@@ -18,6 +16,7 @@ permissions:
 jobs:
   docker-build:
     name: Build and push image
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -43,7 +42,6 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=ref,event=tag
             type=sha
 
@@ -52,7 +50,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
