@@ -99,6 +99,16 @@ const (
 	upgradePVCNameSuffix     = "upgrade-pvc"
 	upgradeHashAnnotation    = "convex.icod.de/upgrade-hash"
 	defaultRestartInterval   = 7 * 24 * time.Hour
+	obcOwnerKindClaim        = "ObjectBucketClaim"
+	obcOwnerKindBucket       = "ObjectBucket"
+	obcLabelProvisioner      = "bucket-provisioner"
+	obcLabelProvisionerAlt   = "objectbucket.io/provisioner"
+	obcAccessKeyIDKey        = "AWS_ACCESS_KEY_ID"
+	obcSecretAccessKeyKey    = "AWS_SECRET_ACCESS_KEY"
+	obcBucketNameKey         = "BUCKET_NAME"
+	obcBucketHostKey         = "BUCKET_HOST"
+	obcBucketPortKey         = "BUCKET_PORT"
+	obcBucketRegionKey       = "BUCKET_REGION"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -174,18 +184,19 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		currentBackendEnv = deduplicateEnvs(existingBackend.Spec.Template.Spec.Containers[0].Env)
 	}
 
-	desiredHash := desiredUpgradeHash(instance)
-	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
-
-	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
-	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
-
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
 		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
+
+	desiredEnv := backendEnvWithS3(instance, instance.Spec.Version, generatedSecretName(instance), extVersions.s3Resolved)
+	desiredHash := desiredUpgradeHash(instance, desiredEnv)
+	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
+
+	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
+	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
+	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	coreRes, resErr := r.reconcileCoreResources(ctx, instance, plan, extVersions)
 	if resErr != nil {
@@ -278,6 +289,17 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			var requests []reconcile.Request
 			for _, inst := range instances.Items {
+				if inst.Spec.Backend.S3.Enabled {
+					s3 := inst.Spec.Backend.S3
+					if s3.ConfigMapRef == cm.Name {
+						requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+						continue
+					}
+					if s3.ConfigMapRef == "" && s3.SecretRef == cm.Name && autoDetectOBCEnabled(s3) {
+						requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&inst)})
+						continue
+					}
+				}
 				_, configRefs := backendEnvRefs(&inst)
 				for _, ref := range configRefs {
 					if ref.name == cm.Name {
@@ -298,12 +320,36 @@ type externalSecretVersions struct {
 	tlsResourceVersion string
 	envSecretVersions  map[string]string
 	envConfigVersions  map[string]string
+	s3Resolved         convexv1alpha1.BackendS3Spec
 }
 
 type envRef struct {
 	name     string
 	key      string
 	optional bool
+}
+
+func autoDetectOBCEnabled(s3 convexv1alpha1.BackendS3Spec) bool {
+	return ptr.Deref(s3.AutoDetectOBC, true)
+}
+
+func isOBCManagedSecret(secret *corev1.Secret) bool {
+	for _, owner := range secret.OwnerReferences {
+		if owner.Kind == obcOwnerKindClaim || owner.Kind == obcOwnerKindBucket {
+			return true
+		}
+	}
+	labels := secret.Labels
+	if labels == nil {
+		return false
+	}
+	if _, ok := labels[obcLabelProvisioner]; ok {
+		return true
+	}
+	if _, ok := labels[obcLabelProvisionerAlt]; ok {
+		return true
+	}
+	return false
 }
 
 func (r *ConvexInstanceReconciler) validateDBRef(ctx context.Context, namespace string, db convexv1alpha1.BackendDatabaseSpec) (string, error) {
@@ -328,48 +374,185 @@ func (r *ConvexInstanceReconciler) validateDBRef(ctx context.Context, namespace 
 	return "", nil
 }
 
-func (r *ConvexInstanceReconciler) validateS3Ref(ctx context.Context, namespace string, s3 convexv1alpha1.BackendS3Spec) (string, error) {
-	if !s3.Enabled {
-		return "", nil
+type s3InlineFlags struct {
+	bucket   bool
+	region   bool
+	endpoint bool
+}
+
+func s3InlineFlagsFor(s3 convexv1alpha1.BackendS3Spec) s3InlineFlags {
+	return s3InlineFlags{
+		bucket:   s3.Bucket != "",
+		region:   s3.Region != "",
+		endpoint: s3.Endpoint != "",
 	}
-	if s3.SecretRef == "" {
-		return "", fmt.Errorf("s3 secret is required when s3 is enabled")
+}
+
+func resolveS3WithOBC(s3 convexv1alpha1.BackendS3Spec, secret *corev1.Secret, inline s3InlineFlags) convexv1alpha1.BackendS3Spec {
+	if !autoDetectOBCEnabled(s3) || !isOBCManagedSecret(secret) {
+		return s3
 	}
-	requiredS3Keys := []struct {
-		field string
-		value string
-	}{
-		{field: "endpointKey", value: s3.EndpointKey},
-		{field: "accessKeyIdKey", value: s3.AccessKeyIDKey},
-		{field: "secretAccessKeyKey", value: s3.SecretAccessKeyKey},
-		{field: "bucketKey", value: s3.BucketKey},
-		{field: "regionKey", value: s3.RegionKey},
+	needsConfigMap := !inline.bucket || !inline.region || !inline.endpoint
+	if s3.ConfigMapRef == "" && needsConfigMap {
+		s3.ConfigMapRef = s3.SecretRef
 	}
-	for _, key := range requiredS3Keys {
-		if key.value == "" {
-			return "", fmt.Errorf("s3 %s is required when s3 is enabled", key.field)
+	if s3.AccessKeyIDKey == "" {
+		s3.AccessKeyIDKey = obcAccessKeyIDKey
+	}
+	if s3.SecretAccessKeyKey == "" {
+		s3.SecretAccessKeyKey = obcSecretAccessKeyKey
+	}
+	if s3.ConfigMapRef == s3.SecretRef {
+		if !inline.bucket && s3.BucketKey == "" {
+			s3.BucketKey = obcBucketNameKey
+		}
+		if !inline.region && s3.RegionKey == "" {
+			s3.RegionKey = obcBucketRegionKey
+		}
+		if !inline.endpoint && s3.EndpointKey == "" && s3.EndpointHostKey == "" {
+			s3.EndpointHostKey = obcBucketHostKey
+		}
+		if !inline.endpoint && s3.EndpointKey == "" && s3.EndpointHostKey == obcBucketHostKey && s3.EndpointPortKey == "" {
+			s3.EndpointPortKey = obcBucketPortKey
 		}
 	}
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, client.ObjectKey{Name: s3.SecretRef, Namespace: namespace}, secret); err != nil {
-		return "", fmt.Errorf("s3 secret %q: %w", s3.SecretRef, err)
+	return s3
+}
+
+func validateS3Spec(s3 convexv1alpha1.BackendS3Spec, inline s3InlineFlags) error {
+	useConfigMap := s3.ConfigMapRef != ""
+	if s3.AccessKeyIDKey == "" {
+		return fmt.Errorf("s3 accessKeyIdKey is required when s3 is enabled")
 	}
-	keys := []string{
-		s3.EndpointKey,
-		s3.RegionKey,
-		s3.AccessKeyIDKey,
-		s3.SecretAccessKeyKey,
-		s3.BucketKey,
+	if s3.SecretAccessKeyKey == "" {
+		return fmt.Errorf("s3 secretAccessKeyKey is required when s3 is enabled")
 	}
+	if !inline.bucket && s3.BucketKey == "" {
+		return fmt.Errorf("s3 bucket or bucketKey is required when s3 is enabled")
+	}
+	if !inline.region && s3.RegionKey == "" {
+		return fmt.Errorf("s3 region or regionKey is required when s3 is enabled")
+	}
+	if inline.endpoint {
+		return nil
+	}
+	if useConfigMap {
+		if s3.EndpointKey != "" && s3.EndpointHostKey != "" {
+			return fmt.Errorf("s3 endpointKey and endpointHostKey are mutually exclusive")
+		}
+		if s3.EndpointPortKey != "" && s3.EndpointHostKey == "" {
+			return fmt.Errorf("s3 endpointPortKey requires endpointHostKey")
+		}
+		if s3.EndpointKey == "" && s3.EndpointHostKey == "" {
+			return fmt.Errorf("s3 endpoint or endpointKey/endpointHostKey is required when s3 is enabled")
+		}
+		return nil
+	}
+	if s3.EndpointHostKey != "" || s3.EndpointPortKey != "" {
+		return fmt.Errorf("s3 endpointHostKey requires configMapRef")
+	}
+	if s3.EndpointKey == "" {
+		return fmt.Errorf("s3 endpoint or endpointKey is required when s3 is enabled")
+	}
+	return nil
+}
+
+func s3SecretKeys(s3 convexv1alpha1.BackendS3Spec, inline s3InlineFlags, useConfigMap bool) []string {
+	keys := []string{s3.AccessKeyIDKey, s3.SecretAccessKeyKey}
+	if useConfigMap {
+		return keys
+	}
+	if !inline.endpoint {
+		keys = append(keys, s3.EndpointKey)
+	}
+	if !inline.region {
+		keys = append(keys, s3.RegionKey)
+	}
+	if !inline.bucket {
+		keys = append(keys, s3.BucketKey)
+	}
+	return keys
+}
+
+func s3ConfigKeys(s3 convexv1alpha1.BackendS3Spec, inline s3InlineFlags) []string {
+	keys := []string{}
+	if !inline.bucket {
+		keys = append(keys, s3.BucketKey)
+	}
+	if !inline.region {
+		keys = append(keys, s3.RegionKey)
+	}
+	if !inline.endpoint {
+		if s3.EndpointKey != "" {
+			keys = append(keys, s3.EndpointKey)
+		} else {
+			keys = append(keys, s3.EndpointHostKey)
+			if s3.EndpointPortKey != "" {
+				keys = append(keys, s3.EndpointPortKey)
+			}
+		}
+	}
+	return keys
+}
+
+func s3NeedsConfigMap(s3 convexv1alpha1.BackendS3Spec, inline s3InlineFlags) bool {
+	return s3.ConfigMapRef != "" && (!inline.bucket || !inline.region || !inline.endpoint)
+}
+
+func validateSecretKeys(secret *corev1.Secret, name string, keys []string) error {
 	for _, key := range keys {
 		if key == "" {
 			continue
 		}
 		if _, ok := secret.Data[key]; !ok {
-			return "", fmt.Errorf("s3 secret %q missing key %q", s3.SecretRef, key)
+			return fmt.Errorf("s3 secret %q missing key %q", name, key)
 		}
 	}
-	return secret.ResourceVersion, nil
+	return nil
+}
+
+func validateConfigMapKeys(cm *corev1.ConfigMap, name string, keys []string) error {
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if _, ok := cm.Data[key]; !ok {
+			return fmt.Errorf("s3 configmap %q missing key %q", name, key)
+		}
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) validateS3Ref(ctx context.Context, namespace string, s3 convexv1alpha1.BackendS3Spec) (convexv1alpha1.BackendS3Spec, string, error) {
+	if !s3.Enabled {
+		return s3, "", nil
+	}
+	if s3.SecretRef == "" {
+		return s3, "", fmt.Errorf("s3 secret is required when s3 is enabled")
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, client.ObjectKey{Name: s3.SecretRef, Namespace: namespace}, secret); err != nil {
+		return s3, "", fmt.Errorf("s3 secret %q: %w", s3.SecretRef, err)
+	}
+	inline := s3InlineFlagsFor(s3)
+	s3 = resolveS3WithOBC(s3, secret, inline)
+	if err := validateS3Spec(s3, inline); err != nil {
+		return s3, "", err
+	}
+	if err := validateSecretKeys(secret, s3.SecretRef, s3SecretKeys(s3, inline, s3.ConfigMapRef != "")); err != nil {
+		return s3, "", err
+	}
+	if !s3NeedsConfigMap(s3, inline) {
+		return s3, secret.ResourceVersion, nil
+	}
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Name: s3.ConfigMapRef, Namespace: namespace}, cm); err != nil {
+		return s3, "", fmt.Errorf("s3 configmap %q: %w", s3.ConfigMapRef, err)
+	}
+	if err := validateConfigMapKeys(cm, s3.ConfigMapRef, s3ConfigKeys(s3, inline)); err != nil {
+		return s3, "", err
+	}
+	return s3, configHash(secret.ResourceVersion, cm.ResourceVersion), nil
 }
 
 func (r *ConvexInstanceReconciler) validateTLSRef(ctx context.Context, namespace, ref string) (string, error) {
@@ -524,7 +707,7 @@ func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, ins
 	if result.dbResourceVersion, err = r.validateDBRef(ctx, instance.Namespace, instance.Spec.Backend.DB); err != nil {
 		return result, err
 	}
-	if result.s3ResourceVersion, err = r.validateS3Ref(ctx, instance.Namespace, instance.Spec.Backend.S3); err != nil {
+	if result.s3Resolved, result.s3ResourceVersion, err = r.validateS3Ref(ctx, instance.Namespace, instance.Spec.Backend.S3); err != nil {
 		return result, err
 	}
 	if result.tlsResourceVersion, err = r.validateTLSRef(ctx, instance.Namespace, instance.Spec.Networking.TLSSecretRef); err != nil {
@@ -1126,6 +1309,10 @@ func backendEnvRefs(instance *convexv1alpha1.ConvexInstance) ([]envRef, []envRef
 }
 
 func backendEnv(instance *convexv1alpha1.ConvexInstance, backendVersion, secretName string) []corev1.EnvVar {
+	return backendEnvWithS3(instance, backendVersion, secretName, instance.Spec.Backend.S3)
+}
+
+func backendEnvWithS3(instance *convexv1alpha1.ConvexInstance, backendVersion, secretName string, s3 convexv1alpha1.BackendS3Spec) []corev1.EnvVar {
 	if backendVersion == "" {
 		backendVersion = instance.Spec.Version
 	}
@@ -1203,9 +1390,8 @@ func backendEnv(instance *convexv1alpha1.ConvexInstance, backendVersion, secretN
 		})
 	}
 
-	if instance.Spec.Backend.S3.Enabled && instance.Spec.Backend.S3.SecretRef != "" {
-		s3 := instance.Spec.Backend.S3
-		appendS3Env := func(name, key string) {
+	if s3.Enabled && s3.SecretRef != "" {
+		appendSecretEnv := func(name, key string) {
 			if key == "" {
 				return
 			}
@@ -1219,19 +1405,105 @@ func backendEnv(instance *convexv1alpha1.ConvexInstance, backendVersion, secretN
 				},
 			})
 		}
-		appendS3Env("AWS_REGION", s3.RegionKey)
-		appendS3Env("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
-		appendS3Env("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
-		appendS3Env("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
-		appendS3Env("AWS_ENDPOINT_URL", s3.EndpointKey)
-		if s3.EmitS3EndpointUrl {
-			appendS3Env("S3_ENDPOINT_URL", s3.EndpointKey)
+		appendConfigEnv := func(name, key string) {
+			if key == "" || s3.ConfigMapRef == "" {
+				return
+			}
+			addEnv(corev1.EnvVar{
+				Name: name,
+				ValueFrom: &corev1.EnvVarSource{
+					ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: s3.ConfigMapRef},
+						Key:                  key,
+					},
+				},
+			})
 		}
-		appendS3Env("S3_STORAGE_EXPORTS_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_MODULES_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_FILES_BUCKET", s3.BucketKey)
-		appendS3Env("S3_STORAGE_SEARCH_BUCKET", s3.BucketKey)
+		appendValueEnv := func(name, value string) {
+			if value == "" {
+				return
+			}
+			addEnv(corev1.EnvVar{
+				Name:  name,
+				Value: value,
+			})
+		}
+		appendInlineOrSecret := func(name, inline, key string) {
+			if inline != "" {
+				appendValueEnv(name, inline)
+				return
+			}
+			appendSecretEnv(name, key)
+		}
+		appendInlineOrConfig := func(name, inline, key string) {
+			if inline != "" {
+				appendValueEnv(name, inline)
+				return
+			}
+			appendConfigEnv(name, key)
+		}
+		appendBucketEnv := func(name string) {
+			if s3.ConfigMapRef != "" {
+				appendInlineOrConfig(name, s3.Bucket, s3.BucketKey)
+				return
+			}
+			appendInlineOrSecret(name, s3.Bucket, s3.BucketKey)
+		}
+
+		appendSecretEnv("AWS_ACCESS_KEY_ID", s3.AccessKeyIDKey)
+		appendSecretEnv("AWS_SECRET_ACCESS_KEY", s3.SecretAccessKeyKey)
+
+		if s3.ConfigMapRef != "" {
+			appendInlineOrConfig("AWS_REGION", s3.Region, s3.RegionKey)
+		} else {
+			appendInlineOrSecret("AWS_REGION", s3.Region, s3.RegionKey)
+		}
+
+		if s3.Endpoint != "" {
+			appendValueEnv("AWS_ENDPOINT_URL_S3", s3.Endpoint)
+			appendValueEnv("AWS_ENDPOINT_URL", s3.Endpoint)
+			if s3.EmitS3EndpointUrl {
+				appendValueEnv("S3_ENDPOINT_URL", s3.Endpoint)
+			}
+		} else if s3.ConfigMapRef != "" {
+			if s3.EndpointHostKey != "" {
+				const hostEnv = "CONVEX_S3_ENDPOINT_HOST"
+				const portEnv = "CONVEX_S3_ENDPOINT_PORT"
+				appendConfigEnv(hostEnv, s3.EndpointHostKey)
+				endpointScheme := s3.EndpointScheme
+				if endpointScheme == "" {
+					endpointScheme = "http"
+				}
+				endpointValue := fmt.Sprintf("%s://$(%s)", endpointScheme, hostEnv)
+				if s3.EndpointPortKey != "" {
+					appendConfigEnv(portEnv, s3.EndpointPortKey)
+					endpointValue = fmt.Sprintf("%s://$(%s):$(%s)", endpointScheme, hostEnv, portEnv)
+				}
+				appendValueEnv("AWS_ENDPOINT_URL_S3", endpointValue)
+				appendValueEnv("AWS_ENDPOINT_URL", endpointValue)
+				if s3.EmitS3EndpointUrl {
+					appendValueEnv("S3_ENDPOINT_URL", endpointValue)
+				}
+			} else {
+				appendConfigEnv("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
+				appendConfigEnv("AWS_ENDPOINT_URL", s3.EndpointKey)
+				if s3.EmitS3EndpointUrl {
+					appendConfigEnv("S3_ENDPOINT_URL", s3.EndpointKey)
+				}
+			}
+		} else {
+			appendSecretEnv("AWS_ENDPOINT_URL_S3", s3.EndpointKey)
+			appendSecretEnv("AWS_ENDPOINT_URL", s3.EndpointKey)
+			if s3.EmitS3EndpointUrl {
+				appendSecretEnv("S3_ENDPOINT_URL", s3.EndpointKey)
+			}
+		}
+
+		appendBucketEnv("S3_STORAGE_EXPORTS_BUCKET")
+		appendBucketEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET")
+		appendBucketEnv("S3_STORAGE_MODULES_BUCKET")
+		appendBucketEnv("S3_STORAGE_FILES_BUCKET")
+		appendBucketEnv("S3_STORAGE_SEARCH_BUCKET")
 	}
 
 	if instance.Spec.Backend.Telemetry.DisableBeacon {
@@ -1461,7 +1733,11 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 		"app.kubernetes.io/instance":  instance.Name,
 		"app.kubernetes.io/component": "backend",
 	}
-	env := backendEnv(instance, backendVersion, secretName)
+	resolvedS3 := instance.Spec.Backend.S3
+	if extVersions.s3Resolved.Enabled || extVersions.s3Resolved.SecretRef != "" || extVersions.s3Resolved.ConfigMapRef != "" {
+		resolvedS3 = extVersions.s3Resolved
+	}
+	env := backendEnvWithS3(instance, backendVersion, secretName, resolvedS3)
 
 	if len(env) > 0 {
 		seen := map[string]bool{}
@@ -2146,12 +2422,12 @@ func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
 	return nil
 }
 
-func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance) string {
+func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance, env []corev1.EnvVar) string {
 	dashboardImage := instance.Spec.Dashboard.Image
 	if !instance.Spec.Dashboard.Enabled {
 		dashboardImage = ""
 	}
-	envSig := envSignature(backendEnv(instance, instance.Spec.Version, generatedSecretName(instance)))
+	envSig := envSignature(env)
 	return configHash(
 		instance.Spec.Version,
 		instance.Spec.Backend.Image,

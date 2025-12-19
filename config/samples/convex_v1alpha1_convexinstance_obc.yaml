@@ -1,0 +1,28 @@
+apiVersion: convex.icod.de/v1alpha1
+kind: ConvexInstance
+metadata:
+  name: convex-obc
+spec:
+  environment: prod
+  version: latest
+  backend:
+    image: ghcr.io/get-convex/convex-backend:latest
+    db:
+      engine: postgres
+      secretRef: convex-prod-db
+      urlKey: url
+      databaseName: convex_prod
+    storage:
+      mode: external
+      pvc:
+        enabled: false
+    s3:
+      enabled: true
+      secretRef: forum-prod
+      autoDetectOBC: true
+      endpointScheme: http
+      emitS3EndpointUrl: true
+  dashboard:
+    enabled: true
+  networking:
+    host: convex.example.com

@@ -330,7 +330,20 @@ spec:
                     properties:
                       accessKeyIdKey:
                         type: string
+                      autoDetectOBC:
+                        default: true
+                        description: AutoDetectOBC enables automatic discovery of
+                          ObjectBucketClaim companion resources.
+                        type: boolean
+                      bucket:
+                        description: Bucket is the inline bucket name (non-sensitive).
+                        type: string
                       bucketKey:
+                        description: BucketKey is the key containing the bucket name.
+                        type: string
+                      configMapRef:
+                        description: ConfigMapRef names the ConfigMap containing S3
+                          bucket metadata.
                         type: string
                       emitS3EndpointUrl:
                         description: EmitS3EndpointUrl sets S3_ENDPOINT_URL alongside
@@ -339,11 +352,34 @@ spec:
                       enabled:
                         default: false
                         type: boolean
+                      endpoint:
+                        description: Endpoint is the inline S3 endpoint URL (non-sensitive).
+                        type: string
+                      endpointHostKey:
+                        description: EndpointHostKey is the key inside the ConfigMap
+                          containing the endpoint host.
+                        type: string
                       endpointKey:
+                        description: EndpointKey is the key containing the S3 endpoint
+                          URL.
+                        type: string
+                      endpointPortKey:
+                        description: EndpointPortKey is the key inside the ConfigMap
+                          containing the endpoint port.
+                        type: string
+                      endpointScheme:
+                        default: http
+                        description: EndpointScheme sets the URL scheme when constructing
+                          an endpoint from host/port.
+                        enum:
+                        - http
+                        - https
+                        type: string
+                      region:
+                        description: Region is the inline AWS region (non-sensitive).
                         type: string
                       regionKey:
-                        description: RegionKey is the key inside the Secret containing
-                          the AWS region.
+                        description: RegionKey is the key containing the AWS region.
                         type: string
                       secretAccessKeyKey:
                         type: string

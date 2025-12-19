@@ -2,4 +2,5 @@
 resources:
 - convex_v1alpha1_convexinstance.yaml
 - convex_v1alpha1_convexinstance_prod.yaml
+- convex_v1alpha1_convexinstance_obc.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

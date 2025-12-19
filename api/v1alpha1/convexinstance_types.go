@@ -151,8 +151,36 @@ type BackendS3Spec struct {
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
 
+	// ConfigMapRef names the ConfigMap containing S3 bucket metadata.
+	// +optional
+	ConfigMapRef string `json:"configMapRef,omitempty"`
+
+	// AutoDetectOBC enables automatic discovery of ObjectBucketClaim companion resources.
+	// +kubebuilder:default:=true
+	// +optional
+	AutoDetectOBC *bool `json:"autoDetectOBC,omitempty"`
+
+	// Endpoint is the inline S3 endpoint URL (non-sensitive).
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// EndpointKey is the key containing the S3 endpoint URL.
 	// +optional
 	EndpointKey string `json:"endpointKey,omitempty"`
+
+	// EndpointHostKey is the key inside the ConfigMap containing the endpoint host.
+	// +optional
+	EndpointHostKey string `json:"endpointHostKey,omitempty"`
+
+	// EndpointPortKey is the key inside the ConfigMap containing the endpoint port.
+	// +optional
+	EndpointPortKey string `json:"endpointPortKey,omitempty"`
+
+	// EndpointScheme sets the URL scheme when constructing an endpoint from host/port.
+	// +kubebuilder:validation:Enum=http;https
+	// +kubebuilder:default:="http"
+	// +optional
+	EndpointScheme string `json:"endpointScheme,omitempty"`
 
 	// +optional
 	AccessKeyIDKey string `json:"accessKeyIdKey,omitempty"`
@@ -160,10 +188,19 @@ type BackendS3Spec struct {
 	// +optional
 	SecretAccessKeyKey string `json:"secretAccessKeyKey,omitempty"`
 
+	// Bucket is the inline bucket name (non-sensitive).
+	// +optional
+	Bucket string `json:"bucket,omitempty"`
+
+	// BucketKey is the key containing the bucket name.
 	// +optional
 	BucketKey string `json:"bucketKey,omitempty"`
 
-	// RegionKey is the key inside the Secret containing the AWS region.
+	// Region is the inline AWS region (non-sensitive).
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// RegionKey is the key containing the AWS region.
 	// +optional
 	RegionKey string `json:"regionKey,omitempty"`
 

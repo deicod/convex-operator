@@ -48,11 +48,20 @@
         s3:
           enabled: bool
           secretRef: string
+          configMapRef: string         # optional ConfigMap for bucket/region/endpoint metadata
+          autoDetectOBC: bool          # auto-detect OBC secret/configmap and default key names (default true)
+          endpoint: string             # inline endpoint URL (non-sensitive)
           endpointKey: string
+          endpointHostKey: string      # optional host key when endpoint is split across host/port
+          endpointPortKey: string
+          endpointScheme: string       # "http" | "https" (defaults to http)
           emitS3EndpointUrl: bool       # optionally emit S3_ENDPOINT_URL alias
           accessKeyIdKey: string
           secretAccessKeyKey: string
+          bucket: string               # inline bucket name (non-sensitive)
           bucketKey: string
+          region: string               # inline AWS region (non-sensitive)
+          regionKey: string
       dashboard:
         enabled: bool
         image: string                   # default convex-dashboard:<version>
@@ -90,7 +99,7 @@
               - Gateway API Gateway (bound to existing gatewayClassName, example "nginx") and HTTPRoute routing host to backend/dashboard paths.
       - Interactions:
               - DB: surface POSTGRES_URL (or MYSQL_URL for mysql engine) from db.urlKey via Secret; no schema management; fallback to SQLite when unset.
-              - S3: consume endpoint/region/access/secret/bucket keys when enabled; set AWS envs (AWS_REGION/ACCESS_KEY_ID/SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL/_S3) and S3_STORAGE_* bucket vars; fallback to local storage when missing.
+              - S3: consume endpoint/region/access/secret/bucket keys when enabled (optionally from a companion ConfigMap for bucket metadata); set AWS envs (AWS_REGION/ACCESS_KEY_ID/SECRET_ACCESS_KEY, optional AWS_ENDPOINT_URL/_S3) and S3_STORAGE_* bucket vars; fallback to local storage when missing.
               - Storage: PVC mounted to backend pod for SQLite/local disk when required.
   - Reconciliation flows
       - Create/Initial

@@ -990,6 +990,17 @@ var _ = Describe("ConvexInstance Controller", func() {
 			instance.Spec.Backend.S3.BucketKey = "bucket"
 			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
 
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "s3-secret",
+					Namespace: typeNamespacedName.Namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
 			controllerReconciler, recorder := newReconciler()
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).To(HaveOccurred())
@@ -1045,6 +1056,66 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
 			Expect(readyCond.Message).To(ContainSubstring("missing key \"bucket\""))
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
+		})
+
+		It("should fail validation when S3 configmap is missing required key data", func() {
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			instance.Spec.Backend.S3.Enabled = true
+			instance.Spec.Backend.S3.SecretRef = "s3-secret"
+			instance.Spec.Backend.S3.ConfigMapRef = "s3-config"
+			instance.Spec.Backend.S3.EndpointHostKey = "BUCKET_HOST"
+			instance.Spec.Backend.S3.EndpointPortKey = "BUCKET_PORT"
+			instance.Spec.Backend.S3.RegionKey = "BUCKET_REGION"
+			instance.Spec.Backend.S3.AccessKeyIDKey = "AWS_ACCESS_KEY_ID"
+			instance.Spec.Backend.S3.SecretAccessKeyKey = "AWS_SECRET_ACCESS_KEY"
+			instance.Spec.Backend.S3.BucketKey = "BUCKET_NAME"
+			Expect(k8sClient.Update(ctx, instance)).To(Succeed())
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "s3-secret",
+					Namespace: typeNamespacedName.Namespace,
+				},
+				Data: map[string][]byte{
+					"AWS_ACCESS_KEY_ID":     []byte("id"),
+					"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "s3-config",
+					Namespace: typeNamespacedName.Namespace,
+				},
+				Data: map[string]string{
+					"BUCKET_HOST":   "rook-ceph-rgw-s3.rook-ceph.svc",
+					"BUCKET_PORT":   "80",
+					"BUCKET_REGION": "",
+				},
+			}
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, cm)
+			})
+
+			controllerReconciler, recorder := newReconciler()
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			readyCond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+			Expect(readyCond).NotTo(BeNil())
+			Expect(readyCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCond.Reason).To(Equal("ValidationFailed"))
+			Expect(readyCond.Message).To(ContainSubstring("configmap"))
+			Expect(readyCond.Message).To(ContainSubstring("missing key \"BUCKET_NAME\""))
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ValidationFailed")))
 		})
 
@@ -1160,7 +1231,8 @@ var _ = Describe("upgrade plan helpers", func() {
 				},
 			},
 		}
-		desiredHash := desiredUpgradeHash(instance)
+		desiredEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
+		desiredHash := desiredUpgradeHash(instance, desiredEnv)
 		instance.Status.UpgradeHash = desiredHash
 
 		currentEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
@@ -1273,7 +1345,8 @@ var _ = Describe("upgrade plan helpers", func() {
 				},
 			},
 		}
-		desiredHash := desiredUpgradeHash(instance)
+		desiredEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
+		desiredHash := desiredUpgradeHash(instance, desiredEnv)
 		instance.Status.UpgradeHash = desiredHash
 
 		currentBackendImage := "ghcr.io/get-convex/convex-backend:1.0.0"
@@ -1312,7 +1385,8 @@ var _ = Describe("upgrade plan helpers", func() {
 			},
 		}
 
-		desiredHash := desiredUpgradeHash(instance)
+		desiredEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
+		desiredHash := desiredUpgradeHash(instance, desiredEnv)
 		currentEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
 		appliedHash := observedUpgradeHash(instance, instance.Spec.Version, instance.Spec.Backend.Image, "", currentEnv)
 		Expect(desiredHash).To(Equal(appliedHash))
@@ -1451,6 +1525,304 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET")).NotTo(BeNil())
 		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
 		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.SecretKeyRef.Key).To(Equal("bucket"))
+	})
+
+	It("renders backend env vars using S3 metadata from a ConfigMap", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "env-vars-configmap",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:    dbEnginePostgres,
+						SecretRef: "db-secret",
+						URLKey:    "url",
+					},
+					S3: convexv1alpha1.BackendS3Spec{
+						Enabled:            true,
+						SecretRef:          "s3-secret",
+						ConfigMapRef:       "s3-config",
+						EndpointHostKey:    "BUCKET_HOST",
+						EndpointPortKey:    "BUCKET_PORT",
+						RegionKey:          "BUCKET_REGION",
+						AccessKeyIDKey:     "AWS_ACCESS_KEY_ID",
+						SecretAccessKeyKey: "AWS_SECRET_ACCESS_KEY",
+						BucketKey:          "BUCKET_NAME",
+						EmitS3EndpointUrl:  true,
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "env-vars-configmap.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+			dbResourceVersion: "db-rv",
+			s3ResourceVersion: "s3-rv",
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		Expect(getEnv("AWS_ACCESS_KEY_ID")).NotTo(BeNil())
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("AWS_ACCESS_KEY_ID"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY")).NotTo(BeNil())
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("AWS_SECRET_ACCESS_KEY"))
+
+		Expect(getEnv("AWS_REGION")).NotTo(BeNil())
+		Expect(getEnv("AWS_REGION").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("AWS_REGION").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_REGION"))
+
+		Expect(getEnv("CONVEX_S3_ENDPOINT_HOST")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_S3_ENDPOINT_HOST").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("CONVEX_S3_ENDPOINT_HOST").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_HOST"))
+		Expect(getEnv("CONVEX_S3_ENDPOINT_PORT")).NotTo(BeNil())
+		Expect(getEnv("CONVEX_S3_ENDPOINT_PORT").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("CONVEX_S3_ENDPOINT_PORT").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_PORT"))
+
+		Expect(getEnv("AWS_ENDPOINT_URL_S3")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").ValueFrom).To(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").Value).To(Equal("http://$(CONVEX_S3_ENDPOINT_HOST):$(CONVEX_S3_ENDPOINT_PORT)"))
+		Expect(getEnv("AWS_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom).To(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL").Value).To(Equal("http://$(CONVEX_S3_ENDPOINT_HOST):$(CONVEX_S3_ENDPOINT_PORT)"))
+		Expect(getEnv("S3_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("S3_ENDPOINT_URL").ValueFrom).To(BeNil())
+		Expect(getEnv("S3_ENDPOINT_URL").Value).To(Equal("http://$(CONVEX_S3_ENDPOINT_HOST):$(CONVEX_S3_ENDPOINT_PORT)"))
+
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_NAME"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_NAME"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_NAME"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_NAME"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.ConfigMapKeyRef.Name).To(Equal("s3-config"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").ValueFrom.ConfigMapKeyRef.Key).To(Equal("BUCKET_NAME"))
+	})
+
+	It("renders backend env vars using inline S3 metadata", func() {
+		instance := &convexv1alpha1.ConvexInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "env-vars-inline",
+				Namespace: "default",
+			},
+			Spec: convexv1alpha1.ConvexInstanceSpec{
+				Environment: "prod",
+				Version:     "9.9.9",
+				Backend: convexv1alpha1.BackendSpec{
+					Image: "ghcr.io/get-convex/convex-backend:9.9.9",
+					DB: convexv1alpha1.BackendDatabaseSpec{
+						Engine:    dbEnginePostgres,
+						SecretRef: "db-secret",
+						URLKey:    "url",
+					},
+					S3: convexv1alpha1.BackendS3Spec{
+						Enabled:            true,
+						SecretRef:          "s3-secret",
+						AccessKeyIDKey:     "AWS_ACCESS_KEY_ID",
+						SecretAccessKeyKey: "AWS_SECRET_ACCESS_KEY",
+						Bucket:             "inline-bucket",
+						Region:             "us-east-1",
+						Endpoint:           "https://s3.us-east-1.amazonaws.com",
+						EmitS3EndpointUrl:  true,
+					},
+				},
+				Networking: convexv1alpha1.NetworkingSpec{
+					Host: "env-vars-inline.example.com",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, instance)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, instance)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		_, err := reconciler.reconcileStatefulSet(ctx, instance, backendServiceName(instance), generatedSecretName(instance), "rv-secret", instance.Spec.Backend.Image, instance.Spec.Version, externalSecretVersions{
+			dbResourceVersion: "db-rv",
+			s3ResourceVersion: "s3-rv",
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, sts)).To(Succeed())
+		envs := sts.Spec.Template.Spec.Containers[0].Env
+
+		getEnv := func(name string) *corev1.EnvVar {
+			for i := range envs {
+				if envs[i].Name == name {
+					return &envs[i]
+				}
+			}
+			return nil
+		}
+
+		Expect(getEnv("AWS_ACCESS_KEY_ID")).NotTo(BeNil())
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_ACCESS_KEY_ID").ValueFrom.SecretKeyRef.Key).To(Equal("AWS_ACCESS_KEY_ID"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY")).NotTo(BeNil())
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Name).To(Equal("s3-secret"))
+		Expect(getEnv("AWS_SECRET_ACCESS_KEY").ValueFrom.SecretKeyRef.Key).To(Equal("AWS_SECRET_ACCESS_KEY"))
+
+		Expect(getEnv("AWS_REGION")).NotTo(BeNil())
+		Expect(getEnv("AWS_REGION").Value).To(Equal("us-east-1"))
+		Expect(getEnv("AWS_REGION").ValueFrom).To(BeNil())
+
+		Expect(getEnv("AWS_ENDPOINT_URL_S3")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").Value).To(Equal("https://s3.us-east-1.amazonaws.com"))
+		Expect(getEnv("AWS_ENDPOINT_URL_S3").ValueFrom).To(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("AWS_ENDPOINT_URL").Value).To(Equal("https://s3.us-east-1.amazonaws.com"))
+		Expect(getEnv("AWS_ENDPOINT_URL").ValueFrom).To(BeNil())
+		Expect(getEnv("S3_ENDPOINT_URL")).NotTo(BeNil())
+		Expect(getEnv("S3_ENDPOINT_URL").Value).To(Equal("https://s3.us-east-1.amazonaws.com"))
+		Expect(getEnv("S3_ENDPOINT_URL").ValueFrom).To(BeNil())
+
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_EXPORTS_BUCKET").Value).To(Equal("inline-bucket"))
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SNAPSHOT_IMPORTS_BUCKET").Value).To(Equal("inline-bucket"))
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_MODULES_BUCKET").Value).To(Equal("inline-bucket"))
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_FILES_BUCKET").Value).To(Equal("inline-bucket"))
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET")).NotTo(BeNil())
+		Expect(getEnv("S3_STORAGE_SEARCH_BUCKET").Value).To(Equal("inline-bucket"))
+	})
+
+	It("auto-detects OBC configmap defaults for S3 keys", func() {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "obc-secret",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "objectbucket.io/v1alpha1",
+					Kind:       "ObjectBucketClaim",
+					Name:       "obc-secret",
+				}},
+			},
+			Data: map[string][]byte{
+				"AWS_ACCESS_KEY_ID":     []byte("id"),
+				"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, secret)
+		})
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "obc-secret",
+				Namespace: "default",
+			},
+			Data: map[string]string{
+				"BUCKET_NAME":   "bucket-name",
+				"BUCKET_HOST":   "rook-ceph-rgw-s3.rook-ceph.svc",
+				"BUCKET_PORT":   "80",
+				"BUCKET_REGION": "us-east-1",
+			},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, cm)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		s3Spec := convexv1alpha1.BackendS3Spec{
+			Enabled:       true,
+			SecretRef:     "obc-secret",
+			AutoDetectOBC: ptr.To(true),
+		}
+		resolved, _, err := reconciler.validateS3Ref(ctx, "default", s3Spec)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resolved.ConfigMapRef).To(Equal("obc-secret"))
+		Expect(resolved.AccessKeyIDKey).To(Equal("AWS_ACCESS_KEY_ID"))
+		Expect(resolved.SecretAccessKeyKey).To(Equal("AWS_SECRET_ACCESS_KEY"))
+		Expect(resolved.BucketKey).To(Equal("BUCKET_NAME"))
+		Expect(resolved.RegionKey).To(Equal("BUCKET_REGION"))
+		Expect(resolved.EndpointHostKey).To(Equal("BUCKET_HOST"))
+		Expect(resolved.EndpointPortKey).To(Equal("BUCKET_PORT"))
+	})
+
+	It("accepts inline S3 metadata values without keys", func() {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "inline-secret",
+				Namespace: "default",
+			},
+			Data: map[string][]byte{
+				"AWS_ACCESS_KEY_ID":     []byte("id"),
+				"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, secret)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		s3Spec := convexv1alpha1.BackendS3Spec{
+			Enabled:            true,
+			SecretRef:          "inline-secret",
+			AccessKeyIDKey:     "AWS_ACCESS_KEY_ID",
+			SecretAccessKeyKey: "AWS_SECRET_ACCESS_KEY",
+			Bucket:             "inline-bucket",
+			Region:             "us-east-1",
+			Endpoint:           "https://s3.example.com",
+		}
+		resolved, _, err := reconciler.validateS3Ref(ctx, "default", s3Spec)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resolved.Bucket).To(Equal("inline-bucket"))
+		Expect(resolved.Region).To(Equal("us-east-1"))
+		Expect(resolved.Endpoint).To(Equal("https://s3.example.com"))
 	})
 
 	It("sets DO_NOT_REQUIRE_SSL when db.requireSSL is false", func() {
@@ -1893,7 +2265,8 @@ var _ = Describe("envtest lifecycle suites", func() {
 		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
 		Expect(err).NotTo(HaveOccurred())
 
-		desiredHash := desiredUpgradeHash(instance)
+		desiredEnv := backendEnv(instance, instance.Spec.Version, generatedSecretName(instance))
+		desiredHash := desiredUpgradeHash(instance, desiredEnv)
 
 		exportJob := &batchv1.Job{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: "mock-upgrade-upgrade-export", Namespace: "default"}, exportJob); errors.IsNotFound(err) {
