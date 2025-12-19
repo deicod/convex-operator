@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -52,7 +53,20 @@ var (
 	k8sClient client.Client
 )
 
-const gatewayAPIModuleVersion = "v1.2.0"
+const defaultGatewayAPIModuleVersion = "v1.3.0"
+
+func gatewayAPIModuleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return defaultGatewayAPIModuleVersion
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "sigs.k8s.io/gateway-api" && dep.Version != "" {
+			return dep.Version
+		}
+	}
+	return defaultGatewayAPIModuleVersion
+}
 
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
@@ -140,7 +154,8 @@ func gatewayStandardCRDPath() string {
 		modCache = strings.TrimSpace(string(output))
 	}
 
-	path := filepath.Join(modCache, "sigs.k8s.io", fmt.Sprintf("gateway-api@%s", gatewayAPIModuleVersion), "config", "crd", "standard")
+	version := gatewayAPIModuleVersion()
+	path := filepath.Join(modCache, "sigs.k8s.io", fmt.Sprintf("gateway-api@%s", version), "config", "crd", "standard")
 	if _, err := os.Stat(path); err != nil {
 		logf.Log.Error(err, "Gateway API CRDs not found", "path", path)
 		return ""
