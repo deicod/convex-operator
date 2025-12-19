@@ -1738,6 +1738,7 @@ var _ = Describe("config and secret helpers", func() {
 					APIVersion: "objectbucket.io/v1alpha1",
 					Kind:       "ObjectBucketClaim",
 					Name:       "obc-secret",
+					UID:        types.UID("obc-secret-uid"),
 				}},
 			},
 			Data: map[string][]byte{
