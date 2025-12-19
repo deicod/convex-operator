@@ -1789,6 +1789,61 @@ var _ = Describe("config and secret helpers", func() {
 		Expect(resolved.EndpointPortKey).To(Equal("BUCKET_PORT"))
 	})
 
+	It("defaults empty OBC region to us-east-1", func() {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "obc-empty-region",
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "objectbucket.io/v1alpha1",
+					Kind:       "ObjectBucketClaim",
+					Name:       "obc-empty-region",
+					UID:        types.UID("obc-empty-region-uid"),
+				}},
+			},
+			Data: map[string][]byte{
+				"AWS_ACCESS_KEY_ID":     []byte("id"),
+				"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, secret)
+		})
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "obc-empty-region",
+				Namespace: "default",
+			},
+			Data: map[string]string{
+				"BUCKET_NAME":   "bucket-name",
+				"BUCKET_HOST":   "rook-ceph-rgw-s3.rook-ceph.svc",
+				"BUCKET_PORT":   "80",
+				"BUCKET_REGION": "",
+			},
+		}
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, cm)
+		})
+
+		reconciler := &ConvexInstanceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+
+		s3Spec := convexv1alpha1.BackendS3Spec{
+			Enabled:       true,
+			SecretRef:     "obc-empty-region",
+			AutoDetectOBC: ptr.To(true),
+		}
+		resolved, _, err := reconciler.validateS3Ref(ctx, "default", s3Spec)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resolved.Region).To(Equal(defaultOBCRegion))
+		Expect(resolved.RegionKey).To(Equal("BUCKET_REGION"))
+	})
+
 	It("accepts inline S3 metadata values without keys", func() {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{

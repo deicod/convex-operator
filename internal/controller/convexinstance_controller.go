@@ -109,6 +109,7 @@ const (
 	obcBucketHostKey         = "BUCKET_HOST"
 	obcBucketPortKey         = "BUCKET_PORT"
 	obcBucketRegionKey       = "BUCKET_REGION"
+	defaultOBCRegion         = "us-east-1"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -523,6 +524,17 @@ func validateConfigMapKeys(cm *corev1.ConfigMap, name string, keys []string) err
 	return nil
 }
 
+func defaultS3RegionIfEmpty(s3 convexv1alpha1.BackendS3Spec, inline s3InlineFlags, cm *corev1.ConfigMap) convexv1alpha1.BackendS3Spec {
+	if inline.region || s3.RegionKey == "" || s3.RegionKey != obcBucketRegionKey || cm == nil {
+		return s3
+	}
+	if strings.TrimSpace(cm.Data[s3.RegionKey]) != "" {
+		return s3
+	}
+	s3.Region = defaultOBCRegion
+	return s3
+}
+
 func (r *ConvexInstanceReconciler) validateS3Ref(ctx context.Context, namespace string, s3 convexv1alpha1.BackendS3Spec) (convexv1alpha1.BackendS3Spec, string, error) {
 	if !s3.Enabled {
 		return s3, "", nil
@@ -552,6 +564,7 @@ func (r *ConvexInstanceReconciler) validateS3Ref(ctx context.Context, namespace 
 	if err := validateConfigMapKeys(cm, s3.ConfigMapRef, s3ConfigKeys(s3, inline)); err != nil {
 		return s3, "", err
 	}
+	s3 = defaultS3RegionIfEmpty(s3, inline, cm)
 	return s3, configHash(secret.ResourceVersion, cm.ResourceVersion), nil
 }
 
