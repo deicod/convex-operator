@@ -91,7 +91,7 @@
               - Supporting packages for config rendering (ConfigMap), secrets wiring, Gateway API resources.
           - Managed resources per instance:
           - ConfigMap for backend non-secret config (ports, feature flags, example defaults).
-          - Secrets: Convex instance secret + admin key (generated if absent), plus existing DB/S3 Secret refs mounted/consumed.
+          - Secrets: Convex instance secret (32-byte hex) + admin key (generated like `generate_key`, `{instance}|{encrypted}`) if absent, plus existing DB/S3 Secret refs mounted/consumed.
           - PVC (if storage.pvc.enabled).
           - StatefulSet (backend, replicas=1) with probes, envs for DB URL, S3 creds, instance/admin secrets, storage mounts.
               - Service (backend) exposing Convex API and HTTP action ports.
@@ -120,7 +120,7 @@
           - Preserve external Secrets (DB/S3) and TLS Secret; clear finalizer after children gone.
   - Configuration & secrets
       - ConfigMap: backend ports (example: CONVEX_PORT=3210 as example), feature toggles per docs, logging level, Env-appropriate defaults.
-      - Secrets: instance secret, admin key (used by dashboard/CLI), projected DB URL, S3 creds; handle regeneration policy (only create if absent, no rotation unless spec indicates).
+      - Secrets: instance secret (32-byte hex), admin key (generated using Convex keybroker), projected DB URL, S3 creds; handle regeneration policy (only create if absent, no rotation unless spec indicates).
       - TLS Secret referenced only; not managed.
   - Networking
       - Gateway API preferred; Gateway refers to provided gatewayClassName (example: nginx). HTTPRoute attaches host, TLS, path rules to backend/dashboard Services.

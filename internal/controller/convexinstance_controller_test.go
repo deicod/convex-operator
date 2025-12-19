@@ -19,7 +19,9 @@ package controller
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -189,6 +191,16 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-convex-secrets", Namespace: "default"}, secret)).To(Succeed())
 			Expect(secret.Data).To(HaveKey("adminKey"))
 			Expect(secret.Data).To(HaveKey("instanceSecret"))
+			adminKey := string(secret.Data[adminKeyKey])
+			Expect(adminKey).To(ContainSubstring("|"))
+			adminKeyParts := strings.SplitN(adminKey, "|", 2)
+			Expect(adminKeyParts[0]).To(Equal(strings.ReplaceAll(resourceName, "-", "_")))
+			Expect(adminKeyParts[1]).NotTo(BeEmpty())
+			instanceSecret := string(secret.Data[instanceSecretKey])
+			Expect(len(instanceSecret)).To(Equal(instanceSecretHexLen))
+			decodedSecret, err := hex.DecodeString(instanceSecret)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(decodedSecret)).To(Equal(instanceSecretBytes))
 
 			service := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-backend", Namespace: "default"}, service)).To(Succeed())

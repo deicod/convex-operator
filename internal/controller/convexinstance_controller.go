@@ -19,15 +19,17 @@ package controller
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/ericlagergren/siv"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -55,6 +57,11 @@ const (
 	finalizerName            = "convex.icod.de/finalizer"
 	adminKeyKey              = "adminKey"
 	instanceSecretKey        = "instanceSecret"
+	adminKeyVersion          = uint8(1)
+	adminKeyPurpose          = "admin key"
+	adminKeyMemberID         = uint64(0)
+	instanceSecretBytes      = 32
+	instanceSecretHexLen     = instanceSecretBytes * 2
 	defaultBackendPortName   = "http"
 	defaultBackendPort       = 3210
 	actionPortName           = "http-action"
@@ -790,15 +797,16 @@ func configHash(content string, values ...string) string {
 
 func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (string, string, error) {
 	secretName := generatedSecretName(instance)
+	instanceName := backendInstanceName(instance)
 	secret := &corev1.Secret{}
 	key := client.ObjectKey{Name: secretName, Namespace: instance.Namespace}
 	err := r.Get(ctx, key, secret)
 	if errors.IsNotFound(err) {
-		adminKey, err := randomAdminString()
+		instanceSecret, err := generateInstanceSecret()
 		if err != nil {
 			return "", "", err
 		}
-		instanceSecret, err := randomAdminString()
+		adminKey, err := generateAdminKey(instanceName, instanceSecret)
 		if err != nil {
 			return "", "", err
 		}
@@ -832,20 +840,22 @@ func (r *ConvexInstanceReconciler) reconcileSecrets(ctx context.Context, instanc
 	if secret.Data == nil {
 		secret.Data = map[string][]byte{}
 	}
-	if _, ok := secret.Data[adminKeyKey]; !ok {
-		keyVal, genErr := randomAdminString()
-		if genErr != nil {
-			return "", "", genErr
+	instanceSecretVal, instanceSecretValid := normalizeInstanceSecret(secret.Data[instanceSecretKey])
+	if !instanceSecretValid {
+		instanceSecretVal, err = generateInstanceSecret()
+		if err != nil {
+			return "", "", err
 		}
-		secret.Data[adminKeyKey] = []byte(keyVal)
+		secret.Data[instanceSecretKey] = []byte(instanceSecretVal)
 		changed = true
 	}
-	if _, ok := secret.Data[instanceSecretKey]; !ok {
-		keyVal, genErr := randomAdminString()
-		if genErr != nil {
-			return "", "", genErr
+	adminKeyValid := adminKeyLooksValid(secret.Data[adminKeyKey])
+	if !adminKeyValid || !instanceSecretValid {
+		adminKey, err := generateAdminKey(instanceName, instanceSecretVal)
+		if err != nil {
+			return "", "", err
 		}
-		secret.Data[instanceSecretKey] = []byte(keyVal)
+		secret.Data[adminKeyKey] = []byte(adminKey)
 		changed = true
 	}
 
@@ -2955,16 +2965,123 @@ func deploymentReady(dep *appsv1.Deployment) bool {
 		dep.Status.ReadyReplicas == desired
 }
 
-func randomString(length int) (string, error) {
+func generateInstanceSecret() (string, error) {
+	return randomHexString(instanceSecretBytes)
+}
+
+func randomHexString(length int) (string, error) {
 	buf := make([]byte, length)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return base64.RawStdEncoding.EncodeToString(buf), nil
+	return hex.EncodeToString(buf), nil
 }
 
-func randomAdminString() (string, error) {
-	return randomString(24)
+func normalizeInstanceSecret(value []byte) (string, bool) {
+	if len(value) == 0 {
+		return "", false
+	}
+	secret := strings.TrimSpace(string(value))
+	if len(secret) != instanceSecretHexLen {
+		return "", false
+	}
+	decoded, err := hex.DecodeString(secret)
+	if err != nil || len(decoded) != instanceSecretBytes {
+		return "", false
+	}
+	return secret, true
+}
+
+func adminKeyLooksValid(value []byte) bool {
+	key := strings.TrimSpace(string(value))
+	parts := strings.SplitN(key, "|", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return false
+	}
+	if _, err := hex.DecodeString(parts[1]); err != nil {
+		return false
+	}
+	return true
+}
+
+func generateAdminKey(instanceName, instanceSecret string) (string, error) {
+	if instanceName == "" {
+		return "", fmt.Errorf("admin key instance name is required")
+	}
+	secretBytes, err := hex.DecodeString(instanceSecret)
+	if err != nil {
+		return "", fmt.Errorf("instance secret must be hex: %w", err)
+	}
+	if len(secretBytes) != instanceSecretBytes {
+		return "", fmt.Errorf("instance secret must be %d bytes", instanceSecretBytes)
+	}
+	derivedKey, err := deriveKBKDFCTR(secretBytes, []byte(adminKeyPurpose), 16)
+	if err != nil {
+		return "", err
+	}
+	aead, err := siv.NewGCM(derivedKey)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	issued := uint64(time.Now().Unix())
+	proto := encodeAdminKeyProto(issued, adminKeyMemberID, false)
+	ciphertext := aead.Seal(nil, nonce, proto, []byte{adminKeyVersion})
+	buf := make([]byte, 0, 1+len(nonce)+len(ciphertext))
+	buf = append(buf, adminKeyVersion)
+	buf = append(buf, nonce...)
+	buf = append(buf, ciphertext...)
+	encoded := hex.EncodeToString(buf)
+	return fmt.Sprintf("%s|%s", instanceName, encoded), nil
+}
+
+func encodeAdminKeyProto(issuedS uint64, memberID uint64, isReadOnly bool) []byte {
+	buf := make([]byte, 0, 20)
+	buf = appendVarintField(buf, 2, issuedS)
+	buf = appendVarintField(buf, 3, memberID)
+	if isReadOnly {
+		buf = appendVarintField(buf, 5, 1)
+	}
+	return buf
+}
+
+func appendVarintField(buf []byte, fieldNum int, value uint64) []byte {
+	tag := uint64(fieldNum<<3 | 0)
+	buf = appendVarint(buf, tag)
+	return appendVarint(buf, value)
+}
+
+func appendVarint(buf []byte, value uint64) []byte {
+	for value >= 0x80 {
+		buf = append(buf, byte(value)|0x80)
+		value >>= 7
+	}
+	return append(buf, byte(value))
+}
+
+func deriveKBKDFCTR(key []byte, label []byte, outLen int) ([]byte, error) {
+	if outLen <= 0 {
+		return nil, fmt.Errorf("kbkdf output length must be positive")
+	}
+	lBits := uint32(outLen * 8)
+	result := make([]byte, 0, outLen)
+	counter := uint32(1)
+	for len(result) < outLen {
+		mac := hmac.New(sha256.New, key)
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], counter)
+		mac.Write(buf[:])
+		mac.Write(label)
+		mac.Write([]byte{0})
+		binary.BigEndian.PutUint32(buf[:], lBits)
+		mac.Write(buf[:])
+		result = append(result, mac.Sum(nil)...)
+		counter++
+	}
+	return result[:outLen], nil
 }
 
 func (r *ConvexInstanceReconciler) recordEvent(instance *convexv1alpha1.ConvexInstance, eventType, reason, message string) {
