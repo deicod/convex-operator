@@ -1579,7 +1579,7 @@ func envSignature(env []corev1.EnvVar) string {
 }
 
 func envResourceVersionSignature(ext externalSecretVersions) []string {
-	parts := []string{}
+	parts := make([]string, 0, len(ext.envSecretVersions)+len(ext.envConfigVersions))
 	for name, rv := range ext.envSecretVersions {
 		parts = append(parts, fmt.Sprintf("secret:%s:%s", name, rv))
 	}
@@ -1858,11 +1858,12 @@ func (r *ConvexInstanceReconciler) reconcileStatefulSet(ctx context.Context, ins
 			Volumes: volumes,
 		},
 	}
-	hashValues := []string{
+	hashValues := make([]string, 0, 3+len(extVersions.envSecretVersions)+len(extVersions.envConfigVersions))
+	hashValues = append(hashValues,
 		generatedSecretRV,
 		extVersions.dbResourceVersion,
 		extVersions.s3ResourceVersion,
-	}
+	)
 	hashValues = append(hashValues, envResourceVersionSignature(extVersions)...)
 	podAnnotations["convex.icod.de/config-hash"] = configHash(
 		r.renderBackendConfig(instance, backendVersion),
