@@ -1,5 +1,5 @@
 # convex-operator
-Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder (Go 1.24+) and controller-runtime.
+Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder (Go 1.25+) and controller-runtime.
 
 ## Description
 - Reconciles a single backend StatefulSet (one replica) and optional dashboard Deployment per `ConvexInstance`.
@@ -44,7 +44,7 @@ kubectl apply -f convex-sample.yaml
 ```
 
 ### Prerequisites
-- go version v1.24.6+
+- go version v1.25.6+
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.

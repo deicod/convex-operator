@@ -8,7 +8,7 @@ The project guidelines, including coding style, testing instructions, and direct
 
 ## Quick Start
 
-1.  **Dependencies**: Ensure you have Go 1.24+, Docker, and kubectl installed.
+1.  **Dependencies**: Ensure you have Go 1.25.6+, Docker, and kubectl installed.
 2.  **Linting**: Run `make fmt vet` to format and vet your code.
 3.  **Testing**: Run `make test` to execute the test suite.
 4.  **Local Dev**: Use `make run` to run the controller locally against your configured Kubernetes cluster.

@@ -33,7 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -57,8 +57,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 		const strategyExportImport = "exportImport"
 
 		ctx := context.Background()
-		newReconciler := func() (*ConvexInstanceReconciler, *record.FakeRecorder) {
-			rec := record.NewFakeRecorder(64)
+		newReconciler := func() (*ConvexInstanceReconciler, *events.FakeRecorder) {
+			rec := events.NewFakeRecorder(64)
 			return &ConvexInstanceReconciler{
 				Client:   k8sClient,
 				Scheme:   k8sClient.Scheme(),

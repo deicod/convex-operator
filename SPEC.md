@@ -13,7 +13,7 @@
       - No provisioning of DB/S3/Certs/External DNS; only consumption via existing Secrets.
       - No cloud-provider specific LB management beyond Gateway API objects.
   - Constraints
-      - Kubebuilder/controller-runtime, Go 1.24+, idiomatic patterns (finalizers, conditions).
+      - Kubebuilder/controller-runtime, Go 1.25+, idiomatic patterns (finalizers, conditions).
       - Multi-namespace support; operator cluster-scoped for watch, but reconciles namespace-scoped resources with owner refs.
       - Images: backend ghcr.io/get-convex/convex-backend:<tag>, dashboard ghcr.io/get-convex/convex-dashboard:<tag>.
       - Ports/env derive from Convex self-hosting docs; use example values only when needed and label them.
@@ -171,7 +171,7 @@
 
 ### M1: Project Bootstrap & CRD Design
 
-  - [x] Initialize Kubebuilder project (module path set to repo), ensuring Go 1.24 toolchain is configured to satisfy future compatibility and aligning with controller-runtime version.
+  - [x] Initialize Kubebuilder project (module path set to repo), ensuring Go 1.25 toolchain is configured to satisfy future compatibility and aligning with controller-runtime version.
   - [x] Define ConvexInstance API types with fields from spec, including nested structs for backend/dashboard/networking/scale/maintenance to mirror desired CRD shape.
   - [x] Add validation markers (enum for environment and upgradeStrategy, required fields like version, format for resource quantities) to enforce spec constraints at admission.
   - [x] Set defaulting markers for images (backend/dashboard using version), dashboard enabled default (true/false decision documented), and replica defaults to ensure consistent behavior.

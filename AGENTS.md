@@ -15,7 +15,7 @@ Brief notes for contributors building the Convex Kubernetes operator. Keep chang
 - `make run` — run the controller against the current kubeconfig; `make install`/`make uninstall` apply/remove CRDs; `make deploy`/`make undeploy` manage in-cluster install.
 
 ## Coding Style & Naming Conventions
-- Go 1.24+, idiomatic Go: tabs, gofmt, lower_snake package dirs, exported symbols commented. Prefer small, pure helpers and idempotent reconciliation steps.
+- Go 1.25+, idiomatic Go: tabs, gofmt, lower_snake package dirs, exported symbols commented. Prefer small, pure helpers and idempotent reconciliation steps.
 - CRD fields use lowerCamelCase JSON tags mirroring the spec (e.g., `upgradeStrategy`, `tlsSecretRef`). Use Kubebuilder validation/default markers for enums, required refs, and quantity formats.
 - Images default to `ghcr.io/get-convex/convex-backend:<version>` and `.../convex-dashboard:<version>`; keep defaults centralized near API defaults.
 
