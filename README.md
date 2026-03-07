@@ -105,6 +105,8 @@ spec:
 ### Gateway and TLS assumptions
 - The operator assumes a `GatewayClass` named `nginx` by default (see `spec.networking.gatewayClassName`). Change it in the ConvexInstance spec to match your installed Gateway implementation.
 - By default the operator creates a Gateway per instance using `spec.networking.gatewayClassName` and annotates it for cert-manager; set `parentRefs` to attach the HTTPRoute to an existing Gateway and skip Gateway reconciliation. TLS on the shared Gateway must then be handled externally.
+- The controller is built against Gateway API `v1.4.1`, but it only reconciles GA `gateway.networking.k8s.io/v1` `Gateway` and `HTTPRoute` fields that are present in both the `1.3.x` and `1.4.x` standard CRD bundles. Use `make test-gateway-api-compat` to run the envtest suite against both CRD versions.
+- This repository does not install NGINX Gateway Fabric. If you upgrade NGF separately to `v2.4.2`, use the upstream Gateway API `v1.4.x` install and migrate any Helm/config usage of `snippetsFilters` to `snippets`.
 - If your cluster lacks the referenced GatewayClass, the `GatewayReady`/`HTTPRouteReady` conditions will stay `False`; install the class or update the spec to a class that exists.
 
 ### Status and Conditions

@@ -19,6 +19,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,7 +54,11 @@ var (
 	k8sClient client.Client
 )
 
-const defaultGatewayAPIModuleVersion = "v1.3.0"
+const (
+	defaultGatewayAPIModuleVersion = "v1.4.1"
+	gatewayAPICRDVersionEnvVar     = "GATEWAY_API_CRD_VERSION"
+	gatewayAPICRDPathEnvVar        = "GATEWAY_API_CRD_PATH"
+)
 
 func gatewayAPIModuleVersion() string {
 	info, ok := debug.ReadBuildInfo()
@@ -66,6 +71,13 @@ func gatewayAPIModuleVersion() string {
 		}
 	}
 	return defaultGatewayAPIModuleVersion
+}
+
+func gatewayAPICRDVersion() string {
+	if version := strings.TrimSpace(os.Getenv(gatewayAPICRDVersionEnvVar)); version != "" {
+		return version
+	}
+	return gatewayAPIModuleVersion()
 }
 
 func TestControllers(t *testing.T) {
@@ -144,21 +156,57 @@ func getFirstFoundEnvTestBinaryDir() string {
 // gatewayStandardCRDPath resolves the path to the Gateway API standard CRDs in the module cache.
 // Tests depend on these CRDs to install gateway.networking.k8s.io types.
 func gatewayStandardCRDPath() string {
+	if override := strings.TrimSpace(os.Getenv(gatewayAPICRDPathEnvVar)); override != "" {
+		if _, err := os.Stat(override); err != nil {
+			logf.Log.Error(err, "Gateway API CRD path override not found", "path", override)
+			return ""
+		}
+		return override
+	}
+
+	version := gatewayAPICRDVersion()
+	moduleDir, err := gatewayAPIModuleDir(version)
+	if err != nil {
+		logf.Log.Error(err, "Failed to resolve Gateway API module path", "version", version)
+		return ""
+	}
+
+	path := filepath.Join(moduleDir, "config", "crd", "standard")
+	if _, err := os.Stat(path); err != nil {
+		logf.Log.Error(err, "Gateway API CRDs not found", "path", path, "version", version)
+		return ""
+	}
+	return path
+}
+
+func gatewayAPIModuleDir(version string) (string, error) {
 	modCache := os.Getenv("GOMODCACHE")
 	if modCache == "" {
 		output, err := exec.Command("go", "env", "GOMODCACHE").Output()
 		if err != nil {
-			logf.Log.Error(err, "Failed to resolve GOMODCACHE for Gateway API CRDs")
-			return ""
+			return "", fmt.Errorf("resolve GOMODCACHE: %w", err)
 		}
 		modCache = strings.TrimSpace(string(output))
 	}
 
-	version := gatewayAPIModuleVersion()
-	path := filepath.Join(modCache, "sigs.k8s.io", fmt.Sprintf("gateway-api@%s", version), "config", "crd", "standard")
-	if _, err := os.Stat(path); err != nil {
-		logf.Log.Error(err, "Gateway API CRDs not found", "path", path)
-		return ""
+	moduleDir := filepath.Join(modCache, "sigs.k8s.io", fmt.Sprintf("gateway-api@%s", version))
+	if _, err := os.Stat(moduleDir); err == nil {
+		return moduleDir, nil
 	}
-	return path
+
+	output, err := exec.Command("go", "mod", "download", "-json", fmt.Sprintf("sigs.k8s.io/gateway-api@%s", version)).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("download Gateway API %s: %w: %s", version, err, strings.TrimSpace(string(output)))
+	}
+
+	var module struct {
+		Dir string
+	}
+	if err := json.Unmarshal(output, &module); err != nil {
+		return "", fmt.Errorf("parse go mod download output for Gateway API %s: %w", version, err)
+	}
+	if module.Dir == "" {
+		return "", fmt.Errorf("Gateway API %s download did not report a module dir", version)
+	}
+	return module.Dir, nil
 }

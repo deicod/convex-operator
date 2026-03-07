@@ -2332,7 +2332,7 @@ func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Liste
 			Protocol: gatewayv1.HTTPSProtocolType,
 			Port:     gatewayv1.PortNumber(443),
 			Hostname: ptr.To(hostname),
-			TLS: &gatewayv1.GatewayTLSConfig{
+			TLS: &gatewayv1.ListenerTLSConfig{
 				CertificateRefs: []gatewayv1.SecretObjectReference{{
 					Kind:      ptr.To(gatewayv1.Kind("Secret")),
 					Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),

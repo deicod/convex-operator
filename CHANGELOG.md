@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.2
+
+- Upgrade `sigs.k8s.io/gateway-api` from `v1.3.0` to `v1.4.1`.
+- Keep the reconciler on the GA `gateway.networking.k8s.io/v1` `Gateway`/`HTTPRoute` field set shared by Gateway API `1.3.x` and `1.4.x`, so clusters on either standard CRD bundle remain supported.
+- Add `make test-gateway-api-compat` plus envtest CRD version overrides to exercise the controller against both Gateway API compatibility paths.
+- Document that NGINX Gateway Fabric `2.4.x` installation changes such as `snippetsFilters` -> `snippets` apply to the NGF deployment, not to this operator.
+
 ## v0.1.1
 
 - Add `spec.networking.gatewayAnnotations` with a default `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`, applied to each per-instance Gateway; users can override or disable by setting a custom map or `{}`.

@@ -16,8 +16,11 @@ The examples use the latest Convex backend/dashboard images (`version: latest`).
 - Kubernetes cluster and `kubectl` context pointing to it.
 - Go toolchain (for `make` targets) and Docker permissions if building your own operator image.
 - Gateway API installed with a `GatewayClass` the operator can reference (default: `nginx`).
+- The operator only uses GA `gateway.networking.k8s.io/v1` `Gateway` and `HTTPRoute` fields and is validated against both Gateway API `1.3.x` and `1.4.x` standard CRD bundles. If you are upgrading NGINX Gateway Fabric to `v2.4.2`, install Gateway API `v1.4.x` first.
 - Postgres reachable at `pg-rw.postgres.svc.cluster.local:5432` with credentials.
 - Optional: TLS Secret for your hosts if you want HTTPS. The operator creates a Gateway per `ConvexInstance` and, by default, annotates it with `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`; set `spec.networking.gatewayAnnotations` to override (or `{}` to disable) and point `spec.networking.tlsSecretRef` at the Secret name cert-manager should populate.
+
+If you manage NGF via Helm values or controller flags, note that upstream deprecated `snippetsFilters` in favor of `snippets` in the `2.4.x` line. That change applies to your NGF installation, not to the Convex operator manifests in this repository.
 
 ## 1) Clone the repo
 ```bash

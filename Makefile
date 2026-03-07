@@ -61,6 +61,16 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+GATEWAY_API_COMPAT_VERSIONS ?= v1.3.0 v1.4.1
+
+.PHONY: test-gateway-api-compat
+test-gateway-api-compat: manifests generate fmt vet setup-envtest ## Run tests against Gateway API 1.3.x and 1.4.x CRD bundles.
+	@assets="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path )"; \
+	for version in $(GATEWAY_API_COMPAT_VERSIONS); do \
+		echo "Running tests with Gateway API CRDs $$version..."; \
+		GATEWAY_API_CRD_VERSION="$$version" KUBEBUILDER_ASSETS="$$assets" go test $$(go list ./... | grep -v /e2e) || exit 1; \
+	done
+
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # CertManager is installed by default; skip with:
