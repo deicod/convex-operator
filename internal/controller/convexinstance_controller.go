@@ -22,6 +22,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -791,7 +792,7 @@ func configHash(content string, values ...string) string {
 	for _, v := range values {
 		buf = append(buf, []byte(v)...)
 	}
-	sum := sha256.Sum256(buf)
+	sum := sha512.Sum512(buf)
 	return hex.EncodeToString(sum[:])
 }
 
