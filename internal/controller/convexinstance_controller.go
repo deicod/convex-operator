@@ -209,9 +209,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	desiredEnv := backendEnvWithS3(instance, instance.Spec.Version, generatedSecretName(instance), extVersions.s3Resolved)
 	desiredHash := desiredUpgradeHash(instance, desiredEnv)
 	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
-	if useListenerSet(instance) && useCustomParentRefs(instance) && instance.Status.ObservedGeneration < instance.Generation {
-		r.recordEvent(instance, corev1.EventTypeWarning, "ParentRefsIgnored", "spec.networking.listenerSet takes precedence over spec.networking.parentRefs; parentRefs are ignored")
-	}
+	r.recordParentRefsIgnored(instance)
 
 	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
 	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
@@ -3304,6 +3302,12 @@ func deriveKBKDFCTR(key []byte, label []byte, outLen int) ([]byte, error) {
 func (r *ConvexInstanceReconciler) recordEvent(instance *convexv1alpha1.ConvexInstance, eventType, reason, message string) {
 	if r.Recorder != nil {
 		r.Recorder.Eventf(instance, nil, eventType, reason, reason, "%s", message)
+	}
+}
+
+func (r *ConvexInstanceReconciler) recordParentRefsIgnored(instance *convexv1alpha1.ConvexInstance) {
+	if useListenerSet(instance) && useCustomParentRefs(instance) && instance.Status.ObservedGeneration < instance.Generation {
+		r.recordEvent(instance, corev1.EventTypeWarning, "ParentRefsIgnored", "spec.networking.listenerSet takes precedence over spec.networking.parentRefs; parentRefs are ignored")
 	}
 }
 
