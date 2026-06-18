@@ -3365,20 +3365,10 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	switch {
 	case useListenerSet(instance):
-		if !r.listenerSetSupported {
-			// The user opted into ListenerSet mode but the cluster lacks the CRD. Surface a clear,
-			// actionable condition and skip creating a dangling HTTPRoute; reconciliation requeues.
-			result.gatewayReady = false
-			result.routeReady = false
-			result.conds = append(result.conds,
-				conditionFalse(conditionGateway, "ListenerSetCRDMissing",
-					"spec.networking.listenerSet requires the Gateway API ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+), which is not installed in this cluster"),
-				conditionFalse(conditionHTTPRoute, "ListenerSetCRDMissing",
-					"Waiting for the Gateway API ListenerSet CRD to be installed"),
-			)
-			return result, nil
-		}
-		// Drop any Gateway left over from a previous mode before managing the ListenerSet.
+		// Drop any Gateway left over from a previous mode. This runs whether or not the ListenerSet
+		// CRD is present so that an instance switched into ListenerSet mode stops serving through its
+		// old managed Gateway. The shared HTTPRoute reconcile below re-points the route at the
+		// ListenerSet (via routeParentRefs), detaching it from any previous Gateway/parentRefs too.
 		if err := r.deleteManagedGateway(ctx, instance); err != nil {
 			return result, &resourceErr{
 				reason: "GatewayError",
@@ -3386,16 +3376,25 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 				err:    err,
 			}
 		}
-		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
-		if err != nil {
-			return result, &resourceErr{
-				reason: "GatewayError",
-				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
-				err:    err,
+		if r.listenerSetSupported {
+			listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
+			if err != nil {
+				return result, &resourceErr{
+					reason: "GatewayError",
+					cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+					err:    err,
+				}
 			}
+			result.gatewayReady = listenerSetReady
+			result.conds = append(result.conds, listenerSetCond)
+		} else {
+			// The cluster lacks the ListenerSet CRD. Report a clear, actionable condition; the route
+			// still gets re-pointed at the (not-yet-present) ListenerSet below, so the instance is no
+			// longer exposed through its old Gateway/parentRefs while it stays degraded.
+			result.gatewayReady = false
+			result.conds = append(result.conds, conditionFalse(conditionGateway, "ListenerSetCRDMissing",
+				"spec.networking.listenerSet requires the Gateway API ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+), which is not installed in this cluster"))
 		}
-		result.gatewayReady = listenerSetReady
-		result.conds = append(result.conds, listenerSetCond)
 	case useCustomParentRefs(instance):
 		if r.listenerSetSupported {
 			if err := r.deleteManagedListenerSet(ctx, instance); err != nil {

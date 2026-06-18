@@ -1001,6 +1001,48 @@ var _ = Describe("ConvexInstance Controller", func() {
 			}
 		})
 
+		It("should tear down the managed Gateway and re-point the route when switching to listenerSet without the CRD", func() {
+			By("first exposing the instance through a managed Gateway")
+			base, _ := newReconciler()
+			_, err := base.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})).To(Succeed())
+
+			By("switching to listenerSet on a cluster without the ListenerSet CRD")
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			rec := &ConvexInstanceReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Recorder:             events.NewFakeRecorder(64),
+				listenerSetSupported: false,
+			}
+			_, err = rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("deleting the previously managed Gateway so stale traffic stops")
+			Eventually(func() bool {
+				return errors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{}))
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+
+			By("re-pointing the HTTPRoute away from the old Gateway to the ListenerSet")
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			Expect(route.Spec.ParentRefs[0].Kind).NotTo(BeNil())
+			Expect(string(*route.Spec.ParentRefs[0].Kind)).To(Equal("ListenerSet"))
+			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-listeners")))
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			gwCond := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
+			Expect(gwCond).NotTo(BeNil())
+			Expect(gwCond.Reason).To(Equal("ListenerSetCRDMissing"))
+		})
+
 		It("should honor custom gateway annotations and override defaults", func() {
 			controllerReconciler, _ := newReconciler()
 
