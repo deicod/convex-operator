@@ -909,6 +909,55 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
+		It("should set TLS mode on ListenerSet listeners when TLS is configured", func() {
+			if !listenerSetCRDAvailable {
+				Skip("Gateway API ListenerSet CRD not installed in this test environment")
+			}
+			controllerReconciler, _ := newReconciler()
+
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "convex-dev-tls",
+					Namespace: "default",
+				},
+				Type: corev1.SecretTypeTLS,
+				Data: map[string][]byte{
+					corev1.TLSCertKey:       []byte("test-cert"),
+					corev1.TLSPrivateKeyKey: []byte("test-key"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, secret)
+			})
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"tlsSecretRef":"convex-dev-tls","listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			ls := &gatewayv1.ListenerSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.Spec.Listeners).To(HaveLen(1))
+			listener := ls.Spec.Listeners[0]
+			Expect(listener.Protocol).To(Equal(gatewayv1.HTTPSProtocolType))
+			Expect(listener.Port).To(Equal(gatewayv1.PortNumber(443)))
+			Expect(listener.TLS).NotTo(BeNil())
+			Expect(listener.TLS.Mode).NotTo(BeNil())
+			Expect(*listener.TLS.Mode).To(Equal(gatewayv1.TLSModeTerminate))
+			Expect(listener.TLS.CertificateRefs).To(HaveLen(1))
+			Expect(listener.TLS.CertificateRefs[0].Name).To(Equal(gatewayv1.ObjectName("convex-dev-tls")))
+
+			resourceVersion := ls.ResourceVersion
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.ResourceVersion).To(Equal(resourceVersion))
+		})
+
 		It("should become Ready once the ListenerSet is accepted and programmed", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")

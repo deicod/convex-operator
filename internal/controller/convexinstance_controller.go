@@ -2472,6 +2472,7 @@ func listenerParams(instance *convexv1alpha1.ConvexInstance) (gatewayv1.SectionN
 	}
 	if instance.Spec.Networking.TLSSecretRef != "" {
 		tls := &gatewayv1.ListenerTLSConfig{
+			Mode: ptr.To(gatewayv1.TLSModeTerminate),
 			CertificateRefs: []gatewayv1.SecretObjectReference{{
 				Kind:      ptr.To(gatewayv1.Kind("Secret")),
 				Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
