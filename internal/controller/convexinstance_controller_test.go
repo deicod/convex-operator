@@ -1183,6 +1183,83 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gwCond.Reason).To(Equal("Provisioning"))
 		})
 
+		It("should not become Ready when the ListenerSet listener entry has a stale true conflict", func() {
+			if !listenerSetCRDAvailable {
+				Skip("Gateway API ListenerSet CRD not installed in this test environment")
+			}
+			controllerReconciler, _ := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+
+			ls := &gatewayv1.ListenerSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.Spec.Listeners).NotTo(BeEmpty())
+			listenerName := ls.Spec.Listeners[0].Name
+			ls.Status.Conditions = []metav1.Condition{
+				{
+					Type:               string(gatewayv1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					Reason:             "Accepted",
+					LastTransitionTime: metav1.Now(),
+				},
+				{
+					Type:               string(gatewayv1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					Reason:             "Programmed",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: ls.GetGeneration(),
+				},
+			}
+			ls.Status.Listeners = []gatewayv1.ListenerEntryStatus{{
+				Name:           listenerName,
+				AttachedRoutes: 1,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonAccepted),
+						LastTransitionTime: metav1.Now(),
+					},
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionProgrammed),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonProgrammed),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionConflicted),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonHostnameConflict),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration() - 1,
+					},
+				},
+			}}
+			Expect(k8sClient.Status().Update(ctx, ls)).To(Succeed())
+			makeRouteAccepted()
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).NotTo(Equal("Ready"))
+			gwCond := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
+			Expect(gwCond).NotTo(BeNil())
+			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(gwCond.Reason).To(Equal("Provisioning"))
+		})
+
 		It("should delete the ListenerSet when switching back to a managed Gateway", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
@@ -1231,6 +1308,14 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			route := &gatewayv1.HTTPRoute{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route); err == nil {
+				Expect(k8sClient.Delete(ctx, route)).To(Succeed())
+				Eventually(func() bool {
+					err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, &gatewayv1.HTTPRoute{})
+					return errors.IsNotFound(err)
+				}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+			}
 			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
 			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
 
@@ -1243,9 +1328,18 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gwCond).NotTo(BeNil())
 			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(gwCond.Reason).To(Equal("ListenerSetCRDMissing"))
+
+			routeCond := meta.FindStatusCondition(updated.Status.Conditions, "HTTPRouteReady")
+			Expect(routeCond).NotTo(BeNil())
+			Expect(routeCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(routeCond.Reason).To(Equal("ListenerSetCRDMissing"))
+
+			route = &gatewayv1.HTTPRoute{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
-		It("should tear down the managed Gateway and re-point the route when switching to listenerSet without the CRD", func() {
+		It("should preserve the managed Gateway and route when switching to listenerSet without the CRD", func() {
 			By("first exposing the instance through a managed Gateway")
 			base, _ := newReconciler()
 			_, err := base.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -1267,24 +1361,26 @@ var _ = Describe("ConvexInstance Controller", func() {
 			_, err = rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("deleting the previously managed Gateway so stale traffic stops")
-			Eventually(func() bool {
-				return errors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{}))
-			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+			By("leaving the previously managed Gateway in place")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})).To(Succeed())
 
-			By("re-pointing the HTTPRoute away from the old Gateway to the ListenerSet")
+			By("leaving the HTTPRoute attached to the managed Gateway")
 			route := &gatewayv1.HTTPRoute{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
 			Expect(route.Spec.ParentRefs).To(HaveLen(1))
-			Expect(route.Spec.ParentRefs[0].Kind).NotTo(BeNil())
-			Expect(string(*route.Spec.ParentRefs[0].Kind)).To(Equal("ListenerSet"))
-			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-listeners")))
+			if route.Spec.ParentRefs[0].Kind != nil {
+				Expect(string(*route.Spec.ParentRefs[0].Kind)).To(Equal("Gateway"))
+			}
+			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-gateway")))
 
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 			gwCond := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
 			Expect(gwCond).NotTo(BeNil())
 			Expect(gwCond.Reason).To(Equal("ListenerSetCRDMissing"))
+			routeCond := meta.FindStatusCondition(updated.Status.Conditions, "HTTPRouteReady")
+			Expect(routeCond).NotTo(BeNil())
+			Expect(routeCond.Reason).To(Equal("ListenerSetCRDMissing"))
 		})
 
 		It("should honor custom gateway annotations and override defaults", func() {

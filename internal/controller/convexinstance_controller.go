@@ -119,6 +119,7 @@ const (
 	obcBucketPortKey         = "BUCKET_PORT"
 	obcBucketRegionKey       = "BUCKET_REGION"
 	defaultOBCRegion         = "us-east-1"
+	listenerSetCRDMissing    = "ListenerSetCRDMissing"
 	listenerSetCRDMissingMsg = "spec.networking.listenerSet requires the Gateway API ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+), which is not installed in this cluster"
 )
 
@@ -2314,7 +2315,7 @@ func listenerSetReady(ls *gatewayv1.ListenerSet) bool {
 		if status == nil ||
 			!conditionStatusTrue(status.Conditions, string(gatewayv1.ListenerEntryConditionAccepted)) ||
 			!conditionTrueForGeneration(status.Conditions, string(gatewayv1.ListenerEntryConditionProgrammed), ls.Generation) ||
-			conditionTrueForGeneration(status.Conditions, string(gatewayv1.ListenerEntryConditionConflicted), ls.Generation) {
+			conditionStatusTrue(status.Conditions, string(gatewayv1.ListenerEntryConditionConflicted)) {
 			return false
 		}
 	}
@@ -3326,7 +3327,11 @@ func conditionFalse(condType, reason, message string) metav1.Condition {
 }
 
 func listenerSetCRDMissingCondition() metav1.Condition {
-	return conditionFalse(conditionGateway, "ListenerSetCRDMissing", listenerSetCRDMissingMsg)
+	return conditionFalse(conditionGateway, listenerSetCRDMissing, listenerSetCRDMissingMsg)
+}
+
+func httpRouteListenerSetCRDMissingCondition() metav1.Condition {
+	return conditionFalse(conditionHTTPRoute, listenerSetCRDMissing, "HTTPRoute reconciliation is blocked until the Gateway API ListenerSet CRD is installed")
 }
 
 func gatewayErr(err error) *resourceErr {
@@ -3361,6 +3366,7 @@ func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dash
 
 func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
 	result := reconcileOutcome{conds: []metav1.Condition{}}
+	reconcileRoute := true
 
 	if err := r.reconcileConfigMap(ctx, instance, plan.effectiveVersion); err != nil {
 		return result, &resourceErr{
@@ -3441,19 +3447,21 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	switch {
 	case useListenerSet(instance):
-		// Drop any Gateway left over from a previous mode. This runs whether or not the ListenerSet
-		// CRD is present so that an instance switched into ListenerSet mode stops serving through its
-		// old managed Gateway. The shared HTTPRoute reconcile below re-points the route at the
-		// ListenerSet (via routeParentRefs), detaching it from any previous Gateway/parentRefs too.
-		if err := r.deleteManagedGateway(ctx, instance); err != nil {
-			return result, gatewayErr(err)
-		}
 		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
 		if err != nil {
 			return result, gatewayErr(err)
 		}
 		result.gatewayReady = listenerSetReady
 		result.conds = append(result.conds, listenerSetCond)
+		if listenerSetCond.Reason == listenerSetCRDMissing {
+			reconcileRoute = false
+			result.conds = append(result.conds, httpRouteListenerSetCRDMissingCondition())
+			break
+		}
+		// Drop any Gateway left over from a previous mode only after the ListenerSet path is usable.
+		if err := r.deleteManagedGateway(ctx, instance); err != nil {
+			return result, gatewayErr(err)
+		}
 	case useCustomParentRefs(instance):
 		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
 			return result, gatewayErr(err)
@@ -3475,16 +3483,18 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 		result.conds = append(result.conds, gatewayCond)
 	}
 
-	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
-	if err != nil {
-		return result, &resourceErr{
-			reason: "HTTPRouteError",
-			cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
-			err:    err,
+	if reconcileRoute {
+		routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
+		if err != nil {
+			return result, &resourceErr{
+				reason: "HTTPRouteError",
+				cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+				err:    err,
+			}
 		}
+		result.routeReady = routeReady
+		result.conds = append(result.conds, routeCond)
 	}
-	result.routeReady = routeReady
-	result.conds = append(result.conds, routeCond)
 
 	backendReady, backendCond, err := r.backendStatus(ctx, instance)
 	if err != nil {
