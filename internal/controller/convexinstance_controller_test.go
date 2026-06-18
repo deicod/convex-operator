@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -48,6 +49,50 @@ const (
 	condSuccessCriteriaMet = batchv1.JobConditionType("SuccessCriteriaMet")
 	condFailureTarget      = batchv1.JobConditionType("FailureTarget")
 )
+
+type listenerSetNoMatchClient struct {
+	client.Client
+}
+
+func (c listenerSetNoMatchClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if isListenerSetObject(obj) {
+		return listenerSetNoMatchErr()
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c listenerSetNoMatchClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if isListenerSetObject(obj) {
+		return listenerSetNoMatchErr()
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c listenerSetNoMatchClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if isListenerSetObject(obj) {
+		return listenerSetNoMatchErr()
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c listenerSetNoMatchClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if isListenerSetObject(obj) {
+		return listenerSetNoMatchErr()
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+func isListenerSetObject(obj client.Object) bool {
+	_, ok := obj.(*gatewayv1.ListenerSet)
+	return ok
+}
+
+func listenerSetNoMatchErr() error {
+	return &meta.NoKindMatchError{
+		GroupKind:        schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"},
+		SearchedVersions: []string{gatewayv1.GroupVersion.Version},
+	}
+}
 
 var _ = Describe("ConvexInstance Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -125,6 +170,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 		makeListenerSetReady := func() {
 			ls := &gatewayv1.ListenerSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.Spec.Listeners).NotTo(BeEmpty())
+			listenerName := ls.Spec.Listeners[0].Name
 			ls.Status.Conditions = []metav1.Condition{
 				{
 					Type:               string(gatewayv1.ListenerSetConditionAccepted),
@@ -141,6 +188,83 @@ var _ = Describe("ConvexInstance Controller", func() {
 					ObservedGeneration: ls.GetGeneration(),
 				},
 			}
+			ls.Status.Listeners = []gatewayv1.ListenerEntryStatus{{
+				Name:           listenerName,
+				AttachedRoutes: 1,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonAccepted),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionProgrammed),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonProgrammed),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionConflicted),
+						Status:             metav1.ConditionFalse,
+						Reason:             "NoConflicts",
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+				},
+			}}
+			Expect(k8sClient.Status().Update(ctx, ls)).To(Succeed())
+		}
+		makeListenerSetConflicted := func() {
+			ls := &gatewayv1.ListenerSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.Spec.Listeners).NotTo(BeEmpty())
+			listenerName := ls.Spec.Listeners[0].Name
+			ls.Status.Conditions = []metav1.Condition{
+				{
+					Type:               string(gatewayv1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					Reason:             "Accepted",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: ls.GetGeneration(),
+				},
+				{
+					Type:               string(gatewayv1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					Reason:             "Programmed",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: ls.GetGeneration(),
+				},
+			}
+			ls.Status.Listeners = []gatewayv1.ListenerEntryStatus{{
+				Name:           listenerName,
+				AttachedRoutes: 1,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonAccepted),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionProgrammed),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonProgrammed),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+					{
+						Type:               string(gatewayv1.ListenerEntryConditionConflicted),
+						Status:             metav1.ConditionTrue,
+						Reason:             string(gatewayv1.ListenerEntryReasonHostnameConflict),
+						LastTransitionTime: metav1.Now(),
+						ObservedGeneration: ls.GetGeneration(),
+					},
+				},
+			}}
 			Expect(k8sClient.Status().Update(ctx, ls)).To(Succeed())
 		}
 
@@ -909,7 +1033,45 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
-		It("should set TLS mode on ListenerSet listeners when TLS is configured", func() {
+		It("should reconcile ListenerSets when the CRD appears after startup detection", func() {
+			if !listenerSetCRDAvailable {
+				Skip("Gateway API ListenerSet CRD not installed in this test environment")
+			}
+			rec := &ConvexInstanceReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				Recorder:             events.NewFakeRecorder(64),
+				listenerSetSupported: false,
+			}
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			ls := &gatewayv1.ListenerSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.Spec.ParentRef.Name).To(Equal(gatewayv1.ObjectName("shared-gateway")))
+		})
+
+		It("should emit an event when listenerSet takes precedence over parentRefs", func() {
+			controllerReconciler, recorder := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"parentRefs":[{"name":"public","namespace":"nginx-gateway"}],"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ParentRefsIgnored")))
+		})
+
+		It("should configure TLS on ListenerSet listeners when TLS is configured", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
 			}
@@ -992,6 +1154,37 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(routeCond.Status).To(Equal(metav1.ConditionTrue))
 		})
 
+		It("should not become Ready when the ListenerSet listener entry is conflicted", func() {
+			if !listenerSetCRDAvailable {
+				Skip("Gateway API ListenerSet CRD not installed in this test environment")
+			}
+			controllerReconciler, _ := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			makeBackendReady()
+			makeDashboardReady()
+			makeListenerSetConflicted()
+			makeRouteAccepted()
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).NotTo(Equal("Ready"))
+			gwCond := meta.FindStatusCondition(updated.Status.Conditions, "GatewayReady")
+			Expect(gwCond).NotTo(BeNil())
+			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(gwCond.Reason).To(Equal("Provisioning"))
+		})
+
 		It("should delete the ListenerSet when switching back to a managed Gateway", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
@@ -1022,7 +1215,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 		It("should report ListenerSetCRDMissing when listenerSet is set but the CRD is absent", func() {
 			rec := &ConvexInstanceReconciler{
-				Client:               k8sClient,
+				Client:               listenerSetNoMatchClient{Client: k8sClient},
 				Scheme:               k8sClient.Scheme(),
 				Recorder:             events.NewFakeRecorder(64),
 				listenerSetSupported: false,
@@ -1042,12 +1235,6 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gwCond).NotTo(BeNil())
 			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(gwCond.Reason).To(Equal("ListenerSetCRDMissing"))
-
-			if listenerSetCRDAvailable {
-				By("not creating a ListenerSet when support is disabled")
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, &gatewayv1.ListenerSet{})
-				Expect(errors.IsNotFound(err)).To(BeTrue())
-			}
 		})
 
 		It("should tear down the managed Gateway and re-point the route when switching to listenerSet without the CRD", func() {
@@ -1064,7 +1251,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
 
 			rec := &ConvexInstanceReconciler{
-				Client:               k8sClient,
+				Client:               listenerSetNoMatchClient{Client: k8sClient},
 				Scheme:               k8sClient.Scheme(),
 				Recorder:             events.NewFakeRecorder(64),
 				listenerSetSupported: false,
