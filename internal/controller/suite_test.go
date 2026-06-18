@@ -52,10 +52,14 @@ var (
 	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
+	// listenerSetCRDAvailable reports whether the loaded Gateway API CRD bundle includes the
+	// standard ListenerSet CRD (Gateway API 1.5+). ListenerSet specs skip when it is absent
+	// (e.g. under the 1.3/1.4 compatibility matrix).
+	listenerSetCRDAvailable bool
 )
 
 const (
-	defaultGatewayAPIModuleVersion = "v1.4.1"
+	defaultGatewayAPIModuleVersion = "v1.5.1"
 	gatewayAPICRDVersionEnvVar     = "GATEWAY_API_CRD_VERSION"
 	gatewayAPICRDPathEnvVar        = "GATEWAY_API_CRD_PATH"
 )
@@ -121,6 +125,8 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	listenerSetCRDAvailable = listenerSetCRDInstalled(k8sClient.RESTMapper())
 })
 
 var _ = AfterSuite(func() {

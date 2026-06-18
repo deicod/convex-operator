@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.3
+
+- Add a third networking mode: `spec.networking.listenerSet.parentGateway` makes the operator create and manage a Gateway API `ListenerSet` (gateway.networking.k8s.io/v1) that attaches the instance's listener (hostname + TLS) to a shared Gateway, and points the HTTPRoute at that `ListenerSet` — so the shared Gateway is never patched. Takes precedence over `parentRefs`.
+- Upgrade `sigs.k8s.io/gateway-api` from `v1.4.1` to `v1.5.1` (where `ListenerSet` graduated to the standard channel). The `Gateway`/`HTTPRoute` modes still use only GA fields shared by the `1.3.x`/`1.4.x`/`1.5.x` standard CRD bundles, so existing clusters remain supported.
+- ListenerSet support is opt-in and auto-detected: the operator only watches/reconciles `ListenerSet` when its CRD is installed, and reports `GatewayReady=False` (reason `ListenerSetCRDMissing`) when an instance requests it on a cluster without the CRD. Requires Gateway API `1.5+` and an implementation such as NGINX Gateway Fabric `2.6+`.
+- Extend `make test-gateway-api-compat` to also cover Gateway API `v1.5.1`; ListenerSet specs skip automatically under the `1.3.x`/`1.4.x` bundles.
+
 ## v0.1.2
 
 - Upgrade `sigs.k8s.io/gateway-api` from `v1.3.0` to `v1.4.1`.

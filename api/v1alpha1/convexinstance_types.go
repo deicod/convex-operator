@@ -273,6 +273,15 @@ type NetworkingSpec struct {
 	// +optional
 	ParentRefs []ParentReference `json:"parentRefs,omitempty"`
 
+	// ListenerSet, when set, makes the operator create a Gateway API ListenerSet attached to the
+	// referenced shared Gateway and attach the HTTPRoute to that ListenerSet, instead of provisioning
+	// a dedicated Gateway. This lets the operator manage the instance's listener (hostname + TLS) on a
+	// shared Gateway without mutating the Gateway itself. Requires Gateway API 1.5+ standard CRDs
+	// (gateway.networking.k8s.io/v1 ListenerSet) and a Gateway whose allowedListeners permits this
+	// namespace. When set, ListenerSet takes precedence over ParentRefs and the managed Gateway.
+	// +optional
+	ListenerSet *ListenerSetSpec `json:"listenerSet,omitempty"`
+
 	// GatewayClassName selects the GatewayClass for the generated Gateway.
 	// +kubebuilder:default:=nginx
 	// +optional
@@ -286,6 +295,23 @@ type NetworkingSpec struct {
 	// TLSSecretRef names the TLS secret used by Gateway/Ingress.
 	// +optional
 	TLSSecretRef string `json:"tlsSecretRef,omitempty"`
+}
+
+// ListenerSetSpec configures an operator-managed Gateway API ListenerSet attached to a shared Gateway.
+type ListenerSetSpec struct {
+	// ParentGateway identifies the shared Gateway that the ListenerSet attaches to.
+	ParentGateway ParentGatewayRef `json:"parentGateway"`
+}
+
+// ParentGatewayRef references the shared Gateway a ListenerSet attaches to.
+type ParentGatewayRef struct {
+	// Name is the name of the parent Gateway.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace is the namespace of the parent Gateway. Defaults to the ConvexInstance namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // ParentReference selects an existing Gateway for the HTTPRoute to attach to.

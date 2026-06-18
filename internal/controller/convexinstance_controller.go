@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -125,6 +126,11 @@ type ConvexInstanceReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
+
+	// listenerSetSupported is set at manager setup time when the standard Gateway API
+	// ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+) is installed in the
+	// cluster. When false, the operator neither watches nor reconciles ListenerSets.
+	listenerSetSupported bool
 }
 
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances,verbs=get;list;watch;create;update;patch;delete
@@ -135,8 +141,8 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status,verbs=get
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes;listenersets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status;listenersets/status,verbs=get
 
 // Reconcile moves the cluster state toward the desired ConvexInstance state.
 //
@@ -248,7 +254,8 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	r.listenerSetSupported = listenerSetCRDInstalled(mgr.GetRESTMapper())
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&convexv1alpha1.ConvexInstance{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
@@ -258,7 +265,13 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&batchv1.Job{}).
 		Owns(&gatewayv1.Gateway{}).
-		Owns(&gatewayv1.HTTPRoute{}).
+		Owns(&gatewayv1.HTTPRoute{})
+	// ListenerSet is an opt-in, Gateway API 1.5+ resource. Only watch it when its CRD is installed so
+	// the manager still starts on clusters that only have the 1.3/1.4 standard Gateway API CRDs.
+	if r.listenerSetSupported {
+		builder = builder.Owns(&gatewayv1.ListenerSet{})
+	}
+	return builder.
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			secret, ok := obj.(*corev1.Secret)
 			if !ok {
@@ -321,6 +334,18 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).
 		Named("convexinstance").
 		Complete(r)
+}
+
+// listenerSetCRDInstalled reports whether the standard Gateway API ListenerSet CRD
+// (gateway.networking.k8s.io/v1) is registered in the cluster. ListenerSet support requires
+// Gateway API 1.5+; on clusters that only ship the 1.3/1.4 standard CRDs the operator must not
+// watch or reconcile the (absent) type.
+func listenerSetCRDInstalled(mapper meta.RESTMapper) bool {
+	if mapper == nil {
+		return false
+	}
+	_, err := mapper.RESTMapping(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"}, gatewayv1.GroupVersion.Version)
+	return err == nil
 }
 
 type externalSecretVersions struct {
@@ -2127,6 +2152,18 @@ func (r *ConvexInstanceReconciler) cleanupUpgradeArtifacts(ctx context.Context, 
 	}
 }
 
+// ownedByInstance reports whether obj is controller-owned by this instance, matching either the
+// live UID or a previous instance of the same name (so resources left behind by a recreated
+// instance are still recognized as ours).
+func ownedByInstance(obj metav1.Object, instance *convexv1alpha1.ConvexInstance) bool {
+	owner := metav1.GetControllerOf(obj)
+	if owner == nil {
+		return false
+	}
+	return owner.UID == instance.UID ||
+		(owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name)
+}
+
 func (r *ConvexInstanceReconciler) deleteManagedGateway(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
 	gw := &gatewayv1.Gateway{}
 	key := client.ObjectKey{Name: gatewayName(instance), Namespace: instance.Namespace}
@@ -2136,10 +2173,8 @@ func (r *ConvexInstanceReconciler) deleteManagedGateway(ctx context.Context, ins
 		}
 		return err
 	}
-	if owner := metav1.GetControllerOf(gw); owner != nil {
-		if owner.UID == instance.UID || (owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name) {
-			return r.Delete(ctx, gw)
-		}
+	if ownedByInstance(gw, instance) {
+		return r.Delete(ctx, gw)
 	}
 	return nil
 }
@@ -2190,6 +2225,95 @@ func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instanc
 		return true, conditionTrue(conditionGateway, "Ready", "Gateway ready"), nil
 	}
 	return false, conditionFalse(conditionGateway, "Provisioning", "Waiting for Gateway readiness"), nil
+}
+
+func listenerSetName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-listeners", instance.Name)
+}
+
+// listenerSetParentGatewayRef builds the reference to the shared Gateway the ListenerSet attaches to.
+func listenerSetParentGatewayRef(instance *convexv1alpha1.ConvexInstance) gatewayv1.ParentGatewayReference {
+	parent := instance.Spec.Networking.ListenerSet.ParentGateway
+	namespace := parent.Namespace
+	if namespace == "" {
+		namespace = instance.Namespace
+	}
+	return gatewayv1.ParentGatewayReference{
+		Group:     ptr.To(gatewayv1.Group(gatewayv1.GroupName)),
+		Kind:      ptr.To(gatewayv1.Kind("Gateway")),
+		Name:      gatewayv1.ObjectName(parent.Name),
+		Namespace: ptr.To(gatewayv1.Namespace(namespace)),
+	}
+}
+
+func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
+	ls := &gatewayv1.ListenerSet{}
+	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
+	spec := gatewayv1.ListenerSetSpec{
+		ParentRef: listenerSetParentGatewayRef(instance),
+		Listeners: listenerEntries(instance),
+	}
+
+	err := r.Get(ctx, key, ls)
+	if errors.IsNotFound(err) {
+		ls = &gatewayv1.ListenerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      listenerSetName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: spec,
+		}
+		if err := controllerutil.SetControllerReference(instance, ls, r.Scheme); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		if err := r.Create(ctx, ls); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionGateway, "Provisioning", "ListenerSet created"), nil
+	}
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+
+	ownerChanged, err := ensureOwner(instance, ls, r.Scheme)
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+	if ownerChanged || !listenerSetSpecEqual(ls.Spec, spec) {
+		ls.Spec = spec
+		if err := r.Update(ctx, ls); err != nil {
+			return false, metav1.Condition{}, err
+		}
+	}
+
+	if listenerSetReady(ls) {
+		return true, conditionTrue(conditionGateway, "Ready", "ListenerSet ready"), nil
+	}
+	return false, conditionFalse(conditionGateway, "Provisioning", "Waiting for ListenerSet readiness"), nil
+}
+
+func listenerSetReady(ls *gatewayv1.ListenerSet) bool {
+	accepted := meta.FindStatusCondition(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted))
+	programmed := meta.FindStatusCondition(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionProgrammed))
+	return accepted != nil && accepted.Status == metav1.ConditionTrue && accepted.ObservedGeneration >= ls.Generation &&
+		programmed != nil && programmed.Status == metav1.ConditionTrue && programmed.ObservedGeneration >= ls.Generation
+}
+
+// deleteManagedListenerSet removes an operator-managed ListenerSet, used when an instance switches
+// away from ListenerSet mode. It is a no-op when the ListenerSet (or its CRD) is absent.
+func (r *ConvexInstanceReconciler) deleteManagedListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	ls := &gatewayv1.ListenerSet{}
+	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, ls); err != nil {
+		if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
+	if ownedByInstance(ls, instance) {
+		return r.Delete(ctx, ls)
+	}
+	return nil
 }
 
 func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string) (bool, metav1.Condition, error) {
@@ -2296,7 +2420,20 @@ func useCustomParentRefs(instance *convexv1alpha1.ConvexInstance) bool {
 	return len(instance.Spec.Networking.ParentRefs) > 0
 }
 
+func useListenerSet(instance *convexv1alpha1.ConvexInstance) bool {
+	return instance.Spec.Networking.ListenerSet != nil
+}
+
 func routeParentRefs(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ParentReference {
+	if useListenerSet(instance) {
+		// Attach the route to the operator-managed ListenerSet so it rides on the shared Gateway.
+		return []gatewayv1.ParentReference{{
+			Group:     ptr.To(gatewayv1.Group(gatewayv1.GroupName)),
+			Kind:      ptr.To(gatewayv1.Kind("ListenerSet")),
+			Name:      gatewayv1.ObjectName(listenerSetName(instance)),
+			Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+		}}
+	}
 	if !useCustomParentRefs(instance) {
 		return []gatewayv1.ParentReference{{
 			Name:      gatewayv1.ObjectName(gatewayName(instance)),
@@ -2321,34 +2458,53 @@ func routeParentRefs(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Parent
 	return refs
 }
 
-func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
+// listenerParams returns the shared listener configuration (name, protocol, port, hostname, TLS,
+// allowed routes) derived from an instance's networking spec. It is shared by gatewayListeners
+// (Gateway listeners) and listenerEntries (ListenerSet entries), which describe the same listener.
+func listenerParams(instance *convexv1alpha1.ConvexInstance) (gatewayv1.SectionName, gatewayv1.ProtocolType, gatewayv1.PortNumber, gatewayv1.Hostname, *gatewayv1.ListenerTLSConfig, *gatewayv1.AllowedRoutes) {
 	hostname := gatewayv1.Hostname(instance.Spec.Networking.Host)
+	// The listener name matches the scheme ("http"/"https"), derived from whether TLS is configured.
+	name := gatewayv1.SectionName(externalScheme(instance))
 	allowedRoutes := &gatewayv1.AllowedRoutes{
 		Namespaces: &gatewayv1.RouteNamespaces{
 			From: ptr.To(gatewayv1.NamespacesFromSame),
 		},
 	}
 	if instance.Spec.Networking.TLSSecretRef != "" {
-		return []gatewayv1.Listener{{
-			Name:     "https",
-			Protocol: gatewayv1.HTTPSProtocolType,
-			Port:     gatewayv1.PortNumber(443),
-			Hostname: ptr.To(hostname),
-			TLS: &gatewayv1.ListenerTLSConfig{
-				CertificateRefs: []gatewayv1.SecretObjectReference{{
-					Kind:      ptr.To(gatewayv1.Kind("Secret")),
-					Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
-					Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
-				}},
-			},
-			AllowedRoutes: allowedRoutes,
-		}}
+		tls := &gatewayv1.ListenerTLSConfig{
+			CertificateRefs: []gatewayv1.SecretObjectReference{{
+				Kind:      ptr.To(gatewayv1.Kind("Secret")),
+				Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
+				Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+			}},
+		}
+		return name, gatewayv1.HTTPSProtocolType, gatewayv1.PortNumber(443), hostname, tls, allowedRoutes
 	}
+	return name, gatewayv1.HTTPProtocolType, gatewayv1.PortNumber(80), hostname, nil, allowedRoutes
+}
+
+func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
+	name, protocol, port, hostname, tls, allowedRoutes := listenerParams(instance)
 	return []gatewayv1.Listener{{
-		Name:          "http",
-		Protocol:      gatewayv1.HTTPProtocolType,
-		Port:          gatewayv1.PortNumber(80),
+		Name:          name,
+		Protocol:      protocol,
+		Port:          port,
 		Hostname:      ptr.To(hostname),
+		TLS:           tls,
+		AllowedRoutes: allowedRoutes,
+	}}
+}
+
+// listenerEntries mirrors gatewayListeners but returns ListenerSet listener entries for the same
+// listener, used when attaching the instance's listener to a shared Gateway via a ListenerSet.
+func listenerEntries(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ListenerEntry {
+	name, protocol, port, hostname, tls, allowedRoutes := listenerParams(instance)
+	return []gatewayv1.ListenerEntry{{
+		Name:          name,
+		Protocol:      protocol,
+		Port:          port,
+		Hostname:      ptr.To(hostname),
+		TLS:           tls,
 		AllowedRoutes: allowedRoutes,
 	}}
 }
@@ -2431,6 +2587,7 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 }
 
 func gatewayIsReady(gw *gatewayv1.Gateway) bool {
+	//nolint:staticcheck // "Ready" retained for backward-compatible managed-Gateway readiness (existing behavior; out of scope for ListenerSet support)
 	readyCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionReady))
 	return readyCond != nil &&
 		readyCond.Status == metav1.ConditionTrue &&
@@ -2701,6 +2858,10 @@ func deploymentSpecEqual(a, b appsv1.DeploymentSpec) bool {
 }
 
 func gatewaySpecEqual(a, b gatewayv1.GatewaySpec) bool {
+	return apiequality.Semantic.DeepEqual(a, b)
+}
+
+func listenerSetSpecEqual(a, b gatewayv1.ListenerSetSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
 }
 
@@ -3202,7 +3363,49 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	}
 	result.nextRestartIn = nextRestartIn
 
-	if useCustomParentRefs(instance) {
+	switch {
+	case useListenerSet(instance):
+		if !r.listenerSetSupported {
+			// The user opted into ListenerSet mode but the cluster lacks the CRD. Surface a clear,
+			// actionable condition and skip creating a dangling HTTPRoute; reconciliation requeues.
+			result.gatewayReady = false
+			result.routeReady = false
+			result.conds = append(result.conds,
+				conditionFalse(conditionGateway, "ListenerSetCRDMissing",
+					"spec.networking.listenerSet requires the Gateway API ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+), which is not installed in this cluster"),
+				conditionFalse(conditionHTTPRoute, "ListenerSetCRDMissing",
+					"Waiting for the Gateway API ListenerSet CRD to be installed"),
+			)
+			return result, nil
+		}
+		// Drop any Gateway left over from a previous mode before managing the ListenerSet.
+		if err := r.deleteManagedGateway(ctx, instance); err != nil {
+			return result, &resourceErr{
+				reason: "GatewayError",
+				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+				err:    err,
+			}
+		}
+		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
+		if err != nil {
+			return result, &resourceErr{
+				reason: "GatewayError",
+				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+				err:    err,
+			}
+		}
+		result.gatewayReady = listenerSetReady
+		result.conds = append(result.conds, listenerSetCond)
+	case useCustomParentRefs(instance):
+		if r.listenerSetSupported {
+			if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
+				return result, &resourceErr{
+					reason: "GatewayError",
+					cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+					err:    err,
+				}
+			}
+		}
 		if err := r.deleteManagedGateway(ctx, instance); err != nil {
 			return result, &resourceErr{
 				reason: "GatewayError",
@@ -3212,7 +3415,16 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 		}
 		result.gatewayReady = true
 		result.conds = append(result.conds, conditionTrue(conditionGateway, "Skipped", "Using provided parentRefs"))
-	} else {
+	default:
+		if r.listenerSetSupported {
+			if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
+				return result, &resourceErr{
+					reason: "GatewayError",
+					cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+					err:    err,
+				}
+			}
+		}
 		gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
 		if err != nil {
 			return result, &resourceErr{
