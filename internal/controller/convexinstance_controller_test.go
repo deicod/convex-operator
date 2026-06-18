@@ -178,7 +178,6 @@ var _ = Describe("ConvexInstance Controller", func() {
 					Status:             metav1.ConditionTrue,
 					Reason:             "Accepted",
 					LastTransitionTime: metav1.Now(),
-					ObservedGeneration: ls.GetGeneration(),
 				},
 				{
 					Type:               string(gatewayv1.ListenerSetConditionProgrammed),
@@ -197,7 +196,6 @@ var _ = Describe("ConvexInstance Controller", func() {
 						Status:             metav1.ConditionTrue,
 						Reason:             string(gatewayv1.ListenerEntryReasonAccepted),
 						LastTransitionTime: metav1.Now(),
-						ObservedGeneration: ls.GetGeneration(),
 					},
 					{
 						Type:               string(gatewayv1.ListenerEntryConditionProgrammed),
@@ -1120,7 +1118,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(ls.ResourceVersion).To(Equal(resourceVersion))
 		})
 
-		It("should become Ready once the ListenerSet is accepted and programmed", func() {
+		It("should become Ready once the ListenerSet is accepted and programmed when Accepted omits observedGeneration", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
 			}
@@ -1211,6 +1209,16 @@ var _ = Describe("ConvexInstance Controller", func() {
 			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
 			gw := &gatewayv1.Gateway{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			parent := route.Spec.ParentRefs[0]
+			Expect(parent.Kind).NotTo(BeNil())
+			Expect(string(*parent.Kind)).To(Equal("Gateway"))
+			Expect(parent.Name).To(Equal(gatewayv1.ObjectName("test-resource-gateway")))
+			Expect(parent.Namespace).NotTo(BeNil())
+			Expect(string(*parent.Namespace)).To(Equal("default"))
 		})
 
 		It("should report ListenerSetCRDMissing when listenerSet is set but the CRD is absent", func() {

@@ -2304,14 +2304,15 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 }
 
 func listenerSetReady(ls *gatewayv1.ListenerSet) bool {
-	if !conditionTrueForGeneration(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted), ls.Generation) ||
+	// Gateway API requires observedGeneration on Programmed, but not on Accepted.
+	if !conditionStatusTrue(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted)) ||
 		!conditionTrueForGeneration(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionProgrammed), ls.Generation) {
 		return false
 	}
 	for _, listener := range ls.Spec.Listeners {
 		status := listenerEntryStatus(ls, listener.Name)
 		if status == nil ||
-			!conditionTrueForGeneration(status.Conditions, string(gatewayv1.ListenerEntryConditionAccepted), ls.Generation) ||
+			!conditionStatusTrue(status.Conditions, string(gatewayv1.ListenerEntryConditionAccepted)) ||
 			!conditionTrueForGeneration(status.Conditions, string(gatewayv1.ListenerEntryConditionProgrammed), ls.Generation) ||
 			conditionTrueForGeneration(status.Conditions, string(gatewayv1.ListenerEntryConditionConflicted), ls.Generation) {
 			return false
@@ -2696,6 +2697,11 @@ func conditionTrueForGeneration(conditions []metav1.Condition, condType string, 
 		return false
 	}
 	return cond.Status == metav1.ConditionTrue && cond.ObservedGeneration >= generation
+}
+
+func conditionStatusTrue(conditions []metav1.Condition, condType string) bool {
+	cond := meta.FindStatusCondition(conditions, condType)
+	return cond != nil && cond.Status == metav1.ConditionTrue
 }
 
 func upgradePVCName(instance *convexv1alpha1.ConvexInstance) string {
