@@ -69,6 +69,7 @@ const (
 	actionPortName           = "http-action"
 	actionPort               = 3211
 	defaultListenerName      = "convex"
+	listenerSetReadyRequeue  = 5 * time.Minute
 	defaultDashboardPortName = "http"
 	defaultDashboardPort     = 6791
 	configMapKey             = "convex.conf"
@@ -170,6 +171,17 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if stop, err := r.ensureFinalizer(ctx, instance); err != nil || stop {
 		return ctrl.Result{}, err
 	}
+	updateStatusPhase := func(reason string, originalErr error, conds ...metav1.Condition) error {
+		msg := ""
+		if originalErr != nil {
+			msg = originalErr.Error()
+		}
+		if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, instance.Status.UpgradeHash, conds...); err != nil {
+			return err
+		}
+		r.recordParentRefsIgnored(instance)
+		return originalErr
+	}
 
 	// Capture current backend/dashboard state to drive upgrade decisions.
 	var existingBackend appsv1.StatefulSet
@@ -206,7 +218,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
+		return ctrl.Result{}, updateStatusPhase("ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
 
 	desiredEnv := backendEnvWithS3(instance, instance.Spec.Version, generatedSecretName(instance), extVersions.s3Resolved)
@@ -220,7 +232,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	coreRes, resErr := r.reconcileCoreResources(ctx, instance, plan, extVersions)
 	if resErr != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, resErr.reason, resErr.err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, resErr.reason, resErr.err, resErr.cond)
+		return ctrl.Result{}, updateStatusPhase(resErr.reason, resErr.err, resErr.cond)
 	}
 
 	// handleUpgrade executes the state transitions for upgrades (e.g. launching export jobs, blocking rollouts).
@@ -228,7 +240,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	status, err := r.handleUpgrade(ctx, instance, plan, coreRes.backendReady, coreRes.dashboardReady, coreRes.gatewayReady, coreRes.routeReady, coreRes.serviceName, coreRes.secretName, coreRes.conds)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
+		return ctrl.Result{}, updateStatusPhase("UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
 	}
 
 	readyEvent := status.phase == phaseReady && oldPhase != phaseReady
@@ -252,6 +264,9 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if requeueAfter == 0 || coreRes.nextRestartIn < requeueAfter {
 			requeueAfter = coreRes.nextRestartIn
 		}
+	}
+	if useListenerSet(instance) && (requeueAfter == 0 || listenerSetReadyRequeue < requeueAfter) {
+		requeueAfter = listenerSetReadyRequeue
 	}
 
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
@@ -2254,14 +2269,14 @@ func listenerSetParentGatewayRef(instance *convexv1alpha1.ConvexInstance) gatewa
 func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
 	ls := &gatewayv1.ListenerSet{}
 	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
-	spec := gatewayv1.ListenerSetSpec{
-		ParentRef: listenerSetParentGatewayRef(instance),
-		Listeners: listenerEntries(instance),
-	}
 
 	err := r.Get(ctx, key, ls)
 	if meta.IsNoMatchError(err) {
 		return false, listenerSetCRDMissingCondition(), nil
+	}
+	spec := gatewayv1.ListenerSetSpec{
+		ParentRef: listenerSetParentGatewayRef(instance),
+		Listeners: listenerEntries(instance),
 	}
 	if errors.IsNotFound(err) {
 		ls = &gatewayv1.ListenerSet{
@@ -2501,11 +2516,11 @@ type listenerConfig struct {
 	allowedRoutes *gatewayv1.AllowedRoutes
 }
 
-// desiredListenerConfig returns the shared listener configuration used by both
-// Gateway listeners and ListenerSet entries.
-func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance) listenerConfig {
+// desiredListenerConfig returns the shared listener configuration used by Gateway
+// listeners and ListenerSet entries. The caller supplies the name because managed
+// Gateways keep their historical http/https names while ListenerSets use a stable name.
+func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gatewayv1.SectionName) listenerConfig {
 	hostname := gatewayv1.Hostname(instance.Spec.Networking.Host)
-	name := gatewayv1.SectionName(defaultListenerName)
 	allowedRoutes := &gatewayv1.AllowedRoutes{
 		Namespaces: &gatewayv1.RouteNamespaces{
 			From: ptr.To(gatewayv1.NamespacesFromSame),
@@ -2539,7 +2554,7 @@ func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance) listenerConf
 }
 
 func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
-	listener := desiredListenerConfig(instance)
+	listener := desiredListenerConfig(instance, gatewayv1.SectionName(externalScheme(instance)))
 	return []gatewayv1.Listener{{
 		Name:          listener.name,
 		Protocol:      listener.protocol,
@@ -2553,7 +2568,7 @@ func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Liste
 // listenerEntries mirrors gatewayListeners but returns ListenerSet listener entries for the same
 // listener, used when attaching the instance's listener to a shared Gateway via a ListenerSet.
 func listenerEntries(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ListenerEntry {
-	listener := desiredListenerConfig(instance)
+	listener := desiredListenerConfig(instance, gatewayv1.SectionName(defaultListenerName))
 	return []gatewayv1.ListenerEntry{{
 		Name:          listener.name,
 		Protocol:      listener.protocol,
@@ -2679,8 +2694,7 @@ func parentReferenceMatchesSpec(statusRef, specRef gatewayv1.ParentReference, de
 		parentReferenceKind(statusRef) == parentReferenceKind(specRef) &&
 		parentReferenceNamespace(statusRef, defaultNamespace) == parentReferenceNamespace(specRef, defaultNamespace) &&
 		statusRef.Name == specRef.Name &&
-		parentReferenceSectionNameMatchesSpec(statusRef, specRef) &&
-		parentReferencePortMatchesSpec(statusRef, specRef)
+		parentReferenceSectionNameMatchesSpec(statusRef, specRef)
 }
 
 func parentReferenceGroup(ref gatewayv1.ParentReference) string {
@@ -2709,13 +2723,6 @@ func parentReferenceSectionNameMatchesSpec(statusRef, specRef gatewayv1.ParentRe
 		return true
 	}
 	return statusRef.SectionName != nil && *statusRef.SectionName == *specRef.SectionName
-}
-
-func parentReferencePortMatchesSpec(statusRef, specRef gatewayv1.ParentReference) bool {
-	if specRef.Port == nil {
-		return true
-	}
-	return statusRef.Port != nil && *statusRef.Port == *specRef.Port
 }
 
 func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance, env []corev1.EnvVar) string {

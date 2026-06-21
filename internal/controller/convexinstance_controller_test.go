@@ -913,6 +913,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
 			Expect(gw.Spec.GatewayClassName).To(Equal(gatewayv1.ObjectName("nginx")))
 			Expect(gw.Spec.Listeners).To(HaveLen(1))
+			Expect(gw.Spec.Listeners[0].Name).To(Equal(gatewayv1.SectionName("http")))
 			Expect(gw.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.HTTPProtocolType))
 			Expect(gw.Spec.Listeners[0].Hostname).NotTo(BeNil())
 			Expect(string(*gw.Spec.Listeners[0].Hostname)).To(Equal("convex-dev.example.com"))
@@ -1080,6 +1081,31 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Eventually(recorder.Events, 2*time.Second, 100*time.Millisecond).Should(Receive(ContainSubstring("Warning ParentRefsIgnored")))
 		})
 
+		It("should emit the parentRefs ignored event when validation fails first", func() {
+			controllerReconciler, recorder := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"backend":{"db":{"engine":"postgres","secretRef":"missing-db","urlKey":"url"}},"networking":{"parentRefs":[{"name":"public","namespace":"nginx-gateway"}],"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(HaveOccurred())
+
+			Eventually(func() bool {
+				for {
+					select {
+					case event := <-recorder.Events:
+						if strings.Contains(event, "Warning ParentRefsIgnored") {
+							return true
+						}
+					default:
+						return false
+					}
+				}
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+		})
+
 		It("should configure TLS on ListenerSet listeners when TLS is configured", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
@@ -1161,8 +1187,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 			makeListenerSetReady()
 			makeRouteAccepted()
 
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(listenerSetReadyRequeue))
 
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
