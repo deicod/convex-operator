@@ -105,10 +105,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 		newReconciler := func() (*ConvexInstanceReconciler, *events.FakeRecorder) {
 			rec := events.NewFakeRecorder(64)
 			return &ConvexInstanceReconciler{
-				Client:               k8sClient,
-				Scheme:               k8sClient.Scheme(),
-				Recorder:             rec,
-				listenerSetSupported: listenerSetCRDAvailable,
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: rec,
 			}, rec
 		}
 
@@ -1036,10 +1035,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
 			}
 			rec := &ConvexInstanceReconciler{
-				Client:               k8sClient,
-				Scheme:               k8sClient.Scheme(),
-				Recorder:             events.NewFakeRecorder(64),
-				listenerSetSupported: false,
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: events.NewFakeRecorder(64),
 			}
 
 			instance := &convexv1alpha1.ConvexInstance{}
@@ -1436,10 +1434,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 		It("should report ListenerSetCRDMissing when listenerSet is set but the CRD is absent", func() {
 			rec := &ConvexInstanceReconciler{
-				Client:               listenerSetNoMatchClient{Client: k8sClient},
-				Scheme:               k8sClient.Scheme(),
-				Recorder:             events.NewFakeRecorder(64),
-				listenerSetSupported: false,
+				Client:   listenerSetNoMatchClient{Client: k8sClient},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: events.NewFakeRecorder(64),
 			}
 
 			instance := &convexv1alpha1.ConvexInstance{}
@@ -1475,6 +1472,39 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
+		It("should delete a ListenerSet-parented HTTPRoute when the ListenerSet CRD disappears", func() {
+			if !listenerSetCRDAvailable {
+				Skip("Gateway API ListenerSet CRD not installed in this test environment")
+			}
+			base, _ := newReconciler()
+
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err := base.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			Expect(route.Spec.ParentRefs[0].Kind).NotTo(BeNil())
+			Expect(string(*route.Spec.ParentRefs[0].Kind)).To(Equal("ListenerSet"))
+
+			rec := &ConvexInstanceReconciler{
+				Client:   listenerSetNoMatchClient{Client: k8sClient},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: events.NewFakeRecorder(64),
+			}
+			_, err = rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, &gatewayv1.HTTPRoute{})
+				return errors.IsNotFound(err)
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+		})
+
 		It("should preserve the managed Gateway and route when switching to listenerSet without the CRD", func() {
 			By("first exposing the instance through a managed Gateway")
 			base, _ := newReconciler()
@@ -1489,10 +1519,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
 
 			rec := &ConvexInstanceReconciler{
-				Client:               listenerSetNoMatchClient{Client: k8sClient},
-				Scheme:               k8sClient.Scheme(),
-				Recorder:             events.NewFakeRecorder(64),
-				listenerSetSupported: false,
+				Client:   listenerSetNoMatchClient{Client: k8sClient},
+				Scheme:   k8sClient.Scheme(),
+				Recorder: events.NewFakeRecorder(64),
 			}
 			_, err = rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())

@@ -131,11 +131,6 @@ type ConvexInstanceReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
-
-	// listenerSetSupported is set at manager setup time when the standard Gateway API
-	// ListenerSet CRD is installed. It controls whether the controller watches ListenerSets;
-	// reconciliation still probes the resource and reports a clear NoMatch degradation.
-	listenerSetSupported bool
 }
 
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances,verbs=get;list;watch;create;update;patch;delete
@@ -274,7 +269,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.listenerSetSupported = listenerSetCRDInstalled(mgr.GetRESTMapper())
+	listenerSetSupported := listenerSetCRDInstalled(mgr.GetRESTMapper())
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&convexv1alpha1.ConvexInstance{}).
 		Owns(&corev1.ConfigMap{}).
@@ -288,7 +283,7 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&gatewayv1.HTTPRoute{})
 	// ListenerSet is an opt-in, Gateway API 1.5+ resource. Only watch it when its CRD is installed so
 	// the manager still starts on clusters that only have the 1.3/1.4 standard Gateway API CRDs.
-	if r.listenerSetSupported {
+	if listenerSetSupported {
 		builder = builder.Owns(&gatewayv1.ListenerSet{})
 	}
 	return builder.
@@ -2177,6 +2172,10 @@ func (r *ConvexInstanceReconciler) cleanupUpgradeArtifacts(ctx context.Context, 
 // instance are still recognized as ours).
 func ownedByInstance(obj metav1.Object, instance *convexv1alpha1.ConvexInstance) bool {
 	owner := metav1.GetControllerOf(obj)
+	return isOurControllerRef(owner, instance)
+}
+
+func isOurControllerRef(owner *metav1.OwnerReference, instance *convexv1alpha1.ConvexInstance) bool {
 	if owner == nil {
 		return false
 	}
@@ -2361,6 +2360,21 @@ func (r *ConvexInstanceReconciler) deleteManagedListenerSet(ctx context.Context,
 	}
 	if ownedByInstance(ls, instance) {
 		return r.Delete(ctx, ls)
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) deleteHTTPRouteIfListenerSetParented(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	route := &gatewayv1.HTTPRoute{}
+	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, route); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if ownedByInstance(route, instance) && httpRouteReferencesListenerSet(route) {
+		return r.Delete(ctx, route)
 	}
 	return nil
 }
@@ -2554,7 +2568,7 @@ func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gateway
 }
 
 func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
-	listener := desiredListenerConfig(instance, gatewayv1.SectionName(externalScheme(instance)))
+	listener := desiredListenerConfig(instance, gatewayListenerName(instance))
 	return []gatewayv1.Listener{{
 		Name:          listener.name,
 		Protocol:      listener.protocol,
@@ -2563,6 +2577,13 @@ func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Liste
 		TLS:           listener.tls,
 		AllowedRoutes: listener.allowedRoutes,
 	}}
+}
+
+func gatewayListenerName(instance *convexv1alpha1.ConvexInstance) gatewayv1.SectionName {
+	if instance.Spec.Networking.TLSSecretRef != "" {
+		return gatewayv1.SectionName("https")
+	}
+	return gatewayv1.SectionName("http")
 }
 
 // listenerEntries mirrors gatewayListeners but returns ListenerSet listener entries for the same
@@ -2683,6 +2704,15 @@ func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
 func routeParentStatusMatchesSpec(route *gatewayv1.HTTPRoute, statusRef gatewayv1.ParentReference) bool {
 	for _, specRef := range route.Spec.ParentRefs {
 		if parentReferenceMatchesSpec(statusRef, specRef, route.Namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+func httpRouteReferencesListenerSet(route *gatewayv1.HTTPRoute) bool {
+	for _, ref := range route.Spec.ParentRefs {
+		if parentReferenceGroup(ref) == gatewayv1.GroupName && parentReferenceKind(ref) == "ListenerSet" {
 			return true
 		}
 	}
@@ -2815,17 +2845,6 @@ func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *c
 	return r.Status().Update(ctx, current)
 }
 
-func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instance *convexv1alpha1.ConvexInstance, reason string, originalErr error, conds ...metav1.Condition) error {
-	msg := ""
-	if originalErr != nil {
-		msg = originalErr.Error()
-	}
-	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, instance.Status.UpgradeHash, conds...); err != nil {
-		return err
-	}
-	return originalErr
-}
-
 func backendConfigMapName(instance *convexv1alpha1.ConvexInstance) string {
 	return fmt.Sprintf("%s-backend-config", instance.Name)
 }
@@ -2946,7 +2965,7 @@ func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, sch
 		if owner.UID == instance.UID {
 			return false, nil
 		}
-		if owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name {
+		if isOurControllerRef(owner, instance) {
 			// Adopt resources left behind by a previous instance with the same name.
 			var refs []metav1.OwnerReference
 			for _, ref := range obj.GetOwnerReferences() {
@@ -3522,6 +3541,9 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 		if listenerSetCond.Reason == listenerSetCRDMissing {
 			reconcileRoute = false
 			result.conds = append(result.conds, httpRouteListenerSetCRDMissingCondition())
+			if err := r.deleteHTTPRouteIfListenerSetParented(ctx, instance); err != nil {
+				return result, gatewayErr(err)
+			}
 		} else {
 			// Drop any Gateway left over from a previous mode only after the ListenerSet path is usable.
 			if err := r.deleteManagedGateway(ctx, instance); err != nil {
