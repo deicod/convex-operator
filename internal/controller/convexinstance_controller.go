@@ -155,8 +155,6 @@ type ConvexInstanceReconciler struct {
 // 6. Execute the upgrade plan (rolling update or export/import orchestration).
 // 7. Update status conditions and phase.
 func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	instance := &convexv1alpha1.ConvexInstance{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -166,54 +164,16 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if stop, err := r.ensureFinalizer(ctx, instance); err != nil || stop {
 		return ctrl.Result{}, err
 	}
-	updateStatusPhase := func(reason string, originalErr error, conds ...metav1.Condition) error {
-		msg := ""
-		if originalErr != nil {
-			msg = originalErr.Error()
-		}
-		if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, instance.Status.UpgradeHash, conds...); err != nil {
-			return err
-		}
-		r.recordParentRefsIgnored(instance)
-		return originalErr
-	}
 
-	// Capture current backend/dashboard state to drive upgrade decisions.
-	var existingBackend appsv1.StatefulSet
-	backendExists := false
-	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, &existingBackend); err == nil {
-		backendExists = true
-	} else if !errors.IsNotFound(err) {
+	current, err := r.observeCurrentWorkloads(ctx, instance)
+	if err != nil {
 		return ctrl.Result{}, err
-	}
-
-	var existingDashboard appsv1.Deployment
-	dashboardExists := false
-	if err := r.Get(ctx, client.ObjectKey{Name: dashboardDeploymentName(instance), Namespace: instance.Namespace}, &existingDashboard); err == nil {
-		dashboardExists = true
-	} else if !errors.IsNotFound(err) {
-		return ctrl.Result{}, err
-	}
-
-	currentBackendImage := ""
-	currentBackendEnv := []corev1.EnvVar{}
-	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
-		currentBackendImage = existingBackend.Spec.Template.Spec.Containers[0].Image
-	}
-	currentDashboardImage := ""
-	if dashboardExists && len(existingDashboard.Spec.Template.Spec.Containers) > 0 {
-		currentDashboardImage = existingDashboard.Spec.Template.Spec.Containers[0].Image
-	}
-	currentBackendVersion := ""
-	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
-		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
-		currentBackendEnv = deduplicateEnvs(existingBackend.Spec.Template.Spec.Containers[0].Env)
 	}
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
-		return ctrl.Result{}, updateStatusPhase("ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
+		return ctrl.Result{}, r.updateErrorStatus(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
 
 	desiredEnv := backendEnvWithS3(instance, instance.Spec.Version, generatedSecretName(instance), extVersions.s3Resolved)
@@ -222,12 +182,12 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
 	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
+	plan := buildUpgradePlan(instance, current.backendExists, current.backendImage, current.dashboardImage, current.backendVersion, current.backendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	coreRes, resErr := r.reconcileCoreResources(ctx, instance, plan, extVersions)
 	if resErr != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, resErr.reason, resErr.err.Error())
-		return ctrl.Result{}, updateStatusPhase(resErr.reason, resErr.err, resErr.cond)
+		return ctrl.Result{}, r.updateErrorStatus(ctx, instance, resErr.reason, resErr.err, resErr.cond)
 	}
 
 	// handleUpgrade executes the state transitions for upgrades (e.g. launching export jobs, blocking rollouts).
@@ -235,38 +195,10 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	status, err := r.handleUpgrade(ctx, instance, plan, coreRes.backendReady, coreRes.dashboardReady, coreRes.gatewayReady, coreRes.routeReady, coreRes.serviceName, coreRes.secretName, coreRes.conds)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
-		return ctrl.Result{}, updateStatusPhase("UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
+		return ctrl.Result{}, r.updateErrorStatus(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
 	}
 
-	readyEvent := status.phase == phaseReady && oldPhase != phaseReady
-	if err := r.updateStatus(ctx, instance, status.phase, status.reason, coreRes.serviceName, status.message, coreRes.gatewayReady && coreRes.routeReady, status.appliedHash, status.conditions...); err != nil {
-		if errors.IsConflict(err) {
-			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
-			return ctrl.Result{Requeue: true}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	r.recordParentRefsIgnored(instance)
-	if readyEvent {
-		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
-	}
-
-	requeueAfter := time.Duration(0)
-	if status.phase != phaseReady || (!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) || !coreRes.gatewayReady || !coreRes.routeReady {
-		requeueAfter = 5 * time.Second
-	}
-	if coreRes.nextRestartIn > 0 {
-		if requeueAfter == 0 || coreRes.nextRestartIn < requeueAfter {
-			requeueAfter = coreRes.nextRestartIn
-		}
-	}
-	if coreRes.listenerSetCRDMissing && (requeueAfter == 0 || requeueAfter < listenerSetReadyRequeue) {
-		requeueAfter = listenerSetReadyRequeue
-	} else if useListenerSet(instance) && (requeueAfter == 0 || listenerSetReadyRequeue < requeueAfter) {
-		requeueAfter = listenerSetReadyRequeue
-	}
-
-	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	return r.finishReconcile(ctx, req, instance, oldPhase, coreRes, status)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -372,6 +304,14 @@ type externalSecretVersions struct {
 	envSecretVersions  map[string]string
 	envConfigVersions  map[string]string
 	s3Resolved         convexv1alpha1.BackendS3Spec
+}
+
+type observedWorkloads struct {
+	backendExists  bool
+	backendImage   string
+	backendVersion string
+	backendEnv     []corev1.EnvVar
+	dashboardImage string
 }
 
 type envRef struct {
@@ -761,6 +701,98 @@ func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance
 		return true, err
 	}
 	return true, nil
+}
+
+func (r *ConvexInstanceReconciler) observeCurrentWorkloads(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (observedWorkloads, error) {
+	current := observedWorkloads{}
+
+	var backend appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, &backend); err == nil {
+		current.backendExists = true
+		if len(backend.Spec.Template.Spec.Containers) > 0 {
+			backendContainer := backend.Spec.Template.Spec.Containers[0]
+			current.backendImage = backendContainer.Image
+			current.backendVersion = backendVersionFromStatefulSet(&backend)
+			current.backendEnv = deduplicateEnvs(backendContainer.Env)
+		}
+	} else if !errors.IsNotFound(err) {
+		return current, err
+	}
+
+	var dashboard appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Name: dashboardDeploymentName(instance), Namespace: instance.Namespace}, &dashboard); err == nil {
+		if len(dashboard.Spec.Template.Spec.Containers) > 0 {
+			current.dashboardImage = dashboard.Spec.Template.Spec.Containers[0].Image
+		}
+	} else if !errors.IsNotFound(err) {
+		return current, err
+	}
+
+	return current, nil
+}
+
+func (r *ConvexInstanceReconciler) updateErrorStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, reason string, originalErr error, conds ...metav1.Condition) error {
+	message := ""
+	if originalErr != nil {
+		message = originalErr.Error()
+	}
+	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), message, false, instance.Status.UpgradeHash, conds...); err != nil {
+		return err
+	}
+	r.recordParentRefsIgnored(instance)
+	return originalErr
+}
+
+func (r *ConvexInstanceReconciler) finishReconcile(ctx context.Context, req ctrl.Request, instance *convexv1alpha1.ConvexInstance, oldPhase string, coreRes reconcileOutcome, status upgradeStatus) (ctrl.Result, error) {
+	if err := r.updateStatus(ctx, instance, status.phase, status.reason, coreRes.serviceName, status.message, coreRes.gatewayReady && coreRes.routeReady, status.appliedHash, status.conditions...); err != nil {
+		if errors.IsConflict(err) {
+			logf.FromContext(ctx).V(1).Info("status conflict, will retry", "name", req.NamespacedName)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	r.recordParentRefsIgnored(instance)
+	if status.phase == phaseReady && oldPhase != phaseReady {
+		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
+	}
+
+	return ctrl.Result{RequeueAfter: reconcileRequeueAfter(instance, coreRes, status)}, nil
+}
+
+func reconcileRequeueAfter(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, status upgradeStatus) time.Duration {
+	requeueAfter := time.Duration(0)
+	if reconcileNeedsProgressRequeue(instance, coreRes, status) {
+		requeueAfter = 5 * time.Second
+	}
+	requeueAfter = minPositiveDuration(requeueAfter, coreRes.nextRestartIn)
+	return listenerSetRequeueAfter(instance, coreRes, requeueAfter)
+}
+
+func reconcileNeedsProgressRequeue(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, status upgradeStatus) bool {
+	return status.phase != phaseReady ||
+		(!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) ||
+		!coreRes.gatewayReady ||
+		!coreRes.routeReady
+}
+
+func minPositiveDuration(current, candidate time.Duration) time.Duration {
+	if candidate <= 0 {
+		return current
+	}
+	if current == 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
+func listenerSetRequeueAfter(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, requeueAfter time.Duration) time.Duration {
+	if coreRes.listenerSetCRDMissing && (requeueAfter == 0 || requeueAfter < listenerSetReadyRequeue) {
+		return listenerSetReadyRequeue
+	}
+	if useListenerSet(instance) && (requeueAfter == 0 || listenerSetReadyRequeue < requeueAfter) {
+		return listenerSetReadyRequeue
+	}
+	return requeueAfter
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
