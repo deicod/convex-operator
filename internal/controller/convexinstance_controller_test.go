@@ -164,6 +164,30 @@ var _ = Describe("ConvexInstance Controller", func() {
 			}}
 			Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
 		}
+		deleteHTTPRouteIfExists := func() {
+			route := &gatewayv1.HTTPRoute{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route); err != nil {
+				Expect(errors.IsNotFound(err)).To(BeTrue())
+				return
+			}
+			Expect(k8sClient.Delete(ctx, route)).To(Succeed())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, &gatewayv1.HTTPRoute{})
+				return errors.IsNotFound(err)
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+		}
+		deleteGatewayIfExists := func() {
+			gw := &gatewayv1.Gateway{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw); err != nil {
+				Expect(errors.IsNotFound(err)).To(BeTrue())
+				return
+			}
+			Expect(k8sClient.Delete(ctx, gw)).To(Succeed())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})
+				return errors.IsNotFound(err)
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+		}
 		makeListenerSetReady := func() {
 			ls := &gatewayv1.ListenerSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
@@ -984,6 +1008,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
 			}
 			controllerReconciler, _ := newReconciler()
+			deleteHTTPRouteIfExists()
+			deleteGatewayIfExists()
 
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
@@ -1030,7 +1056,58 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(gwCond.Status).To(Equal(metav1.ConditionFalse))
 		})
 
-		It("should reconcile ListenerSets when the CRD appears after startup detection", func() {
+		It("should preserve the managed Gateway route until the ListenerSet is ready", func() {
+			if !listenerSetCRDAvailable {
+				Skip("Gateway API ListenerSet CRD not installed in this test environment")
+			}
+			controllerReconciler, _ := newReconciler()
+
+			By("first exposing the instance through a managed Gateway")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})).To(Succeed())
+
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-gateway")))
+
+			By("switching to ListenerSet mode before the ListenerSet is ready")
+			instance := &convexv1alpha1.ConvexInstance{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("leaving the managed Gateway and Gateway-parented route in place")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-gateway")))
+
+			By("moving the route only after the ListenerSet is ready")
+			makeListenerSetReady()
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)).To(Succeed())
+			Expect(route.Spec.ParentRefs).To(HaveLen(1))
+			Expect(route.Spec.ParentRefs[0].Kind).NotTo(BeNil())
+			Expect(string(*route.Spec.ParentRefs[0].Kind)).To(Equal("ListenerSet"))
+			Expect(route.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName("test-resource-listeners")))
+
+			By("deleting the old managed Gateway after the route has moved")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func() bool {
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, &gatewayv1.Gateway{})
+				return errors.IsNotFound(err)
+			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
+		})
+
+		It("should reconcile ListenerSets when the CRD is available at runtime", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
 			}
@@ -1171,6 +1248,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
 			}
 			controllerReconciler, _ := newReconciler()
+			deleteHTTPRouteIfExists()
+			deleteGatewayIfExists()
 
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
@@ -1452,8 +1531,9 @@ var _ = Describe("ConvexInstance Controller", func() {
 			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
 			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
 
-			_, err := rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			result, err := rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(listenerSetReadyRequeue))
 
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())

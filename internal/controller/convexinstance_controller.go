@@ -260,7 +260,9 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			requeueAfter = coreRes.nextRestartIn
 		}
 	}
-	if useListenerSet(instance) && (requeueAfter == 0 || listenerSetReadyRequeue < requeueAfter) {
+	if coreRes.listenerSetCRDMissing && (requeueAfter == 0 || requeueAfter < listenerSetReadyRequeue) {
+		requeueAfter = listenerSetReadyRequeue
+	} else if useListenerSet(instance) && (requeueAfter == 0 || listenerSetReadyRequeue < requeueAfter) {
 		requeueAfter = listenerSetReadyRequeue
 	}
 
@@ -695,16 +697,17 @@ type upgradeStatus struct {
 }
 
 type reconcileOutcome struct {
-	serviceName          string
-	dashboardServiceName string
-	dashboardReady       bool
-	gatewayReady         bool
-	routeReady           bool
-	backendReady         bool
-	secretName           string
-	secretRV             string
-	conds                []metav1.Condition
-	nextRestartIn        time.Duration
+	serviceName           string
+	dashboardServiceName  string
+	dashboardReady        bool
+	gatewayReady          bool
+	routeReady            bool
+	backendReady          bool
+	listenerSetCRDMissing bool
+	secretName            string
+	secretRV              string
+	conds                 []metav1.Condition
+	nextRestartIn         time.Duration
 }
 
 type resourceErr struct {
@@ -2379,6 +2382,18 @@ func (r *ConvexInstanceReconciler) deleteHTTPRouteIfListenerSetParented(ctx cont
 	return nil
 }
 
+func (r *ConvexInstanceReconciler) existingHTTPRouteReferencesListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, bool, error) {
+	route := &gatewayv1.HTTPRoute{}
+	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, route); err != nil {
+		if errors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	return httpRouteReferencesListenerSet(route), true, nil
+}
+
 func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string) (bool, metav1.Condition, error) {
 	route := &gatewayv1.HTTPRoute{}
 	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
@@ -3539,15 +3554,32 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 		result.gatewayReady = listenerSetReady
 		result.conds = append(result.conds, listenerSetCond)
 		if listenerSetCond.Reason == listenerSetCRDMissing {
+			result.listenerSetCRDMissing = true
 			reconcileRoute = false
 			result.conds = append(result.conds, httpRouteListenerSetCRDMissingCondition())
 			if err := r.deleteHTTPRouteIfListenerSetParented(ctx, instance); err != nil {
 				return result, gatewayErr(err)
 			}
-		} else {
-			// Drop any Gateway left over from a previous mode only after the ListenerSet path is usable.
-			if err := r.deleteManagedGateway(ctx, instance); err != nil {
+		} else if !listenerSetReady {
+			routeUsesListenerSet, routeExists, err := r.existingHTTPRouteReferencesListenerSet(ctx, instance)
+			if err != nil {
 				return result, gatewayErr(err)
+			}
+			if routeExists && !routeUsesListenerSet {
+				reconcileRoute = false
+				result.conds = append(result.conds, conditionFalse(conditionHTTPRoute, "WaitingForListenerSet", "Waiting for ListenerSet readiness before moving HTTPRoute"))
+			}
+		} else {
+			routeUsesListenerSet, routeExists, err := r.existingHTTPRouteReferencesListenerSet(ctx, instance)
+			if err != nil {
+				return result, gatewayErr(err)
+			}
+			// Drop any Gateway left over from a previous mode only after the ListenerSet is ready
+			// and the managed HTTPRoute no longer points at that Gateway.
+			if !routeExists || routeUsesListenerSet {
+				if err := r.deleteManagedGateway(ctx, instance); err != nil {
+					return result, gatewayErr(err)
+				}
 			}
 		}
 	case useCustomParentRefs(instance):
