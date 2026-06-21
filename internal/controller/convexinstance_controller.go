@@ -68,6 +68,7 @@ const (
 	defaultBackendPort       = 3210
 	actionPortName           = "http-action"
 	actionPort               = 3211
+	defaultListenerName      = "convex"
 	defaultDashboardPortName = "http"
 	defaultDashboardPort     = 6791
 	configMapKey             = "convex.conf"
@@ -2260,7 +2261,6 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 
 	err := r.Get(ctx, key, ls)
 	if meta.IsNoMatchError(err) {
-		r.listenerSetSupported = false
 		return false, listenerSetCRDMissingCondition(), nil
 	}
 	if errors.IsNotFound(err) {
@@ -2276,18 +2276,15 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 		}
 		if err := r.Create(ctx, ls); err != nil {
 			if meta.IsNoMatchError(err) {
-				r.listenerSetSupported = false
 				return false, listenerSetCRDMissingCondition(), nil
 			}
 			return false, metav1.Condition{}, err
 		}
-		r.listenerSetSupported = true
 		return false, conditionFalse(conditionGateway, "Provisioning", "ListenerSet created"), nil
 	}
 	if err != nil {
 		return false, metav1.Condition{}, err
 	}
-	r.listenerSetSupported = true
 
 	ownerChanged, err := ensureOwner(instance, ls, r.Scheme)
 	if err != nil {
@@ -2297,7 +2294,6 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 		ls.Spec = spec
 		if err := r.Update(ctx, ls); err != nil {
 			if meta.IsNoMatchError(err) {
-				r.listenerSetSupported = false
 				return false, listenerSetCRDMissingCondition(), nil
 			}
 			return false, metav1.Condition{}, err
@@ -2340,9 +2336,6 @@ func listenerEntryStatus(ls *gatewayv1.ListenerSet, name gatewayv1.SectionName) 
 // deleteManagedListenerSet removes an operator-managed ListenerSet, used when an instance switches
 // away from ListenerSet mode. It is a no-op when the ListenerSet (or its CRD) is absent.
 func (r *ConvexInstanceReconciler) deleteManagedListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
-	if !r.listenerSetSupported {
-		return nil
-	}
 	ls := &gatewayv1.ListenerSet{}
 	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
 	if err := r.Get(ctx, key, ls); err != nil {
@@ -2512,8 +2505,7 @@ type listenerConfig struct {
 // Gateway listeners and ListenerSet entries.
 func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance) listenerConfig {
 	hostname := gatewayv1.Hostname(instance.Spec.Networking.Host)
-	// The listener name matches the scheme ("http"/"https"), derived from whether TLS is configured.
-	name := gatewayv1.SectionName(externalScheme(instance))
+	name := gatewayv1.SectionName(defaultListenerName)
 	allowedRoutes := &gatewayv1.AllowedRoutes{
 		Namespaces: &gatewayv1.RouteNamespaces{
 			From: ptr.To(gatewayv1.NamespacesFromSame),
@@ -2650,42 +2642,45 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 }
 
 func gatewayIsReady(gw *gatewayv1.Gateway) bool {
-	programmedCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
-	if programmedCond != nil {
-		return programmedCond.Status == metav1.ConditionTrue && programmedCond.ObservedGeneration >= gw.Generation
-	}
-	return conditionTrueForGeneration(gw.Status.Conditions, legacyGatewayReady, gw.Generation)
+	return conditionTrueForGeneration(gw.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), gw.Generation) ||
+		conditionTrueForGeneration(gw.Status.Conditions, legacyGatewayReady, gw.Generation)
 }
 
 func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
+	var firstCurrent *metav1.Condition
 	for _, parent := range route.Status.Parents {
 		if !routeParentStatusMatchesSpec(route, parent.ParentRef) {
 			continue
 		}
 		cond := meta.FindStatusCondition(parent.Conditions, string(gatewayv1.RouteConditionAccepted))
 		if cond != nil && cond.ObservedGeneration >= route.Generation {
-			return cond
+			if cond.Status == metav1.ConditionTrue {
+				return cond
+			}
+			if firstCurrent == nil {
+				firstCurrent = cond
+			}
 		}
 	}
-	return nil
+	return firstCurrent
 }
 
 func routeParentStatusMatchesSpec(route *gatewayv1.HTTPRoute, statusRef gatewayv1.ParentReference) bool {
 	for _, specRef := range route.Spec.ParentRefs {
-		if parentReferenceEqual(statusRef, specRef, route.Namespace) {
+		if parentReferenceMatchesSpec(statusRef, specRef, route.Namespace) {
 			return true
 		}
 	}
 	return false
 }
 
-func parentReferenceEqual(a, b gatewayv1.ParentReference, defaultNamespace string) bool {
-	return parentReferenceGroup(a) == parentReferenceGroup(b) &&
-		parentReferenceKind(a) == parentReferenceKind(b) &&
-		parentReferenceNamespace(a, defaultNamespace) == parentReferenceNamespace(b, defaultNamespace) &&
-		a.Name == b.Name &&
-		parentReferenceSectionName(a) == parentReferenceSectionName(b) &&
-		parentReferencePort(a) == parentReferencePort(b)
+func parentReferenceMatchesSpec(statusRef, specRef gatewayv1.ParentReference, defaultNamespace string) bool {
+	return parentReferenceGroup(statusRef) == parentReferenceGroup(specRef) &&
+		parentReferenceKind(statusRef) == parentReferenceKind(specRef) &&
+		parentReferenceNamespace(statusRef, defaultNamespace) == parentReferenceNamespace(specRef, defaultNamespace) &&
+		statusRef.Name == specRef.Name &&
+		parentReferenceSectionNameMatchesSpec(statusRef, specRef) &&
+		parentReferencePortMatchesSpec(statusRef, specRef)
 }
 
 func parentReferenceGroup(ref gatewayv1.ParentReference) string {
@@ -2709,18 +2704,18 @@ func parentReferenceNamespace(ref gatewayv1.ParentReference, defaultNamespace st
 	return string(*ref.Namespace)
 }
 
-func parentReferenceSectionName(ref gatewayv1.ParentReference) string {
-	if ref.SectionName == nil {
-		return ""
+func parentReferenceSectionNameMatchesSpec(statusRef, specRef gatewayv1.ParentReference) bool {
+	if specRef.SectionName == nil {
+		return true
 	}
-	return string(*ref.SectionName)
+	return statusRef.SectionName != nil && *statusRef.SectionName == *specRef.SectionName
 }
 
-func parentReferencePort(ref gatewayv1.ParentReference) int32 {
-	if ref.Port == nil {
-		return 0
+func parentReferencePortMatchesSpec(statusRef, specRef gatewayv1.ParentReference) bool {
+	if specRef.Port == nil {
+		return true
 	}
-	return int32(*ref.Port)
+	return statusRef.Port != nil && *statusRef.Port == *specRef.Port
 }
 
 func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance, env []corev1.EnvVar) string {

@@ -1001,6 +1001,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(ls.Spec.ParentRef.Kind).NotTo(BeNil())
 			Expect(string(*ls.Spec.ParentRef.Kind)).To(Equal("Gateway"))
 			Expect(ls.Spec.Listeners).To(HaveLen(1))
+			Expect(ls.Spec.Listeners[0].Name).To(Equal(gatewayv1.SectionName(defaultListenerName)))
 			Expect(ls.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.HTTPProtocolType))
 			Expect(ls.Spec.Listeners[0].Hostname).NotTo(BeNil())
 			Expect(string(*ls.Spec.Listeners[0].Hostname)).To(Equal("convex-dev.example.com"))
@@ -1103,7 +1104,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			instance := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
-			patch := []byte(`{"spec":{"networking":{"tlsSecretRef":"convex-dev-tls","listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
+			patch := []byte(`{"spec":{"networking":{"listenerSet":{"parentGateway":{"name":"shared-gateway","namespace":"nginx-gateway"}}}}}`)
 			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
@@ -1112,7 +1113,20 @@ var _ = Describe("ConvexInstance Controller", func() {
 			ls := &gatewayv1.ListenerSet{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
 			Expect(ls.Spec.Listeners).To(HaveLen(1))
+			listenerName := ls.Spec.Listeners[0].Name
+			Expect(listenerName).To(Equal(gatewayv1.SectionName(defaultListenerName)))
+			Expect(ls.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.HTTPProtocolType))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, instance)).To(Succeed())
+			patch = []byte(`{"spec":{"networking":{"tlsSecretRef":"convex-dev-tls"}}}`)
+			Expect(k8sClient.Patch(ctx, instance, client.RawPatch(types.MergePatchType, patch))).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-listeners", Namespace: "default"}, ls)).To(Succeed())
+			Expect(ls.Spec.Listeners).To(HaveLen(1))
 			listener := ls.Spec.Listeners[0]
+			Expect(listener.Name).To(Equal(listenerName))
 			Expect(listener.Protocol).To(Equal(gatewayv1.HTTPSProtocolType))
 			Expect(listener.Port).To(Equal(gatewayv1.PortNumber(443)))
 			Expect(listener.TLS).NotTo(BeNil())
@@ -1200,7 +1214,51 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(routeAccepted(route)).To(BeNil())
 
 			route.Status.Parents[0].ParentRef = route.Spec.ParentRefs[0]
+			route.Status.Parents[0].ParentRef.SectionName = ptr.To(gatewayv1.SectionName("https"))
+			route.Status.Parents[0].ParentRef.Port = ptr.To(gatewayv1.PortNumber(443))
 			Expect(routeAccepted(route)).NotTo(BeNil())
+
+			route.Spec.ParentRefs[0].SectionName = ptr.To(gatewayv1.SectionName("http"))
+			Expect(routeAccepted(route)).To(BeNil())
+
+			route.Status.Parents[0].ParentRef.SectionName = route.Spec.ParentRefs[0].SectionName
+			Expect(routeAccepted(route)).NotTo(BeNil())
+		})
+
+		It("should keep legacy Gateway Ready fallback when Programmed is not ready", func() {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-resource-gateway",
+					Namespace:  "default",
+					Generation: 4,
+				},
+				Status: gatewayv1.GatewayStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(gatewayv1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							Reason:             "Pending",
+							LastTransitionTime: metav1.Now(),
+							ObservedGeneration: 4,
+						},
+						{
+							Type:               legacyGatewayReady,
+							Status:             metav1.ConditionTrue,
+							Reason:             "Ready",
+							LastTransitionTime: metav1.Now(),
+							ObservedGeneration: 4,
+						},
+					},
+				},
+			}
+
+			Expect(gatewayIsReady(gw)).To(BeTrue())
+
+			gw.Status.Conditions[1].ObservedGeneration = 3
+			Expect(gatewayIsReady(gw)).To(BeFalse())
+
+			gw.Status.Conditions[0].Status = metav1.ConditionTrue
+			Expect(gatewayIsReady(gw)).To(BeTrue())
 		})
 
 		It("should not become Ready when the ListenerSet listener entry is conflicted", func() {
