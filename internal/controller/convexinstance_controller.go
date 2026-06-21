@@ -121,6 +121,7 @@ const (
 	defaultOBCRegion         = "us-east-1"
 	listenerSetCRDMissing    = "ListenerSetCRDMissing"
 	listenerSetCRDMissingMsg = "spec.networking.listenerSet requires the Gateway API ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+), which is not installed in this cluster"
+	legacyGatewayReady       = "Ready"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -210,7 +211,6 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	desiredEnv := backendEnvWithS3(instance, instance.Spec.Version, generatedSecretName(instance), extVersions.s3Resolved)
 	desiredHash := desiredUpgradeHash(instance, desiredEnv)
 	exportSucceeded, importSucceeded, exportFailed, importFailed := r.observeUpgradeJobs(ctx, instance, desiredHash)
-	r.recordParentRefsIgnored(instance)
 
 	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
 	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
@@ -238,6 +238,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		return ctrl.Result{}, err
 	}
+	r.recordParentRefsIgnored(instance)
 	if readyEvent {
 		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
 	}
@@ -2259,6 +2260,7 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 
 	err := r.Get(ctx, key, ls)
 	if meta.IsNoMatchError(err) {
+		r.listenerSetSupported = false
 		return false, listenerSetCRDMissingCondition(), nil
 	}
 	if errors.IsNotFound(err) {
@@ -2274,15 +2276,18 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 		}
 		if err := r.Create(ctx, ls); err != nil {
 			if meta.IsNoMatchError(err) {
+				r.listenerSetSupported = false
 				return false, listenerSetCRDMissingCondition(), nil
 			}
 			return false, metav1.Condition{}, err
 		}
+		r.listenerSetSupported = true
 		return false, conditionFalse(conditionGateway, "Provisioning", "ListenerSet created"), nil
 	}
 	if err != nil {
 		return false, metav1.Condition{}, err
 	}
+	r.listenerSetSupported = true
 
 	ownerChanged, err := ensureOwner(instance, ls, r.Scheme)
 	if err != nil {
@@ -2292,6 +2297,7 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 		ls.Spec = spec
 		if err := r.Update(ctx, ls); err != nil {
 			if meta.IsNoMatchError(err) {
+				r.listenerSetSupported = false
 				return false, listenerSetCRDMissingCondition(), nil
 			}
 			return false, metav1.Condition{}, err
@@ -2334,6 +2340,9 @@ func listenerEntryStatus(ls *gatewayv1.ListenerSet, name gatewayv1.SectionName) 
 // deleteManagedListenerSet removes an operator-managed ListenerSet, used when an instance switches
 // away from ListenerSet mode. It is a no-op when the ListenerSet (or its CRD) is absent.
 func (r *ConvexInstanceReconciler) deleteManagedListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	if !r.listenerSetSupported {
+		return nil
+	}
 	ls := &gatewayv1.ListenerSet{}
 	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
 	if err := r.Get(ctx, key, ls); err != nil {
@@ -2641,21 +2650,77 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 }
 
 func gatewayIsReady(gw *gatewayv1.Gateway) bool {
-	//nolint:staticcheck // "Ready" retained for backward-compatible managed-Gateway readiness (existing behavior; out of scope for ListenerSet support)
-	readyCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionReady))
-	return readyCond != nil &&
-		readyCond.Status == metav1.ConditionTrue &&
-		readyCond.ObservedGeneration >= gw.Generation
+	programmedCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed))
+	if programmedCond != nil {
+		return programmedCond.Status == metav1.ConditionTrue && programmedCond.ObservedGeneration >= gw.Generation
+	}
+	return conditionTrueForGeneration(gw.Status.Conditions, legacyGatewayReady, gw.Generation)
 }
 
 func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
 	for _, parent := range route.Status.Parents {
+		if !routeParentStatusMatchesSpec(route, parent.ParentRef) {
+			continue
+		}
 		cond := meta.FindStatusCondition(parent.Conditions, string(gatewayv1.RouteConditionAccepted))
 		if cond != nil && cond.ObservedGeneration >= route.Generation {
 			return cond
 		}
 	}
 	return nil
+}
+
+func routeParentStatusMatchesSpec(route *gatewayv1.HTTPRoute, statusRef gatewayv1.ParentReference) bool {
+	for _, specRef := range route.Spec.ParentRefs {
+		if parentReferenceEqual(statusRef, specRef, route.Namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+func parentReferenceEqual(a, b gatewayv1.ParentReference, defaultNamespace string) bool {
+	return parentReferenceGroup(a) == parentReferenceGroup(b) &&
+		parentReferenceKind(a) == parentReferenceKind(b) &&
+		parentReferenceNamespace(a, defaultNamespace) == parentReferenceNamespace(b, defaultNamespace) &&
+		a.Name == b.Name &&
+		parentReferenceSectionName(a) == parentReferenceSectionName(b) &&
+		parentReferencePort(a) == parentReferencePort(b)
+}
+
+func parentReferenceGroup(ref gatewayv1.ParentReference) string {
+	if ref.Group == nil {
+		return gatewayv1.GroupName
+	}
+	return string(*ref.Group)
+}
+
+func parentReferenceKind(ref gatewayv1.ParentReference) string {
+	if ref.Kind == nil {
+		return "Gateway"
+	}
+	return string(*ref.Kind)
+}
+
+func parentReferenceNamespace(ref gatewayv1.ParentReference, defaultNamespace string) string {
+	if ref.Namespace == nil {
+		return defaultNamespace
+	}
+	return string(*ref.Namespace)
+}
+
+func parentReferenceSectionName(ref gatewayv1.ParentReference) string {
+	if ref.SectionName == nil {
+		return ""
+	}
+	return string(*ref.SectionName)
+}
+
+func parentReferencePort(ref gatewayv1.ParentReference) int32 {
+	if ref.Port == nil {
+		return 0
+	}
+	return int32(*ref.Port)
 }
 
 func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance, env []corev1.EnvVar) string {
@@ -2701,8 +2766,7 @@ func conditionTrueForGeneration(conditions []metav1.Condition, condType string, 
 }
 
 func conditionStatusTrue(conditions []metav1.Condition, condType string) bool {
-	cond := meta.FindStatusCondition(conditions, condType)
-	return cond != nil && cond.Status == metav1.ConditionTrue
+	return conditionTrueForGeneration(conditions, condType, 0)
 }
 
 func upgradePVCName(instance *convexv1alpha1.ConvexInstance) string {
@@ -3456,11 +3520,11 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 		if listenerSetCond.Reason == listenerSetCRDMissing {
 			reconcileRoute = false
 			result.conds = append(result.conds, httpRouteListenerSetCRDMissingCondition())
-			break
-		}
-		// Drop any Gateway left over from a previous mode only after the ListenerSet path is usable.
-		if err := r.deleteManagedGateway(ctx, instance); err != nil {
-			return result, gatewayErr(err)
+		} else {
+			// Drop any Gateway left over from a previous mode only after the ListenerSet path is usable.
+			if err := r.deleteManagedGateway(ctx, instance); err != nil {
+				return result, gatewayErr(err)
+			}
 		}
 	case useCustomParentRefs(instance):
 		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
