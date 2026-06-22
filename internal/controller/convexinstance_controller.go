@@ -88,6 +88,7 @@ const (
 	conditionImport          = "ImportCompleted"
 	conditionRollingUpdate   = "RollingUpdate"
 	conditionBackendReady    = "BackendReady"
+	reasonWaitingForGateway  = "WaitingForGateway"
 	msgInstanceReady         = "Instance ready"
 	msgBackendReady          = "Backend ready"
 	phasePending             = "Pending"
@@ -131,6 +132,11 @@ type ConvexInstanceReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
+
+	// Set when the manager started before the ListenerSet CRD existed. In that
+	// case no ListenerSet watch is registered, so ListenerSet mode keeps a slow
+	// polling fallback after it has otherwise converged.
+	listenerSetWatchMissing bool
 }
 
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances,verbs=get;list;watch;create;update;patch;delete
@@ -204,6 +210,7 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 // SetupWithManager sets up the controller with the Manager.
 func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	listenerSetSupported := listenerSetCRDInstalled(mgr.GetRESTMapper())
+	r.listenerSetWatchMissing = !listenerSetSupported
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&convexv1alpha1.ConvexInstance{}).
 		Owns(&corev1.ConfigMap{}).
@@ -637,17 +644,18 @@ type upgradeStatus struct {
 }
 
 type reconcileOutcome struct {
-	serviceName           string
-	dashboardServiceName  string
-	dashboardReady        bool
-	gatewayReady          bool
-	routeReady            bool
-	backendReady          bool
-	listenerSetCRDMissing bool
-	secretName            string
-	secretRV              string
-	conds                 []metav1.Condition
-	nextRestartIn         time.Duration
+	serviceName             string
+	dashboardServiceName    string
+	dashboardReady          bool
+	gatewayReady            bool
+	routeReady              bool
+	backendReady            bool
+	listenerSetCRDMissing   bool
+	listenerSetWatchMissing bool
+	secretName              string
+	secretRV                string
+	conds                   []metav1.Condition
+	nextRestartIn           time.Duration
 }
 
 type resourceErr struct {
@@ -765,14 +773,25 @@ func reconcileRequeueAfter(instance *convexv1alpha1.ConvexInstance, coreRes reco
 		requeueAfter = 5 * time.Second
 	}
 	requeueAfter = minPositiveDuration(requeueAfter, coreRes.nextRestartIn)
-	return listenerSetRequeueAfter(instance, coreRes, requeueAfter)
+	return listenerSetRequeueAfter(coreRes, requeueAfter)
 }
 
 func reconcileNeedsProgressRequeue(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, status upgradeStatus) bool {
-	return status.phase != phaseReady ||
-		(!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) ||
-		!coreRes.gatewayReady ||
-		!coreRes.routeReady
+	if !coreRes.backendReady {
+		return true
+	}
+	if instance.Spec.Dashboard.Enabled && !coreRes.dashboardReady {
+		return true
+	}
+	if coreRes.listenerSetCRDMissing {
+		// Active export/import jobs still need the fast progress poll; otherwise
+		// a missing ListenerSet CRD is a static cluster condition and can back off.
+		return status.phase == phaseUpgrading && status.reason != reasonWaitingForGateway
+	}
+	if status.phase == phaseUpgrading {
+		return true
+	}
+	return status.phase != phaseReady || !coreRes.gatewayReady || !coreRes.routeReady
 }
 
 func minPositiveDuration(current, candidate time.Duration) time.Duration {
@@ -785,12 +804,9 @@ func minPositiveDuration(current, candidate time.Duration) time.Duration {
 	return current
 }
 
-func listenerSetRequeueAfter(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, requeueAfter time.Duration) time.Duration {
-	if coreRes.listenerSetCRDMissing && (requeueAfter == 0 || requeueAfter < listenerSetReadyRequeue) {
-		return listenerSetReadyRequeue
-	}
-	if useListenerSet(instance) && (requeueAfter == 0 || listenerSetReadyRequeue < requeueAfter) {
-		return listenerSetReadyRequeue
+func listenerSetRequeueAfter(coreRes reconcileOutcome, requeueAfter time.Duration) time.Duration {
+	if coreRes.listenerSetCRDMissing || coreRes.listenerSetWatchMissing {
+		return minPositiveDuration(requeueAfter, listenerSetReadyRequeue)
 	}
 	return requeueAfter
 }
@@ -2580,7 +2596,9 @@ type listenerConfig struct {
 // desiredListenerConfig returns the shared listener configuration used by Gateway
 // listeners and ListenerSet entries. The caller supplies the name because managed
 // Gateways keep their historical http/https names while ListenerSets use a stable name.
-func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gatewayv1.SectionName) listenerConfig {
+// Managed Gateways also keep TLS mode implicit to avoid rewriting existing specs;
+// ListenerSets pass explicit Terminate because this feature creates those resources.
+func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gatewayv1.SectionName, tlsMode *gatewayv1.TLSModeType) listenerConfig {
 	hostname := gatewayv1.Hostname(instance.Spec.Networking.Host)
 	allowedRoutes := &gatewayv1.AllowedRoutes{
 		Namespaces: &gatewayv1.RouteNamespaces{
@@ -2589,7 +2607,7 @@ func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gateway
 	}
 	if instance.Spec.Networking.TLSSecretRef != "" {
 		tls := &gatewayv1.ListenerTLSConfig{
-			Mode: ptr.To(gatewayv1.TLSModeTerminate),
+			Mode: tlsMode,
 			CertificateRefs: []gatewayv1.SecretObjectReference{{
 				Kind:      ptr.To(gatewayv1.Kind("Secret")),
 				Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
@@ -2615,7 +2633,7 @@ func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gateway
 }
 
 func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
-	listener := desiredListenerConfig(instance, gatewayListenerName(instance))
+	listener := desiredListenerConfig(instance, gatewayListenerName(instance), nil)
 	return []gatewayv1.Listener{{
 		Name:          listener.name,
 		Protocol:      listener.protocol,
@@ -2636,7 +2654,7 @@ func gatewayListenerName(instance *convexv1alpha1.ConvexInstance) gatewayv1.Sect
 // listenerEntries mirrors gatewayListeners but returns ListenerSet listener entries for the same
 // listener, used when attaching the instance's listener to a shared Gateway via a ListenerSet.
 func listenerEntries(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ListenerEntry {
-	listener := desiredListenerConfig(instance, gatewayv1.SectionName(defaultListenerName))
+	listener := desiredListenerConfig(instance, gatewayv1.SectionName(defaultListenerName), ptr.To(gatewayv1.TLSModeTerminate))
 	return []gatewayv1.ListenerEntry{{
 		Name:          listener.name,
 		Protocol:      listener.protocol,
@@ -2725,8 +2743,9 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 }
 
 func gatewayIsReady(gw *gatewayv1.Gateway) bool {
-	return conditionTrueForGeneration(gw.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), gw.Generation) ||
-		conditionTrueForGeneration(gw.Status.Conditions, legacyGatewayReady, gw.Generation)
+	return conditionTrueForGeneration(gw.Status.Conditions, legacyGatewayReady, gw.Generation) ||
+		(conditionTrueForGeneration(gw.Status.Conditions, string(gatewayv1.GatewayConditionAccepted), gw.Generation) &&
+			conditionTrueForGeneration(gw.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), gw.Generation))
 }
 
 func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
@@ -3049,7 +3068,21 @@ func deploymentSpecEqual(a, b appsv1.DeploymentSpec) bool {
 }
 
 func gatewaySpecEqual(a, b gatewayv1.GatewaySpec) bool {
-	return apiequality.Semantic.DeepEqual(a, b)
+	aCopy := a.DeepCopy()
+	bCopy := b.DeepCopy()
+	normalizeGatewayTLSMode(aCopy)
+	normalizeGatewayTLSMode(bCopy)
+	return apiequality.Semantic.DeepEqual(*aCopy, *bCopy)
+}
+
+// Gateway API defaults nil listener TLS mode to Terminate. Treat them as equivalent
+// for managed Gateways so upgrading this operator does not churn pre-existing specs.
+func normalizeGatewayTLSMode(spec *gatewayv1.GatewaySpec) {
+	for i := range spec.Listeners {
+		if spec.Listeners[i].TLS != nil && spec.Listeners[i].TLS.Mode == nil {
+			spec.Listeners[i].TLS.Mode = ptr.To(gatewayv1.TLSModeTerminate)
+		}
+	}
 }
 
 func listenerSetSpecEqual(a, b gatewayv1.ListenerSetSpec) bool {
@@ -3491,7 +3524,7 @@ func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dash
 		return "WaitingForDashboard", "Waiting for dashboard readiness"
 	}
 	if !gatewayReady || !routeReady {
-		return "WaitingForGateway", "Waiting for Gateway/HTTPRoute readiness"
+		return reasonWaitingForGateway, "Waiting for Gateway/HTTPRoute readiness"
 	}
 	return "BackendReady", "Backend ready"
 }
@@ -3579,6 +3612,7 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	switch {
 	case useListenerSet(instance):
+		result.listenerSetWatchMissing = r.listenerSetWatchMissing
 		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
 		if err != nil {
 			return result, gatewayErr(err)

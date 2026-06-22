@@ -137,13 +137,22 @@ var _ = Describe("ConvexInstance Controller", func() {
 		makeGatewayReady := func() {
 			gw := &gatewayv1.Gateway{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-gateway", Namespace: "default"}, gw)).To(Succeed())
-			gw.Status.Conditions = []metav1.Condition{{
-				Type:               string(gatewayv1.GatewayConditionProgrammed),
-				Status:             metav1.ConditionTrue,
-				Reason:             string(gatewayv1.GatewayReasonProgrammed),
-				LastTransitionTime: metav1.Now(),
-				ObservedGeneration: gw.GetGeneration(),
-			}}
+			gw.Status.Conditions = []metav1.Condition{
+				{
+					Type:               string(gatewayv1.GatewayConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					Reason:             string(gatewayv1.GatewayReasonAccepted),
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: gw.GetGeneration(),
+				},
+				{
+					Type:               string(gatewayv1.GatewayConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					Reason:             string(gatewayv1.GatewayReasonProgrammed),
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: gw.GetGeneration(),
+				},
+			}
 			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
 		}
 		makeRouteAccepted := func() {
@@ -1181,6 +1190,34 @@ var _ = Describe("ConvexInstance Controller", func() {
 			}, 2*time.Second, 100*time.Millisecond).Should(BeTrue())
 		})
 
+		It("should keep managed Gateway TLS mode implicit while accepting defaulted Terminate", func() {
+			instance := &convexv1alpha1.ConvexInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-resource",
+					Namespace: "default",
+				},
+				Spec: convexv1alpha1.ConvexInstanceSpec{
+					Networking: convexv1alpha1.NetworkingSpec{
+						Host:         "convex-dev.example.com",
+						TLSSecretRef: "convex-dev-tls",
+					},
+				},
+			}
+
+			listeners := gatewayListeners(instance)
+			Expect(listeners).To(HaveLen(1))
+			Expect(listeners[0].TLS).NotTo(BeNil())
+			Expect(listeners[0].TLS.Mode).To(BeNil())
+
+			desired := gatewayv1.GatewaySpec{Listeners: listeners}
+			defaulted := *desired.DeepCopy()
+			defaulted.Listeners[0].TLS.Mode = ptr.To(gatewayv1.TLSModeTerminate)
+			Expect(gatewaySpecEqual(defaulted, desired)).To(BeTrue())
+
+			defaulted.Listeners[0].TLS.Mode = ptr.To(gatewayv1.TLSModePassthrough)
+			Expect(gatewaySpecEqual(defaulted, desired)).To(BeFalse())
+		})
+
 		It("should configure TLS on ListenerSet listeners when TLS is configured", func() {
 			if !listenerSetCRDAvailable {
 				Skip("Gateway API ListenerSet CRD not installed in this test environment")
@@ -1266,7 +1303,8 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(listenerSetReadyRequeue))
+			Expect(result.RequeueAfter).To(BeNumerically(">", listenerSetReadyRequeue))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", defaultRestartInterval))
 
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
@@ -1278,6 +1316,32 @@ var _ = Describe("ConvexInstance Controller", func() {
 			routeCond := meta.FindStatusCondition(updated.Status.Conditions, "HTTPRouteReady")
 			Expect(routeCond).NotTo(BeNil())
 			Expect(routeCond.Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("should keep a slow ListenerSet poll when the manager started without the watch", func() {
+			instance := &convexv1alpha1.ConvexInstance{
+				Spec: convexv1alpha1.ConvexInstanceSpec{
+					Networking: convexv1alpha1.NetworkingSpec{
+						ListenerSet: &convexv1alpha1.ListenerSetSpec{
+							ParentGateway: convexv1alpha1.ParentGatewayRef{Name: "shared-gateway"},
+						},
+					},
+				},
+			}
+			status := upgradeStatus{phase: phaseReady}
+			coreRes := reconcileOutcome{
+				backendReady:            true,
+				dashboardReady:          true,
+				gatewayReady:            true,
+				routeReady:              true,
+				listenerSetWatchMissing: true,
+				nextRestartIn:           defaultRestartInterval,
+			}
+
+			Expect(reconcileRequeueAfter(instance, coreRes, status)).To(Equal(listenerSetReadyRequeue))
+
+			coreRes.listenerSetWatchMissing = false
+			Expect(reconcileRequeueAfter(instance, coreRes, status)).To(Equal(defaultRestartInterval))
 		})
 
 		It("should ignore HTTPRoute Accepted status for a non-matching parent", func() {
@@ -1329,7 +1393,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(routeAccepted(route)).NotTo(BeNil())
 		})
 
-		It("should keep legacy Gateway Ready fallback when Programmed is not ready", func() {
+		It("should require Gateway Accepted with Programmed or legacy Ready", func() {
 			gw := &gatewayv1.Gateway{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       "test-resource-gateway",
@@ -1338,6 +1402,13 @@ var _ = Describe("ConvexInstance Controller", func() {
 				},
 				Status: gatewayv1.GatewayStatus{
 					Conditions: []metav1.Condition{
+						{
+							Type:               string(gatewayv1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							Reason:             string(gatewayv1.GatewayReasonAccepted),
+							LastTransitionTime: metav1.Now(),
+							ObservedGeneration: 4,
+						},
 						{
 							Type:               string(gatewayv1.GatewayConditionProgrammed),
 							Status:             metav1.ConditionFalse,
@@ -1358,11 +1429,20 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			Expect(gatewayIsReady(gw)).To(BeTrue())
 
-			gw.Status.Conditions[1].ObservedGeneration = 3
+			gw.Status.Conditions[1].Status = metav1.ConditionTrue
+			gw.Status.Conditions[2].Status = metav1.ConditionFalse
+			Expect(gatewayIsReady(gw)).To(BeTrue())
+
+			gw.Status.Conditions[0].Status = metav1.ConditionFalse
 			Expect(gatewayIsReady(gw)).To(BeFalse())
 
 			gw.Status.Conditions[0].Status = metav1.ConditionTrue
+			gw.Status.Conditions[2].Status = metav1.ConditionTrue
+			gw.Status.Conditions[2].ObservedGeneration = 3
 			Expect(gatewayIsReady(gw)).To(BeTrue())
+
+			gw.Status.Conditions[1].ObservedGeneration = 3
+			Expect(gatewayIsReady(gw)).To(BeFalse())
 		})
 
 		It("should not become Ready when the ListenerSet listener entry is conflicted", func() {
@@ -1533,7 +1613,7 @@ var _ = Describe("ConvexInstance Controller", func() {
 
 			result, err := rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(listenerSetReadyRequeue))
+			Expect(result.RequeueAfter).To(Equal(5 * time.Second))
 
 			updated := &convexv1alpha1.ConvexInstance{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
@@ -1550,6 +1630,12 @@ var _ = Describe("ConvexInstance Controller", func() {
 			route = &gatewayv1.HTTPRoute{}
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-route", Namespace: "default"}, route)
 			Expect(errors.IsNotFound(err)).To(BeTrue())
+
+			makeBackendReady()
+			makeDashboardReady()
+			result, err = rec.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(listenerSetReadyRequeue))
 		})
 
 		It("should delete a ListenerSet-parented HTTPRoute when the ListenerSet CRD disappears", func() {
@@ -2948,13 +3034,22 @@ var _ = Describe("envtest lifecycle suites", func() {
 	makeGatewayReady := func(name string) {
 		gw := &gatewayv1.Gateway{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: fmt.Sprintf("%s-gateway", name), Namespace: "default"}, gw)).To(Succeed())
-		gw.Status.Conditions = []metav1.Condition{{
-			Type:               string(gatewayv1.GatewayConditionProgrammed),
-			Status:             metav1.ConditionTrue,
-			Reason:             string(gatewayv1.GatewayReasonProgrammed),
-			LastTransitionTime: metav1.Now(),
-			ObservedGeneration: gw.GetGeneration(),
-		}}
+		gw.Status.Conditions = []metav1.Condition{
+			{
+				Type:               string(gatewayv1.GatewayConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				Reason:             string(gatewayv1.GatewayReasonAccepted),
+				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: gw.GetGeneration(),
+			},
+			{
+				Type:               string(gatewayv1.GatewayConditionProgrammed),
+				Status:             metav1.ConditionTrue,
+				Reason:             string(gatewayv1.GatewayReasonProgrammed),
+				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: gw.GetGeneration(),
+			},
+		}
 		Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
 	}
 	makeRouteAccepted := func(name string) {
