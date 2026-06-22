@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -67,6 +68,8 @@ const (
 	defaultBackendPort       = 3210
 	actionPortName           = "http-action"
 	actionPort               = 3211
+	defaultListenerName      = "convex"
+	listenerSetReadyRequeue  = 5 * time.Minute
 	defaultDashboardPortName = "http"
 	defaultDashboardPort     = 6791
 	configMapKey             = "convex.conf"
@@ -85,6 +88,7 @@ const (
 	conditionImport          = "ImportCompleted"
 	conditionRollingUpdate   = "RollingUpdate"
 	conditionBackendReady    = "BackendReady"
+	reasonWaitingForGateway  = "WaitingForGateway"
 	msgInstanceReady         = "Instance ready"
 	msgBackendReady          = "Backend ready"
 	phasePending             = "Pending"
@@ -118,6 +122,9 @@ const (
 	obcBucketPortKey         = "BUCKET_PORT"
 	obcBucketRegionKey       = "BUCKET_REGION"
 	defaultOBCRegion         = "us-east-1"
+	listenerSetCRDMissing    = "ListenerSetCRDMissing"
+	listenerSetCRDMissingMsg = "spec.networking.listenerSet requires the Gateway API ListenerSet CRD (gateway.networking.k8s.io/v1, Gateway API 1.5+), which is not installed in this cluster"
+	legacyGatewayReady       = "Ready"
 )
 
 // ConvexInstanceReconciler reconciles a ConvexInstance object
@@ -125,6 +132,11 @@ type ConvexInstanceReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
+
+	// Set when the manager started before the ListenerSet CRD existed. In that
+	// case no ListenerSet watch is registered, so ListenerSet mode keeps a slow
+	// polling fallback after it has otherwise converged.
+	listenerSetWatchMissing bool
 }
 
 // +kubebuilder:rbac:groups=convex.icod.de,resources=convexinstances,verbs=get;list;watch;create;update;patch;delete
@@ -135,8 +147,8 @@ type ConvexInstanceReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status,verbs=get
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes;listenersets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status;listenersets/status,verbs=get
 
 // Reconcile moves the cluster state toward the desired ConvexInstance state.
 //
@@ -149,8 +161,6 @@ type ConvexInstanceReconciler struct {
 // 6. Execute the upgrade plan (rolling update or export/import orchestration).
 // 7. Update status conditions and phase.
 func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	instance := &convexv1alpha1.ConvexInstance{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -161,42 +171,15 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// Capture current backend/dashboard state to drive upgrade decisions.
-	var existingBackend appsv1.StatefulSet
-	backendExists := false
-	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, &existingBackend); err == nil {
-		backendExists = true
-	} else if !errors.IsNotFound(err) {
+	current, err := r.observeCurrentWorkloads(ctx, instance)
+	if err != nil {
 		return ctrl.Result{}, err
-	}
-
-	var existingDashboard appsv1.Deployment
-	dashboardExists := false
-	if err := r.Get(ctx, client.ObjectKey{Name: dashboardDeploymentName(instance), Namespace: instance.Namespace}, &existingDashboard); err == nil {
-		dashboardExists = true
-	} else if !errors.IsNotFound(err) {
-		return ctrl.Result{}, err
-	}
-
-	currentBackendImage := ""
-	currentBackendEnv := []corev1.EnvVar{}
-	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
-		currentBackendImage = existingBackend.Spec.Template.Spec.Containers[0].Image
-	}
-	currentDashboardImage := ""
-	if dashboardExists && len(existingDashboard.Spec.Template.Spec.Containers) > 0 {
-		currentDashboardImage = existingDashboard.Spec.Template.Spec.Containers[0].Image
-	}
-	currentBackendVersion := ""
-	if backendExists && len(existingBackend.Spec.Template.Spec.Containers) > 0 {
-		currentBackendVersion = backendVersionFromStatefulSet(&existingBackend)
-		currentBackendEnv = deduplicateEnvs(existingBackend.Spec.Template.Spec.Containers[0].Env)
 	}
 
 	extVersions, err := r.validateExternalRefs(ctx, instance)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "ValidationFailed", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
+		return ctrl.Result{}, r.updateErrorStatus(ctx, instance, "ValidationFailed", err, conditionFalse(conditionSecrets, "ValidationFailed", err.Error()))
 	}
 
 	desiredEnv := backendEnvWithS3(instance, instance.Spec.Version, generatedSecretName(instance), extVersions.s3Resolved)
@@ -205,12 +188,12 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// buildUpgradePlan determines if an upgrade is needed and tracks the state of export/import jobs.
 	// It calculates the effective images/versions to use for the core resources (e.g. keeping old version during export).
-	plan := buildUpgradePlan(instance, backendExists, currentBackendImage, currentDashboardImage, currentBackendVersion, currentBackendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
+	plan := buildUpgradePlan(instance, current.backendExists, current.backendImage, current.dashboardImage, current.backendVersion, current.backendEnv, exportSucceeded, importSucceeded, exportFailed, importFailed, desiredHash)
 
 	coreRes, resErr := r.reconcileCoreResources(ctx, instance, plan, extVersions)
 	if resErr != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, resErr.reason, resErr.err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, resErr.reason, resErr.err, resErr.cond)
+		return ctrl.Result{}, r.updateErrorStatus(ctx, instance, resErr.reason, resErr.err, resErr.cond)
 	}
 
 	// handleUpgrade executes the state transitions for upgrades (e.g. launching export jobs, blocking rollouts).
@@ -218,37 +201,17 @@ func (r *ConvexInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	status, err := r.handleUpgrade(ctx, instance, plan, coreRes.backendReady, coreRes.dashboardReady, coreRes.gatewayReady, coreRes.routeReady, coreRes.serviceName, coreRes.secretName, coreRes.conds)
 	if err != nil {
 		r.recordEvent(instance, corev1.EventTypeWarning, "UpgradeError", err.Error())
-		return ctrl.Result{}, r.updateStatusPhase(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
+		return ctrl.Result{}, r.updateErrorStatus(ctx, instance, "UpgradeError", err, conditionFalse(conditionUpgrade, "UpgradeError", err.Error()))
 	}
 
-	readyEvent := status.phase == phaseReady && oldPhase != phaseReady
-	if err := r.updateStatus(ctx, instance, status.phase, status.reason, coreRes.serviceName, status.message, coreRes.gatewayReady && coreRes.routeReady, status.appliedHash, status.conditions...); err != nil {
-		if errors.IsConflict(err) {
-			log.V(1).Info("status conflict, will retry", "name", req.NamespacedName)
-			return ctrl.Result{Requeue: true}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	if readyEvent {
-		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
-	}
-
-	requeueAfter := time.Duration(0)
-	if status.phase != phaseReady || (!coreRes.dashboardReady && instance.Spec.Dashboard.Enabled) || !coreRes.gatewayReady || !coreRes.routeReady {
-		requeueAfter = 5 * time.Second
-	}
-	if coreRes.nextRestartIn > 0 {
-		if requeueAfter == 0 || coreRes.nextRestartIn < requeueAfter {
-			requeueAfter = coreRes.nextRestartIn
-		}
-	}
-
-	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	return r.finishReconcile(ctx, req, instance, oldPhase, coreRes, status)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	listenerSetSupported := listenerSetCRDInstalled(mgr.GetRESTMapper())
+	r.listenerSetWatchMissing = !listenerSetSupported
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&convexv1alpha1.ConvexInstance{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
@@ -258,7 +221,13 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&batchv1.Job{}).
 		Owns(&gatewayv1.Gateway{}).
-		Owns(&gatewayv1.HTTPRoute{}).
+		Owns(&gatewayv1.HTTPRoute{})
+	// ListenerSet is an opt-in, Gateway API 1.5+ resource. Only watch it when its CRD is installed so
+	// the manager still starts on clusters that only have the 1.3/1.4 standard Gateway API CRDs.
+	if listenerSetSupported {
+		builder = builder.Owns(&gatewayv1.ListenerSet{})
+	}
+	return builder.
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 			secret, ok := obj.(*corev1.Secret)
 			if !ok {
@@ -323,6 +292,18 @@ func (r *ConvexInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+// listenerSetCRDInstalled reports whether the standard Gateway API ListenerSet CRD
+// (gateway.networking.k8s.io/v1) is registered in the cluster. ListenerSet support requires
+// Gateway API 1.5+; on clusters that only ship the 1.3/1.4 standard CRDs the operator must not
+// watch or reconcile the (absent) type.
+func listenerSetCRDInstalled(mapper meta.RESTMapper) bool {
+	if mapper == nil {
+		return false
+	}
+	_, err := mapper.RESTMapping(schema.GroupKind{Group: gatewayv1.GroupName, Kind: "ListenerSet"}, gatewayv1.GroupVersion.Version)
+	return err == nil
+}
+
 type externalSecretVersions struct {
 	dbResourceVersion  string
 	s3ResourceVersion  string
@@ -330,6 +311,14 @@ type externalSecretVersions struct {
 	envSecretVersions  map[string]string
 	envConfigVersions  map[string]string
 	s3Resolved         convexv1alpha1.BackendS3Spec
+}
+
+type observedWorkloads struct {
+	backendExists  bool
+	backendImage   string
+	backendVersion string
+	backendEnv     []corev1.EnvVar
+	dashboardImage string
 }
 
 type envRef struct {
@@ -655,16 +644,18 @@ type upgradeStatus struct {
 }
 
 type reconcileOutcome struct {
-	serviceName          string
-	dashboardServiceName string
-	dashboardReady       bool
-	gatewayReady         bool
-	routeReady           bool
-	backendReady         bool
-	secretName           string
-	secretRV             string
-	conds                []metav1.Condition
-	nextRestartIn        time.Duration
+	serviceName             string
+	dashboardServiceName    string
+	dashboardReady          bool
+	gatewayReady            bool
+	routeReady              bool
+	backendReady            bool
+	listenerSetCRDMissing   bool
+	listenerSetWatchMissing bool
+	secretName              string
+	secretRV                string
+	conds                   []metav1.Condition
+	nextRestartIn           time.Duration
 }
 
 type resourceErr struct {
@@ -718,6 +709,106 @@ func (r *ConvexInstanceReconciler) ensureFinalizer(ctx context.Context, instance
 		return true, err
 	}
 	return true, nil
+}
+
+func (r *ConvexInstanceReconciler) observeCurrentWorkloads(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (observedWorkloads, error) {
+	current := observedWorkloads{}
+
+	var backend appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKey{Name: backendStatefulSetName(instance), Namespace: instance.Namespace}, &backend); err == nil {
+		current.backendExists = true
+		if len(backend.Spec.Template.Spec.Containers) > 0 {
+			backendContainer := backend.Spec.Template.Spec.Containers[0]
+			current.backendImage = backendContainer.Image
+			current.backendVersion = backendVersionFromStatefulSet(&backend)
+			current.backendEnv = deduplicateEnvs(backendContainer.Env)
+		}
+	} else if !errors.IsNotFound(err) {
+		return current, err
+	}
+
+	var dashboard appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Name: dashboardDeploymentName(instance), Namespace: instance.Namespace}, &dashboard); err == nil {
+		if len(dashboard.Spec.Template.Spec.Containers) > 0 {
+			current.dashboardImage = dashboard.Spec.Template.Spec.Containers[0].Image
+		}
+	} else if !errors.IsNotFound(err) {
+		return current, err
+	}
+
+	return current, nil
+}
+
+func (r *ConvexInstanceReconciler) updateErrorStatus(ctx context.Context, instance *convexv1alpha1.ConvexInstance, reason string, originalErr error, conds ...metav1.Condition) error {
+	message := ""
+	if originalErr != nil {
+		message = originalErr.Error()
+	}
+	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), message, false, instance.Status.UpgradeHash, conds...); err != nil {
+		return err
+	}
+	r.recordParentRefsIgnored(instance)
+	return originalErr
+}
+
+func (r *ConvexInstanceReconciler) finishReconcile(ctx context.Context, req ctrl.Request, instance *convexv1alpha1.ConvexInstance, oldPhase string, coreRes reconcileOutcome, status upgradeStatus) (ctrl.Result, error) {
+	if err := r.updateStatus(ctx, instance, status.phase, status.reason, coreRes.serviceName, status.message, coreRes.gatewayReady && coreRes.routeReady, status.appliedHash, status.conditions...); err != nil {
+		if errors.IsConflict(err) {
+			logf.FromContext(ctx).V(1).Info("status conflict, will retry", "name", req.NamespacedName)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	r.recordParentRefsIgnored(instance)
+	if status.phase == phaseReady && oldPhase != phaseReady {
+		r.recordEvent(instance, corev1.EventTypeNormal, conditionReady, "Backend is ready")
+	}
+
+	return ctrl.Result{RequeueAfter: reconcileRequeueAfter(instance, coreRes, status)}, nil
+}
+
+func reconcileRequeueAfter(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, status upgradeStatus) time.Duration {
+	requeueAfter := time.Duration(0)
+	if reconcileNeedsProgressRequeue(instance, coreRes, status) {
+		requeueAfter = 5 * time.Second
+	}
+	requeueAfter = minPositiveDuration(requeueAfter, coreRes.nextRestartIn)
+	return listenerSetRequeueAfter(coreRes, requeueAfter)
+}
+
+func reconcileNeedsProgressRequeue(instance *convexv1alpha1.ConvexInstance, coreRes reconcileOutcome, status upgradeStatus) bool {
+	if !coreRes.backendReady {
+		return true
+	}
+	if instance.Spec.Dashboard.Enabled && !coreRes.dashboardReady {
+		return true
+	}
+	if coreRes.listenerSetCRDMissing {
+		// Active export/import jobs still need the fast progress poll; otherwise
+		// a missing ListenerSet CRD is a static cluster condition and can back off.
+		return status.phase == phaseUpgrading && status.reason != reasonWaitingForGateway
+	}
+	if status.phase == phaseUpgrading {
+		return true
+	}
+	return status.phase != phaseReady || !coreRes.gatewayReady || !coreRes.routeReady
+}
+
+func minPositiveDuration(current, candidate time.Duration) time.Duration {
+	if candidate <= 0 {
+		return current
+	}
+	if current == 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
+func listenerSetRequeueAfter(coreRes reconcileOutcome, requeueAfter time.Duration) time.Duration {
+	if coreRes.listenerSetCRDMissing || coreRes.listenerSetWatchMissing {
+		return minPositiveDuration(requeueAfter, listenerSetReadyRequeue)
+	}
+	return requeueAfter
 }
 
 func (r *ConvexInstanceReconciler) validateExternalRefs(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (externalSecretVersions, error) {
@@ -2127,6 +2218,22 @@ func (r *ConvexInstanceReconciler) cleanupUpgradeArtifacts(ctx context.Context, 
 	}
 }
 
+// ownedByInstance reports whether obj is controller-owned by this instance, matching either the
+// live UID or a previous instance of the same name (so resources left behind by a recreated
+// instance are still recognized as ours).
+func ownedByInstance(obj metav1.Object, instance *convexv1alpha1.ConvexInstance) bool {
+	owner := metav1.GetControllerOf(obj)
+	return isOurControllerRef(owner, instance)
+}
+
+func isOurControllerRef(owner *metav1.OwnerReference, instance *convexv1alpha1.ConvexInstance) bool {
+	if owner == nil {
+		return false
+	}
+	return owner.UID == instance.UID ||
+		(owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name)
+}
+
 func (r *ConvexInstanceReconciler) deleteManagedGateway(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
 	gw := &gatewayv1.Gateway{}
 	key := client.ObjectKey{Name: gatewayName(instance), Namespace: instance.Namespace}
@@ -2136,10 +2243,8 @@ func (r *ConvexInstanceReconciler) deleteManagedGateway(ctx context.Context, ins
 		}
 		return err
 	}
-	if owner := metav1.GetControllerOf(gw); owner != nil {
-		if owner.UID == instance.UID || (owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name) {
-			return r.Delete(ctx, gw)
-		}
+	if ownedByInstance(gw, instance) {
+		return r.Delete(ctx, gw)
 	}
 	return nil
 }
@@ -2192,9 +2297,149 @@ func (r *ConvexInstanceReconciler) reconcileGateway(ctx context.Context, instanc
 	return false, conditionFalse(conditionGateway, "Provisioning", "Waiting for Gateway readiness"), nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string) (bool, metav1.Condition, error) {
+func listenerSetName(instance *convexv1alpha1.ConvexInstance) string {
+	return fmt.Sprintf("%s-listeners", instance.Name)
+}
+
+// listenerSetParentGatewayRef builds the reference to the shared Gateway the ListenerSet attaches to.
+func listenerSetParentGatewayRef(instance *convexv1alpha1.ConvexInstance) gatewayv1.ParentGatewayReference {
+	parent := instance.Spec.Networking.ListenerSet.ParentGateway
+	namespace := parent.Namespace
+	if namespace == "" {
+		namespace = instance.Namespace
+	}
+	return gatewayv1.ParentGatewayReference{
+		Group:     ptr.To(gatewayv1.Group(gatewayv1.GroupName)),
+		Kind:      ptr.To(gatewayv1.Kind("Gateway")),
+		Name:      gatewayv1.ObjectName(parent.Name),
+		Namespace: ptr.To(gatewayv1.Namespace(namespace)),
+	}
+}
+
+func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, metav1.Condition, error) {
+	ls := &gatewayv1.ListenerSet{}
+	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
+
+	err := r.Get(ctx, key, ls)
+	if meta.IsNoMatchError(err) {
+		return false, listenerSetCRDMissingCondition(), nil
+	}
+	spec := gatewayv1.ListenerSetSpec{
+		ParentRef: listenerSetParentGatewayRef(instance),
+		Listeners: listenerEntries(instance),
+	}
+	if errors.IsNotFound(err) {
+		ls = &gatewayv1.ListenerSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      listenerSetName(instance),
+				Namespace: instance.Namespace,
+			},
+			Spec: spec,
+		}
+		if err := controllerutil.SetControllerReference(instance, ls, r.Scheme); err != nil {
+			return false, metav1.Condition{}, err
+		}
+		if err := r.Create(ctx, ls); err != nil {
+			if meta.IsNoMatchError(err) {
+				return false, listenerSetCRDMissingCondition(), nil
+			}
+			return false, metav1.Condition{}, err
+		}
+		return false, conditionFalse(conditionGateway, "Provisioning", "ListenerSet created"), nil
+	}
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+
+	ownerChanged, err := ensureOwner(instance, ls, r.Scheme)
+	if err != nil {
+		return false, metav1.Condition{}, err
+	}
+	if ownerChanged || !listenerSetSpecEqual(ls.Spec, spec) {
+		ls.Spec = spec
+		if err := r.Update(ctx, ls); err != nil {
+			if meta.IsNoMatchError(err) {
+				return false, listenerSetCRDMissingCondition(), nil
+			}
+			return false, metav1.Condition{}, err
+		}
+	}
+
+	if listenerSetReady(ls) {
+		return true, conditionTrue(conditionGateway, "Ready", "ListenerSet ready"), nil
+	}
+	return false, conditionFalse(conditionGateway, "Provisioning", "Waiting for ListenerSet readiness"), nil
+}
+
+func listenerSetReady(ls *gatewayv1.ListenerSet) bool {
+	// ListenerSet Accepted conditions do not require observedGeneration in
+	// Gateway API v1.5. Programmed is the generation-gated readiness signal.
+	if !conditionStatusTrue(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted)) ||
+		!conditionTrueForGeneration(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionProgrammed), ls.Generation) {
+		return false
+	}
+	for _, listener := range ls.Spec.Listeners {
+		status := listenerEntryStatus(ls, listener.Name)
+		if status == nil ||
+			!conditionStatusTrue(status.Conditions, string(gatewayv1.ListenerEntryConditionAccepted)) ||
+			!conditionTrueForGeneration(status.Conditions, string(gatewayv1.ListenerEntryConditionProgrammed), ls.Generation) ||
+			conditionStatusTrue(status.Conditions, string(gatewayv1.ListenerEntryConditionConflicted)) {
+			return false
+		}
+	}
+	return true
+}
+
+func listenerEntryStatus(ls *gatewayv1.ListenerSet, name gatewayv1.SectionName) *gatewayv1.ListenerEntryStatus {
+	for i := range ls.Status.Listeners {
+		if ls.Status.Listeners[i].Name == name {
+			return &ls.Status.Listeners[i]
+		}
+	}
+	return nil
+}
+
+// deleteManagedListenerSet removes an operator-managed ListenerSet, used when an instance switches
+// away from ListenerSet mode. It is a no-op when the ListenerSet (or its CRD) is absent.
+func (r *ConvexInstanceReconciler) deleteManagedListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	ls := &gatewayv1.ListenerSet{}
+	key := client.ObjectKey{Name: listenerSetName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, ls); err != nil {
+		if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
+	if ownedByInstance(ls, instance) {
+		return r.Delete(ctx, ls)
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) deleteHTTPRouteIfListenerSetParented(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
+	route, err := r.fetchHTTPRoute(ctx, instance)
+	if err != nil {
+		return err
+	}
+	if route != nil && ownedByInstance(route, instance) && httpRouteReferencesListenerSet(route) {
+		return r.Delete(ctx, route)
+	}
+	return nil
+}
+
+func (r *ConvexInstanceReconciler) fetchHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (*gatewayv1.HTTPRoute, error) {
 	route := &gatewayv1.HTTPRoute{}
 	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
+	if err := r.Get(ctx, key, route); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return route, nil
+}
+
+func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string, route *gatewayv1.HTTPRoute) (bool, metav1.Condition, error) {
 	spec := gatewayv1.HTTPRouteSpec{
 		CommonRouteSpec: gatewayv1.CommonRouteSpec{
 			ParentRefs: routeParentRefs(instance),
@@ -2203,8 +2448,7 @@ func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, insta
 		Rules:     httpRouteRules(instance, backendServiceName, dashboardServiceName),
 	}
 
-	err := r.Get(ctx, key, route)
-	if errors.IsNotFound(err) {
+	if route == nil {
 		route = &gatewayv1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      httpRouteName(instance),
@@ -2219,9 +2463,6 @@ func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, insta
 			return false, metav1.Condition{}, err
 		}
 		return false, conditionFalse(conditionHTTPRoute, "Provisioning", "HTTPRoute created"), nil
-	}
-	if err != nil {
-		return false, metav1.Condition{}, err
 	}
 
 	ownerChanged, err := ensureOwner(instance, route, r.Scheme)
@@ -2296,7 +2537,20 @@ func useCustomParentRefs(instance *convexv1alpha1.ConvexInstance) bool {
 	return len(instance.Spec.Networking.ParentRefs) > 0
 }
 
+func useListenerSet(instance *convexv1alpha1.ConvexInstance) bool {
+	return instance.Spec.Networking.ListenerSet != nil
+}
+
 func routeParentRefs(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ParentReference {
+	if useListenerSet(instance) {
+		// Attach the route to the operator-managed ListenerSet so it rides on the shared Gateway.
+		return []gatewayv1.ParentReference{{
+			Group:     ptr.To(gatewayv1.Group(gatewayv1.GroupName)),
+			Kind:      ptr.To(gatewayv1.Kind("ListenerSet")),
+			Name:      gatewayv1.ObjectName(listenerSetName(instance)),
+			Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+		}}
+	}
 	if !useCustomParentRefs(instance) {
 		return []gatewayv1.ParentReference{{
 			Name:      gatewayv1.ObjectName(gatewayName(instance)),
@@ -2321,7 +2575,21 @@ func routeParentRefs(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Parent
 	return refs
 }
 
-func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
+type listenerConfig struct {
+	name          gatewayv1.SectionName
+	protocol      gatewayv1.ProtocolType
+	port          gatewayv1.PortNumber
+	hostname      gatewayv1.Hostname
+	tls           *gatewayv1.ListenerTLSConfig
+	allowedRoutes *gatewayv1.AllowedRoutes
+}
+
+// desiredListenerConfig returns the shared listener configuration used by Gateway
+// listeners and ListenerSet entries. The caller supplies the name because managed
+// Gateways keep their historical http/https names while ListenerSets use a stable name.
+// Managed Gateways also keep TLS mode implicit to avoid rewriting existing specs;
+// ListenerSets pass explicit Terminate because this feature creates those resources.
+func desiredListenerConfig(instance *convexv1alpha1.ConvexInstance, name gatewayv1.SectionName, tlsMode *gatewayv1.TLSModeType) listenerConfig {
 	hostname := gatewayv1.Hostname(instance.Spec.Networking.Host)
 	allowedRoutes := &gatewayv1.AllowedRoutes{
 		Namespaces: &gatewayv1.RouteNamespaces{
@@ -2329,27 +2597,62 @@ func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Liste
 		},
 	}
 	if instance.Spec.Networking.TLSSecretRef != "" {
-		return []gatewayv1.Listener{{
-			Name:     "https",
-			Protocol: gatewayv1.HTTPSProtocolType,
-			Port:     gatewayv1.PortNumber(443),
-			Hostname: ptr.To(hostname),
-			TLS: &gatewayv1.ListenerTLSConfig{
-				CertificateRefs: []gatewayv1.SecretObjectReference{{
-					Kind:      ptr.To(gatewayv1.Kind("Secret")),
-					Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
-					Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
-				}},
-			},
-			AllowedRoutes: allowedRoutes,
-		}}
+		tls := &gatewayv1.ListenerTLSConfig{
+			Mode: tlsMode,
+			CertificateRefs: []gatewayv1.SecretObjectReference{{
+				Kind:      ptr.To(gatewayv1.Kind("Secret")),
+				Name:      gatewayv1.ObjectName(instance.Spec.Networking.TLSSecretRef),
+				Namespace: ptr.To(gatewayv1.Namespace(instance.Namespace)),
+			}},
+		}
+		return listenerConfig{
+			name:          name,
+			protocol:      gatewayv1.HTTPSProtocolType,
+			port:          gatewayv1.PortNumber(443),
+			hostname:      hostname,
+			tls:           tls,
+			allowedRoutes: allowedRoutes,
+		}
 	}
+	return listenerConfig{
+		name:          name,
+		protocol:      gatewayv1.HTTPProtocolType,
+		port:          gatewayv1.PortNumber(80),
+		hostname:      hostname,
+		allowedRoutes: allowedRoutes,
+	}
+}
+
+func gatewayListeners(instance *convexv1alpha1.ConvexInstance) []gatewayv1.Listener {
+	listener := desiredListenerConfig(instance, gatewayListenerName(instance), nil)
 	return []gatewayv1.Listener{{
-		Name:          "http",
-		Protocol:      gatewayv1.HTTPProtocolType,
-		Port:          gatewayv1.PortNumber(80),
-		Hostname:      ptr.To(hostname),
-		AllowedRoutes: allowedRoutes,
+		Name:          listener.name,
+		Protocol:      listener.protocol,
+		Port:          listener.port,
+		Hostname:      ptr.To(listener.hostname),
+		TLS:           listener.tls,
+		AllowedRoutes: listener.allowedRoutes,
+	}}
+}
+
+func gatewayListenerName(instance *convexv1alpha1.ConvexInstance) gatewayv1.SectionName {
+	if instance.Spec.Networking.TLSSecretRef != "" {
+		return gatewayv1.SectionName("https")
+	}
+	return gatewayv1.SectionName("http")
+}
+
+// listenerEntries mirrors gatewayListeners but returns ListenerSet listener entries for the same
+// listener, used when attaching the instance's listener to a shared Gateway via a ListenerSet.
+func listenerEntries(instance *convexv1alpha1.ConvexInstance) []gatewayv1.ListenerEntry {
+	listener := desiredListenerConfig(instance, gatewayv1.SectionName(defaultListenerName), ptr.To(gatewayv1.TLSModeTerminate))
+	return []gatewayv1.ListenerEntry{{
+		Name:          listener.name,
+		Protocol:      listener.protocol,
+		Port:          listener.port,
+		Hostname:      ptr.To(listener.hostname),
+		TLS:           listener.tls,
+		AllowedRoutes: listener.allowedRoutes,
 	}}
 }
 
@@ -2431,20 +2734,82 @@ func httpRouteRules(instance *convexv1alpha1.ConvexInstance, backendServiceName,
 }
 
 func gatewayIsReady(gw *gatewayv1.Gateway) bool {
-	readyCond := meta.FindStatusCondition(gw.Status.Conditions, string(gatewayv1.GatewayConditionReady))
-	return readyCond != nil &&
-		readyCond.Status == metav1.ConditionTrue &&
-		readyCond.ObservedGeneration >= gw.Generation
+	return conditionTrueForGeneration(gw.Status.Conditions, legacyGatewayReady, gw.Generation) ||
+		(conditionTrueForGeneration(gw.Status.Conditions, string(gatewayv1.GatewayConditionAccepted), gw.Generation) &&
+			conditionTrueForGeneration(gw.Status.Conditions, string(gatewayv1.GatewayConditionProgrammed), gw.Generation))
 }
 
 func routeAccepted(route *gatewayv1.HTTPRoute) *metav1.Condition {
+	var firstCurrent *metav1.Condition
 	for _, parent := range route.Status.Parents {
+		if !routeParentStatusMatchesSpec(route, parent.ParentRef) {
+			continue
+		}
 		cond := meta.FindStatusCondition(parent.Conditions, string(gatewayv1.RouteConditionAccepted))
 		if cond != nil && cond.ObservedGeneration >= route.Generation {
-			return cond
+			if cond.Status == metav1.ConditionTrue {
+				return cond
+			}
+			if firstCurrent == nil {
+				firstCurrent = cond
+			}
 		}
 	}
-	return nil
+	return firstCurrent
+}
+
+func routeParentStatusMatchesSpec(route *gatewayv1.HTTPRoute, statusRef gatewayv1.ParentReference) bool {
+	for _, specRef := range route.Spec.ParentRefs {
+		if parentReferenceMatchesSpec(statusRef, specRef, route.Namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+func httpRouteReferencesListenerSet(route *gatewayv1.HTTPRoute) bool {
+	for _, ref := range route.Spec.ParentRefs {
+		if parentReferenceGroup(ref) == gatewayv1.GroupName && parentReferenceKind(ref) == "ListenerSet" {
+			return true
+		}
+	}
+	return false
+}
+
+func parentReferenceMatchesSpec(statusRef, specRef gatewayv1.ParentReference, defaultNamespace string) bool {
+	return parentReferenceGroup(statusRef) == parentReferenceGroup(specRef) &&
+		parentReferenceKind(statusRef) == parentReferenceKind(specRef) &&
+		parentReferenceNamespace(statusRef, defaultNamespace) == parentReferenceNamespace(specRef, defaultNamespace) &&
+		statusRef.Name == specRef.Name &&
+		parentReferenceSectionNameMatchesSpec(statusRef, specRef)
+}
+
+func parentReferenceGroup(ref gatewayv1.ParentReference) string {
+	if ref.Group == nil {
+		return gatewayv1.GroupName
+	}
+	return string(*ref.Group)
+}
+
+func parentReferenceKind(ref gatewayv1.ParentReference) string {
+	if ref.Kind == nil {
+		return "Gateway"
+	}
+	return string(*ref.Kind)
+}
+
+func parentReferenceNamespace(ref gatewayv1.ParentReference, defaultNamespace string) string {
+	if ref.Namespace == nil {
+		return defaultNamespace
+	}
+	return string(*ref.Namespace)
+}
+
+func parentReferenceSectionNameMatchesSpec(statusRef, specRef gatewayv1.ParentReference) bool {
+	if specRef.SectionName == nil {
+		return true
+	}
+	return statusRef.SectionName != nil && *statusRef.SectionName == *specRef.SectionName
 }
 
 func desiredUpgradeHash(instance *convexv1alpha1.ConvexInstance, env []corev1.EnvVar) string {
@@ -2489,6 +2854,10 @@ func conditionTrueForGeneration(conditions []metav1.Condition, condType string, 
 	return cond.Status == metav1.ConditionTrue && cond.ObservedGeneration >= generation
 }
 
+func conditionStatusTrue(conditions []metav1.Condition, condType string) bool {
+	return conditionTrueForGeneration(conditions, condType, 0)
+}
+
 func upgradePVCName(instance *convexv1alpha1.ConvexInstance) string {
 	return fmt.Sprintf("%s-%s", instance.Name, upgradePVCNameSuffix)
 }
@@ -2531,17 +2900,6 @@ func (r *ConvexInstanceReconciler) updateStatus(ctx context.Context, instance *c
 		ObservedGeneration: instance.GetGeneration(),
 	})
 	return r.Status().Update(ctx, current)
-}
-
-func (r *ConvexInstanceReconciler) updateStatusPhase(ctx context.Context, instance *convexv1alpha1.ConvexInstance, reason string, originalErr error, conds ...metav1.Condition) error {
-	msg := ""
-	if originalErr != nil {
-		msg = originalErr.Error()
-	}
-	if err := r.updateStatus(ctx, instance, phaseError, reason, backendServiceName(instance), msg, false, instance.Status.UpgradeHash, conds...); err != nil {
-		return err
-	}
-	return originalErr
 }
 
 func backendConfigMapName(instance *convexv1alpha1.ConvexInstance) string {
@@ -2664,7 +3022,7 @@ func ensureOwner(instance *convexv1alpha1.ConvexInstance, obj client.Object, sch
 		if owner.UID == instance.UID {
 			return false, nil
 		}
-		if owner.APIVersion == convexv1alpha1.GroupVersion.String() && owner.Kind == "ConvexInstance" && owner.Name == instance.Name {
+		if isOurControllerRef(owner, instance) {
 			// Adopt resources left behind by a previous instance with the same name.
 			var refs []metav1.OwnerReference
 			for _, ref := range obj.GetOwnerReferences() {
@@ -2701,6 +3059,24 @@ func deploymentSpecEqual(a, b appsv1.DeploymentSpec) bool {
 }
 
 func gatewaySpecEqual(a, b gatewayv1.GatewaySpec) bool {
+	aCopy := a.DeepCopy()
+	bCopy := b.DeepCopy()
+	normalizeGatewayTLSMode(aCopy)
+	normalizeGatewayTLSMode(bCopy)
+	return apiequality.Semantic.DeepEqual(*aCopy, *bCopy)
+}
+
+// Gateway API defaults nil listener TLS mode to Terminate. Treat them as equivalent
+// for managed Gateways so upgrading this operator does not churn pre-existing specs.
+func normalizeGatewayTLSMode(spec *gatewayv1.GatewaySpec) {
+	for i := range spec.Listeners {
+		if spec.Listeners[i].TLS != nil && spec.Listeners[i].TLS.Mode == nil {
+			spec.Listeners[i].TLS.Mode = ptr.To(gatewayv1.TLSModeTerminate)
+		}
+	}
+}
+
+func listenerSetSpecEqual(a, b gatewayv1.ListenerSetSpec) bool {
 	return apiequality.Semantic.DeepEqual(a, b)
 }
 
@@ -3092,12 +3468,34 @@ func (r *ConvexInstanceReconciler) recordEvent(instance *convexv1alpha1.ConvexIn
 	}
 }
 
+func (r *ConvexInstanceReconciler) recordParentRefsIgnored(instance *convexv1alpha1.ConvexInstance) {
+	if useListenerSet(instance) && useCustomParentRefs(instance) && instance.Status.ObservedGeneration < instance.Generation {
+		r.recordEvent(instance, corev1.EventTypeWarning, "ParentRefsIgnored", "spec.networking.listenerSet takes precedence over spec.networking.parentRefs; parentRefs are ignored")
+	}
+}
+
 func conditionTrue(condType, reason, message string) metav1.Condition {
 	return condition(condType, reason, message, metav1.ConditionTrue)
 }
 
 func conditionFalse(condType, reason, message string) metav1.Condition {
 	return condition(condType, reason, message, metav1.ConditionFalse)
+}
+
+func listenerSetCRDMissingCondition() metav1.Condition {
+	return conditionFalse(conditionGateway, listenerSetCRDMissing, listenerSetCRDMissingMsg)
+}
+
+func httpRouteListenerSetCRDMissingCondition() metav1.Condition {
+	return conditionFalse(conditionHTTPRoute, listenerSetCRDMissing, "HTTPRoute reconciliation is blocked until the Gateway API ListenerSet CRD is installed")
+}
+
+func gatewayErr(err error) *resourceErr {
+	return &resourceErr{
+		reason: "GatewayError",
+		cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
+		err:    err,
+	}
 }
 
 func condition(condType, reason, message string, status metav1.ConditionStatus) metav1.Condition {
@@ -3117,13 +3515,14 @@ func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dash
 		return "WaitingForDashboard", "Waiting for dashboard readiness"
 	}
 	if !gatewayReady || !routeReady {
-		return "WaitingForGateway", "Waiting for Gateway/HTTPRoute readiness"
+		return reasonWaitingForGateway, "Waiting for Gateway/HTTPRoute readiness"
 	}
 	return "BackendReady", "Backend ready"
 }
 
 func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
 	result := reconcileOutcome{conds: []metav1.Condition{}}
+	reconcileRoute := true
 
 	if err := r.reconcileConfigMap(ctx, instance, plan.effectiveVersion); err != nil {
 		return result, &resourceErr{
@@ -3202,39 +3601,91 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	}
 	result.nextRestartIn = nextRestartIn
 
-	if useCustomParentRefs(instance) {
-		if err := r.deleteManagedGateway(ctx, instance); err != nil {
-			return result, &resourceErr{
-				reason: "GatewayError",
-				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
-				err:    err,
+	var existingRoute *gatewayv1.HTTPRoute
+	routeFetched := false
+	switch {
+	case useListenerSet(instance):
+		result.listenerSetWatchMissing = r.listenerSetWatchMissing
+		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
+		if err != nil {
+			return result, gatewayErr(err)
+		}
+		result.gatewayReady = listenerSetReady
+		result.conds = append(result.conds, listenerSetCond)
+		if listenerSetCond.Reason == listenerSetCRDMissing {
+			result.listenerSetCRDMissing = true
+			reconcileRoute = false
+			result.conds = append(result.conds, httpRouteListenerSetCRDMissingCondition())
+			if err := r.deleteHTTPRouteIfListenerSetParented(ctx, instance); err != nil {
+				return result, gatewayErr(err)
 			}
+		} else if !listenerSetReady {
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return result, gatewayErr(err)
+			}
+			routeFetched = true
+			if existingRoute != nil && !httpRouteReferencesListenerSet(existingRoute) {
+				reconcileRoute = false
+				result.conds = append(result.conds, conditionFalse(conditionHTTPRoute, "WaitingForListenerSet", "Waiting for ListenerSet readiness before moving HTTPRoute"))
+			}
+		} else {
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return result, gatewayErr(err)
+			}
+			routeFetched = true
+			// Drop any Gateway left over from a previous mode only after the ListenerSet is ready
+			// and the managed HTTPRoute no longer points at that Gateway.
+			if existingRoute == nil || httpRouteReferencesListenerSet(existingRoute) {
+				if err := r.deleteManagedGateway(ctx, instance); err != nil {
+					return result, gatewayErr(err)
+				}
+			}
+		}
+	case useCustomParentRefs(instance):
+		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
+			return result, gatewayErr(err)
+		}
+		if err := r.deleteManagedGateway(ctx, instance); err != nil {
+			return result, gatewayErr(err)
 		}
 		result.gatewayReady = true
 		result.conds = append(result.conds, conditionTrue(conditionGateway, "Skipped", "Using provided parentRefs"))
-	} else {
+	default:
+		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
+			return result, gatewayErr(err)
+		}
 		gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
 		if err != nil {
-			return result, &resourceErr{
-				reason: "GatewayError",
-				cond:   conditionFalse(conditionGateway, "GatewayError", err.Error()),
-				err:    err,
-			}
+			return result, gatewayErr(err)
 		}
 		result.gatewayReady = gatewayReady
 		result.conds = append(result.conds, gatewayCond)
 	}
 
-	routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
-	if err != nil {
-		return result, &resourceErr{
-			reason: "HTTPRouteError",
-			cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
-			err:    err,
+	if reconcileRoute {
+		if !routeFetched {
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return result, &resourceErr{
+					reason: "HTTPRouteError",
+					cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+					err:    err,
+				}
+			}
 		}
+		routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName, existingRoute)
+		if err != nil {
+			return result, &resourceErr{
+				reason: "HTTPRouteError",
+				cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+				err:    err,
+			}
+		}
+		result.routeReady = routeReady
+		result.conds = append(result.conds, routeCond)
 	}
-	result.routeReady = routeReady
-	result.conds = append(result.conds, routeCond)
 
 	backendReady, backendCond, err := r.backendStatus(ctx, instance)
 	if err != nil {

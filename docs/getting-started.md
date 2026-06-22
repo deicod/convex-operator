@@ -16,7 +16,8 @@ The examples use the latest Convex backend/dashboard images (`version: latest`).
 - Kubernetes cluster and `kubectl` context pointing to it.
 - Go toolchain (for `make` targets) and Docker permissions if building your own operator image.
 - Gateway API installed with a `GatewayClass` the operator can reference (default: `nginx`).
-- The operator only uses GA `gateway.networking.k8s.io/v1` `Gateway` and `HTTPRoute` fields and is validated against both Gateway API `1.3.x` and `1.4.x` standard CRD bundles. If you are upgrading NGINX Gateway Fabric to `v2.4.2`, install Gateway API `v1.4.x` first.
+- The operator's `Gateway`/`HTTPRoute` modes only use GA `gateway.networking.k8s.io/v1` fields and are validated against the Gateway API `1.3.x`, `1.4.x`, and `1.5.x` standard CRD bundles. If you are upgrading NGINX Gateway Fabric to `v2.4.2`, install Gateway API `v1.4.x` first.
+- Optional (`ListenerSet` mode): to use `spec.networking.listenerSet`, install the Gateway API `1.5+` standard CRDs (which include `ListenerSet`) and an implementation that supports it (NGINX Gateway Fabric `2.6+`). Without the `ListenerSet` CRD, instances that set `listenerSet` report `GatewayReady=False` with reason `ListenerSetCRDMissing`.
 - Postgres reachable at `pg-rw.postgres.svc.cluster.local:5432` with credentials.
 - Optional: TLS Secret for your hosts if you want HTTPS. The operator creates a Gateway per `ConvexInstance` and, by default, annotates it with `cert-manager.io/cluster-issuer: letsencrypt-prod-rfc2136`; set `spec.networking.gatewayAnnotations` to override (or `{}` to disable) and point `spec.networking.tlsSecretRef` at the Secret name cert-manager should populate.
 
@@ -232,6 +233,47 @@ spec:
     - name: todo-prod-dashboard
       port: 6791
 ```
+
+### Sharing a Gateway with a ListenerSet
+
+Instead of one Gateway per instance, you can attach each instance's listener (hostname + TLS) to a single shared Gateway using a Gateway API `ListenerSet`. The operator creates and owns the `ListenerSet` and attaches the instance's HTTPRoute to it, so the shared Gateway is never patched. This requires Gateway API `1.5+` and NGINX Gateway Fabric `2.6+`.
+
+1. Provision the shared Gateway once and allow `ListenerSet` attachment from the Convex namespace via `allowedListeners` (use `from: Selector`/`Same`/`All` to scope it):
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared-gateway
+  namespace: nginx-gateway
+spec:
+  gatewayClassName: nginx
+  allowedListeners:
+    namespaces:
+      from: Selector
+      selector:
+        matchLabels:
+          kubernetes.io/metadata.name: convex
+  listeners:
+  - name: placeholder
+    protocol: HTTP
+    port: 80
+```
+
+2. Point the instance at the shared Gateway:
+
+```yaml
+spec:
+  networking:
+    host: todo.dev.convex.icod.de
+    tlsSecretRef: todo-dev-tls
+    listenerSet:
+      parentGateway:
+        name: shared-gateway
+        namespace: nginx-gateway
+```
+
+The operator creates a `ListenerSet` named `<instance>-listeners` in the instance namespace (carrying the host + TLS listener) attached to `shared-gateway`, and an HTTPRoute whose `parentRef` targets that `ListenerSet`. `GatewayReady` becomes `True` once the `ListenerSet` and its listener entry report `Accepted` and `Programmed` with no listener conflict. `listenerSet` takes precedence over `parentRefs`; clearing it makes the operator delete the `ListenerSet` and fall back to a managed Gateway.
 
 ## 5) Verify resources and status
 Check instances and conditions:

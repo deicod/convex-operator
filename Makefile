@@ -61,10 +61,10 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-GATEWAY_API_COMPAT_VERSIONS ?= v1.3.0 v1.4.1
+GATEWAY_API_COMPAT_VERSIONS ?= v1.3.0 v1.4.1 v1.5.1
 
 .PHONY: test-gateway-api-compat
-test-gateway-api-compat: manifests generate fmt vet setup-envtest ## Run tests against Gateway API 1.3.x and 1.4.x CRD bundles.
+test-gateway-api-compat: manifests generate fmt vet setup-envtest ## Run tests against Gateway API 1.3.x, 1.4.x, and 1.5.x CRD bundles.
 	@assets="$$( "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path )"; \
 	for version in $(GATEWAY_API_COMPAT_VERSIONS); do \
 		echo "Running tests with Gateway API CRDs $$version..."; \

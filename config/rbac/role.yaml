@@ -82,6 +82,7 @@ rules:
   resources:
   - gateways
   - httproutes
+  - listenersets
   verbs:
   - create
   - delete
@@ -95,5 +96,6 @@ rules:
   resources:
   - gateways/status
   - httproutes/status
+  - listenersets/status
   verbs:
   - get

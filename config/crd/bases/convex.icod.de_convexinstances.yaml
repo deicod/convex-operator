@@ -1435,6 +1435,33 @@ spec:
                       This host must resolve to the Ingress/Gateway IP.
                     minLength: 1
                     type: string
+                  listenerSet:
+                    description: |-
+                      ListenerSet, when set, makes the operator create a Gateway API ListenerSet attached to the
+                      referenced shared Gateway and attach the HTTPRoute to that ListenerSet, instead of provisioning
+                      a dedicated Gateway. This lets the operator manage the instance's listener (hostname + TLS) on a
+                      shared Gateway without mutating the Gateway itself. Requires Gateway API 1.5+ standard CRDs
+                      (gateway.networking.k8s.io/v1 ListenerSet) and a Gateway whose allowedListeners permits this
+                      namespace. When set, ListenerSet takes precedence over ParentRefs and the managed Gateway.
+                    properties:
+                      parentGateway:
+                        description: ParentGateway identifies the shared Gateway that
+                          the ListenerSet attaches to.
+                        properties:
+                          name:
+                            description: Name is the name of the parent Gateway.
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace is the namespace of the parent
+                              Gateway. Defaults to the ConvexInstance namespace.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    required:
+                    - parentGateway
+                    type: object
                   parentRefs:
                     description: |-
                       ParentRefs overrides the operator-managed Gateway; when set, HTTPRoutes attach to these parent Gateways and the operator skips creating its own Gateway.

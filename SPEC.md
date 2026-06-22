@@ -124,6 +124,7 @@
       - TLS Secret referenced only; not managed.
   - Networking
       - Gateway API preferred; Gateway refers to provided gatewayClassName (example: nginx). HTTPRoute attaches host, TLS, path rules to backend/dashboard Services.
+      - Three modes: a per-instance managed Gateway (default); attach to an existing Gateway via spec.networking.parentRefs; or attach the instance's listener (host + TLS) to a shared Gateway via an operator-managed Gateway API ListenerSet (spec.networking.listenerSet, Gateway API 1.5+ / NGF 2.6+) without patching that Gateway.
       - Service ports align with Convex defaults; annotate if NGINX Gateway Fabric specifics needed (e.g., backend protocol hints).
   - Scaling behavior
       - Backend replicas fixed to 1; vertical resources from spec; optional HPA-like hooks via cpuTargetUtilization for future (documented but not creating HPA unless explicitly decided).
