@@ -2372,7 +2372,8 @@ func (r *ConvexInstanceReconciler) reconcileListenerSet(ctx context.Context, ins
 }
 
 func listenerSetReady(ls *gatewayv1.ListenerSet) bool {
-	// Gateway API requires observedGeneration on Programmed, but not on Accepted.
+	// ListenerSet Accepted conditions do not require observedGeneration in
+	// Gateway API v1.5. Programmed is the generation-gated readiness signal.
 	if !conditionStatusTrue(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionAccepted)) ||
 		!conditionTrueForGeneration(ls.Status.Conditions, string(gatewayv1.ListenerSetConditionProgrammed), ls.Generation) {
 		return false
@@ -2416,35 +2417,29 @@ func (r *ConvexInstanceReconciler) deleteManagedListenerSet(ctx context.Context,
 }
 
 func (r *ConvexInstanceReconciler) deleteHTTPRouteIfListenerSetParented(ctx context.Context, instance *convexv1alpha1.ConvexInstance) error {
-	route := &gatewayv1.HTTPRoute{}
-	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
-	if err := r.Get(ctx, key, route); err != nil {
-		if errors.IsNotFound(err) {
-			return nil
-		}
+	route, err := r.fetchHTTPRoute(ctx, instance)
+	if err != nil {
 		return err
 	}
-	if ownedByInstance(route, instance) && httpRouteReferencesListenerSet(route) {
+	if route != nil && ownedByInstance(route, instance) && httpRouteReferencesListenerSet(route) {
 		return r.Delete(ctx, route)
 	}
 	return nil
 }
 
-func (r *ConvexInstanceReconciler) existingHTTPRouteReferencesListenerSet(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (bool, bool, error) {
+func (r *ConvexInstanceReconciler) fetchHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance) (*gatewayv1.HTTPRoute, error) {
 	route := &gatewayv1.HTTPRoute{}
 	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
 	if err := r.Get(ctx, key, route); err != nil {
 		if errors.IsNotFound(err) {
-			return false, false, nil
+			return nil, nil
 		}
-		return false, false, err
+		return nil, err
 	}
-	return httpRouteReferencesListenerSet(route), true, nil
+	return route, nil
 }
 
-func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string) (bool, metav1.Condition, error) {
-	route := &gatewayv1.HTTPRoute{}
-	key := client.ObjectKey{Name: httpRouteName(instance), Namespace: instance.Namespace}
+func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, instance *convexv1alpha1.ConvexInstance, backendServiceName, dashboardServiceName string, route *gatewayv1.HTTPRoute) (bool, metav1.Condition, error) {
 	spec := gatewayv1.HTTPRouteSpec{
 		CommonRouteSpec: gatewayv1.CommonRouteSpec{
 			ParentRefs: routeParentRefs(instance),
@@ -2453,8 +2448,7 @@ func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, insta
 		Rules:     httpRouteRules(instance, backendServiceName, dashboardServiceName),
 	}
 
-	err := r.Get(ctx, key, route)
-	if errors.IsNotFound(err) {
+	if route == nil {
 		route = &gatewayv1.HTTPRoute{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      httpRouteName(instance),
@@ -2469,9 +2463,6 @@ func (r *ConvexInstanceReconciler) reconcileHTTPRoute(ctx context.Context, insta
 			return false, metav1.Condition{}, err
 		}
 		return false, conditionFalse(conditionHTTPRoute, "Provisioning", "HTTPRoute created"), nil
-	}
-	if err != nil {
-		return false, metav1.Condition{}, err
 	}
 
 	ownerChanged, err := ensureOwner(instance, route, r.Scheme)
@@ -3610,6 +3601,8 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	}
 	result.nextRestartIn = nextRestartIn
 
+	var existingRoute *gatewayv1.HTTPRoute
+	routeFetched := false
 	switch {
 	case useListenerSet(instance):
 		result.listenerSetWatchMissing = r.listenerSetWatchMissing
@@ -3627,22 +3620,24 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 				return result, gatewayErr(err)
 			}
 		} else if !listenerSetReady {
-			routeUsesListenerSet, routeExists, err := r.existingHTTPRouteReferencesListenerSet(ctx, instance)
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
 			if err != nil {
 				return result, gatewayErr(err)
 			}
-			if routeExists && !routeUsesListenerSet {
+			routeFetched = true
+			if existingRoute != nil && !httpRouteReferencesListenerSet(existingRoute) {
 				reconcileRoute = false
 				result.conds = append(result.conds, conditionFalse(conditionHTTPRoute, "WaitingForListenerSet", "Waiting for ListenerSet readiness before moving HTTPRoute"))
 			}
 		} else {
-			routeUsesListenerSet, routeExists, err := r.existingHTTPRouteReferencesListenerSet(ctx, instance)
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
 			if err != nil {
 				return result, gatewayErr(err)
 			}
+			routeFetched = true
 			// Drop any Gateway left over from a previous mode only after the ListenerSet is ready
 			// and the managed HTTPRoute no longer points at that Gateway.
-			if !routeExists || routeUsesListenerSet {
+			if existingRoute == nil || httpRouteReferencesListenerSet(existingRoute) {
 				if err := r.deleteManagedGateway(ctx, instance); err != nil {
 					return result, gatewayErr(err)
 				}
@@ -3670,7 +3665,17 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	}
 
 	if reconcileRoute {
-		routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName)
+		if !routeFetched {
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return result, &resourceErr{
+					reason: "HTTPRouteError",
+					cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+					err:    err,
+				}
+			}
+		}
+		routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName, existingRoute)
 		if err != nil {
 			return result, &resourceErr{
 				reason: "HTTPRouteError",

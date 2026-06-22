@@ -1344,6 +1344,60 @@ var _ = Describe("ConvexInstance Controller", func() {
 			Expect(reconcileRequeueAfter(instance, coreRes, status)).To(Equal(defaultRestartInterval))
 		})
 
+		It("should tolerate ListenerSet Accepted without observedGeneration and require current Programmed", func() {
+			listenerName := gatewayv1.SectionName(defaultListenerName)
+			ls := &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Generation: 5},
+				Spec: gatewayv1.ListenerSetSpec{
+					Listeners: []gatewayv1.ListenerEntry{{Name: listenerName}},
+				},
+				Status: gatewayv1.ListenerSetStatus{
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(gatewayv1.ListenerSetConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							Reason:             string(gatewayv1.ListenerSetReasonAccepted),
+							LastTransitionTime: metav1.Now(),
+						},
+						{
+							Type:               string(gatewayv1.ListenerSetConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							Reason:             string(gatewayv1.ListenerSetReasonProgrammed),
+							LastTransitionTime: metav1.Now(),
+							ObservedGeneration: 5,
+						},
+					},
+					Listeners: []gatewayv1.ListenerEntryStatus{{
+						Name: listenerName,
+						Conditions: []metav1.Condition{
+							{
+								Type:               string(gatewayv1.ListenerEntryConditionAccepted),
+								Status:             metav1.ConditionTrue,
+								Reason:             string(gatewayv1.ListenerEntryReasonAccepted),
+								LastTransitionTime: metav1.Now(),
+							},
+							{
+								Type:               string(gatewayv1.ListenerEntryConditionProgrammed),
+								Status:             metav1.ConditionTrue,
+								Reason:             string(gatewayv1.ListenerEntryReasonProgrammed),
+								LastTransitionTime: metav1.Now(),
+								ObservedGeneration: 5,
+							},
+						},
+					}},
+				},
+			}
+
+			Expect(listenerSetReady(ls)).To(BeTrue())
+
+			ls.Status.Conditions[1].ObservedGeneration = 4
+			Expect(listenerSetReady(ls)).To(BeFalse())
+			ls.Status.Conditions[1].ObservedGeneration = 5
+
+			ls.Status.Listeners[0].Conditions[1].ObservedGeneration = 4
+			Expect(listenerSetReady(ls)).To(BeFalse())
+		})
+
 		It("should ignore HTTPRoute Accepted status for a non-matching parent", func() {
 			route := &gatewayv1.HTTPRoute{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1379,6 +1433,19 @@ var _ = Describe("ConvexInstance Controller", func() {
 				Conditions:     []metav1.Condition{accepted},
 			}}
 
+			Expect(routeAccepted(route)).To(BeNil())
+
+			route.Status.Parents[0].ParentRef = gatewayv1.ParentReference{
+				Name:      gatewayv1.ObjectName("test-resource-listeners"),
+				Namespace: ptr.To(gatewayv1.Namespace("default")),
+			}
+			Expect(routeAccepted(route)).To(BeNil())
+
+			route.Status.Parents[0].ParentRef = route.Spec.ParentRefs[0]
+			route.Status.Parents[0].ParentRef.Namespace = nil
+			Expect(routeAccepted(route)).NotTo(BeNil())
+
+			route.Status.Parents[0].ParentRef.Namespace = ptr.To(gatewayv1.Namespace("other"))
 			Expect(routeAccepted(route)).To(BeNil())
 
 			route.Status.Parents[0].ParentRef = route.Spec.ParentRefs[0]
