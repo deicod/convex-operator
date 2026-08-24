@@ -3522,7 +3522,6 @@ func readinessReason(instance *convexv1alpha1.ConvexInstance, backendReady, dash
 
 func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, instance *convexv1alpha1.ConvexInstance, plan upgradePlan, extVersions externalSecretVersions) (reconcileOutcome, *resourceErr) {
 	result := reconcileOutcome{conds: []metav1.Condition{}}
-	reconcileRoute := true
 
 	if err := r.reconcileConfigMap(ctx, instance, plan.effectiveVersion); err != nil {
 		return result, &resourceErr{
@@ -3601,90 +3600,8 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 	}
 	result.nextRestartIn = nextRestartIn
 
-	var existingRoute *gatewayv1.HTTPRoute
-	routeFetched := false
-	switch {
-	case useListenerSet(instance):
-		result.listenerSetWatchMissing = r.listenerSetWatchMissing
-		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
-		if err != nil {
-			return result, gatewayErr(err)
-		}
-		result.gatewayReady = listenerSetReady
-		result.conds = append(result.conds, listenerSetCond)
-		if listenerSetCond.Reason == listenerSetCRDMissing {
-			result.listenerSetCRDMissing = true
-			reconcileRoute = false
-			result.conds = append(result.conds, httpRouteListenerSetCRDMissingCondition())
-			if err := r.deleteHTTPRouteIfListenerSetParented(ctx, instance); err != nil {
-				return result, gatewayErr(err)
-			}
-		} else if !listenerSetReady {
-			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
-			if err != nil {
-				return result, gatewayErr(err)
-			}
-			routeFetched = true
-			if existingRoute != nil && !httpRouteReferencesListenerSet(existingRoute) {
-				reconcileRoute = false
-				result.conds = append(result.conds, conditionFalse(conditionHTTPRoute, "WaitingForListenerSet", "Waiting for ListenerSet readiness before moving HTTPRoute"))
-			}
-		} else {
-			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
-			if err != nil {
-				return result, gatewayErr(err)
-			}
-			routeFetched = true
-			// Drop any Gateway left over from a previous mode only after the ListenerSet is ready
-			// and the managed HTTPRoute no longer points at that Gateway.
-			if existingRoute == nil || httpRouteReferencesListenerSet(existingRoute) {
-				if err := r.deleteManagedGateway(ctx, instance); err != nil {
-					return result, gatewayErr(err)
-				}
-			}
-		}
-	case useCustomParentRefs(instance):
-		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
-			return result, gatewayErr(err)
-		}
-		if err := r.deleteManagedGateway(ctx, instance); err != nil {
-			return result, gatewayErr(err)
-		}
-		result.gatewayReady = true
-		result.conds = append(result.conds, conditionTrue(conditionGateway, "Skipped", "Using provided parentRefs"))
-	default:
-		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
-			return result, gatewayErr(err)
-		}
-		gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
-		if err != nil {
-			return result, gatewayErr(err)
-		}
-		result.gatewayReady = gatewayReady
-		result.conds = append(result.conds, gatewayCond)
-	}
-
-	if reconcileRoute {
-		if !routeFetched {
-			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
-			if err != nil {
-				return result, &resourceErr{
-					reason: "HTTPRouteError",
-					cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
-					err:    err,
-				}
-			}
-		}
-		routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashSvcName, existingRoute)
-		if err != nil {
-			return result, &resourceErr{
-				reason: "HTTPRouteError",
-				cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
-				err:    err,
-			}
-		}
-		result.routeReady = routeReady
-		result.conds = append(result.conds, routeCond)
+	if resErr := r.reconcileNetworking(ctx, instance, serviceName, dashSvcName, &result); resErr != nil {
+		return result, resErr
 	}
 
 	backendReady, backendCond, err := r.backendStatus(ctx, instance)
@@ -3700,6 +3617,103 @@ func (r *ConvexInstanceReconciler) reconcileCoreResources(ctx context.Context, i
 
 	return result, nil
 }
+
+// reconcileNetworking reconciles the Gateway API surface for the instance: the
+// ListenerSet, a managed Gateway or caller-provided parentRefs, plus the
+// HTTPRoute that attaches to whichever of those is in play. Conditions and
+// readiness flags are recorded on out.
+func (r *ConvexInstanceReconciler) reconcileNetworking(ctx context.Context, instance *convexv1alpha1.ConvexInstance, serviceName, dashboardServiceName string, out *reconcileOutcome) *resourceErr {
+	reconcileRoute := true
+	var existingRoute *gatewayv1.HTTPRoute
+	routeFetched := false
+	switch {
+	case useListenerSet(instance):
+		out.listenerSetWatchMissing = r.listenerSetWatchMissing
+		listenerSetReady, listenerSetCond, err := r.reconcileListenerSet(ctx, instance)
+		if err != nil {
+			return gatewayErr(err)
+		}
+		out.gatewayReady = listenerSetReady
+		out.conds = append(out.conds, listenerSetCond)
+		if listenerSetCond.Reason == listenerSetCRDMissing {
+			out.listenerSetCRDMissing = true
+			reconcileRoute = false
+			out.conds = append(out.conds, httpRouteListenerSetCRDMissingCondition())
+			if err := r.deleteHTTPRouteIfListenerSetParented(ctx, instance); err != nil {
+				return gatewayErr(err)
+			}
+		} else if !listenerSetReady {
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return gatewayErr(err)
+			}
+			routeFetched = true
+			if existingRoute != nil && !httpRouteReferencesListenerSet(existingRoute) {
+				reconcileRoute = false
+				out.conds = append(out.conds, conditionFalse(conditionHTTPRoute, "WaitingForListenerSet", "Waiting for ListenerSet readiness before moving HTTPRoute"))
+			}
+		} else {
+			existingRoute, err = r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return gatewayErr(err)
+			}
+			routeFetched = true
+			// Drop any Gateway left over from a previous mode only after the ListenerSet is ready
+			// and the managed HTTPRoute no longer points at that Gateway.
+			if existingRoute == nil || httpRouteReferencesListenerSet(existingRoute) {
+				if err := r.deleteManagedGateway(ctx, instance); err != nil {
+					return gatewayErr(err)
+				}
+			}
+		}
+	case useCustomParentRefs(instance):
+		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
+			return gatewayErr(err)
+		}
+		if err := r.deleteManagedGateway(ctx, instance); err != nil {
+			return gatewayErr(err)
+		}
+		out.gatewayReady = true
+		out.conds = append(out.conds, conditionTrue(conditionGateway, "Skipped", "Using provided parentRefs"))
+	default:
+		if err := r.deleteManagedListenerSet(ctx, instance); err != nil {
+			return gatewayErr(err)
+		}
+		gatewayReady, gatewayCond, err := r.reconcileGateway(ctx, instance)
+		if err != nil {
+			return gatewayErr(err)
+		}
+		out.gatewayReady = gatewayReady
+		out.conds = append(out.conds, gatewayCond)
+	}
+
+	if reconcileRoute {
+		if !routeFetched {
+			fetched, err := r.fetchHTTPRoute(ctx, instance)
+			if err != nil {
+				return &resourceErr{
+					reason: "HTTPRouteError",
+					cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+					err:    err,
+				}
+			}
+			existingRoute = fetched
+		}
+		routeReady, routeCond, err := r.reconcileHTTPRoute(ctx, instance, serviceName, dashboardServiceName, existingRoute)
+		if err != nil {
+			return &resourceErr{
+				reason: "HTTPRouteError",
+				cond:   conditionFalse(conditionHTTPRoute, "HTTPRouteError", err.Error()),
+				err:    err,
+			}
+		}
+		out.routeReady = routeReady
+		out.conds = append(out.conds, routeCond)
+	}
+
+	return nil
+}
+
 func buildUpgradePlan(instance *convexv1alpha1.ConvexInstance, backendExists bool, currentBackendImage, currentDashboardImage, currentBackendVersion string, currentBackendEnv []corev1.EnvVar, exportSucceeded, importSucceeded, exportFailed, importFailed bool, desiredHash string) upgradePlan {
 	strategy := instance.Spec.Maintenance.UpgradeStrategy
 	if strategy == "" {

@@ -7,6 +7,8 @@
 - Add `.github/dependabot.yml` covering Go modules, GitHub Actions, the Docker base image, and the dev container, with grouped weekly version updates and separately grouped security updates. Major bumps of `k8s.io/*` and `sigs.k8s.io/controller-runtime` are excluded from automation.
 - Add `SECURITY.md` with supported versions, private vulnerability reporting, and the dependency/supply-chain policy (remediation SLAs, SHA-pinned actions, alert dismissal rules).
 - Add a `Vulnerability Scan` workflow running `govulncheck` on push, pull request, and weekly, covering both dependencies and the pinned Go standard library.
+- Fix the failing `Lint` and `Tests` workflows (red on `main` since v0.1.3): extract the Gateway/ListenerSet/HTTPRoute reconciliation out of `reconcileCoreResources` into a new `reconcileNetworking` method, bringing cyclomatic complexity back under the `gocyclo` threshold. Behaviour is unchanged.
+- Align `GOLANGCI_LINT_VERSION` in the Makefile (`v2.8.0`) with the version the `Lint` workflow installs (`v2.12.2`), so `make lint` and CI agree.
 
 ## v0.1.3
 
