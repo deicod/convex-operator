@@ -1,0 +1,95 @@
+# Dependabot configuration
+#
+# Scope:
+#   * Version updates  - scheduled, grouped, low-noise dependency refreshes.
+#   * Security updates - opened by Dependabot as soon as an advisory matches a
+#                        dependency in the graph. These are NOT governed by the
+#                        `schedule` below; the `groups` entries with
+#                        `applies-to: security-updates` only control how the
+#                        resulting pull requests are batched.
+#
+# Security policy and disclosure process: see SECURITY.md
+version: 2
+
+updates:
+  # ---------------------------------------------------------------- Go modules
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps(dev)"
+      include: scope
+    groups:
+      # One PR per week for routine bumps, so review effort stays proportional.
+      go-minor-and-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      # Advisory-driven bumps land together and are reviewed/merged first.
+      go-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    ignore:
+      # The Kubernetes libraries are upgraded deliberately and in lockstep with
+      # controller-runtime, never by an unattended major bump.
+      - dependency-name: "k8s.io/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sigs.k8s.io/controller-runtime"
+        update-types: ["version-update:semver-major"]
+
+  # ------------------------------------------------------------ GitHub Actions
+  # Workflows pin actions by commit SHA; Dependabot rewrites the SHA and keeps
+  # the trailing `# vX.Y.Z` comment in sync.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: scope
+    groups:
+      actions-all:
+        applies-to: version-updates
+        patterns: ["*"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # -------------------------------------------------------- Container base image
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "build"
+      include: scope
+    groups:
+      docker-all:
+        applies-to: version-updates
+        patterns: ["*"]
+      docker-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # ------------------------------------------------------------- Dev container
+  - package-ecosystem: devcontainers
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "build(devcontainer)"

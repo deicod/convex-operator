@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Security: resolve all Dependabot/`govulncheck` findings by upgrading vulnerable transitive dependencies — `golang.org/x/net` `v0.49.0` -> `v0.58.0`, `golang.org/x/text` `v0.33.0` -> `v0.41.0`, `golang.org/x/mod` `v0.32.0` -> `v0.40.0`, `golang.org/x/sys` `v0.42.0` -> `v0.47.0`, `google.golang.org/grpc` `v1.79.3` -> `v1.83.1`, and `github.com/google/cel-go` `v0.26.0` -> `v0.30.0`.
+- Security: bump the `go` directive from `1.25.6` to `1.25.14`, picking up the Go standard library fixes in `crypto/tls`, `crypto/x509`, `net/http`, `net/url`, `net/textproto`, `mime`, `encoding/asn1`, and `html/template`.
+- Add `.github/dependabot.yml` covering Go modules, GitHub Actions, the Docker base image, and the dev container, with grouped weekly version updates and separately grouped security updates. Major bumps of `k8s.io/*` and `sigs.k8s.io/controller-runtime` are excluded from automation.
+- Add `SECURITY.md` with supported versions, private vulnerability reporting, and the dependency/supply-chain policy (remediation SLAs, SHA-pinned actions, alert dismissal rules).
+- Add a `Vulnerability Scan` workflow running `govulncheck` on push, pull request, and weekly, covering both dependencies and the pinned Go standard library.
+
 ## v0.1.3
 
 - Add a third networking mode: `spec.networking.listenerSet.parentGateway` makes the operator create and manage a Gateway API `ListenerSet` (gateway.networking.k8s.io/v1) that attaches the instance's listener (hostname + TLS) to a shared Gateway, and points the HTTPRoute at that `ListenerSet` — so the shared Gateway is never patched. Takes precedence over `parentRefs`.
