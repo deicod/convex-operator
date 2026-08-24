@@ -434,7 +434,3 @@ type ConvexInstanceList struct {
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []ConvexInstance `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&ConvexInstance{}, &ConvexInstanceList{})
-}
