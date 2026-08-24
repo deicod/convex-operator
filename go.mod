@@ -1,6 +1,6 @@
 module github.com/deicod/convex-operator
 
-go 1.26.0
+go 1.26.7
 
 require (
 	github.com/ericlagergren/siv v0.0.0-20220507050439-0b757b3aa5f1
