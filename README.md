@@ -1,5 +1,17 @@
 # convex-operator
-Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder (Go 1.25+) and controller-runtime.
+Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder v4 (cli 4.13.0), Go 1.26.9, and controller-runtime v0.25.2.
+
+Current release: [`v0.12.4`](https://github.com/deicod/convex-operator/releases/tag/v0.12.4). Image: `ghcr.io/deicod/convex-operator:v0.12.4` (`linux/amd64` and `linux/arm64`). `config/manager/kustomization.yaml` pins tag `main`.
+
+## Versions
+
+Pins on `main` (same commit as `v0.12.4`):
+
+- Go `1.26.9` (`go` directive in `go.mod`). The image build uses `golang:1.27`.
+- Kubernetes client libraries `k8s.io/*` `v0.37.1` (Kubernetes 1.37). Envtest uses 1.37.
+- `sigs.k8s.io/controller-runtime` `v0.25.2`, controller-tools `v0.20.1`, kustomize `v5.8.1`.
+- Gateway API module `sigs.k8s.io/gateway-api` `v1.6.3`. `make test-gateway-api-compat` still runs against standard CRD bundles `v1.3.0`, `v1.4.1`, and `v1.5.1`.
+- Sample Convex release `1.0.0` (`ghcr.io/get-convex/convex-backend:1.0.0`). CRD image defaults are `ghcr.io/get-convex/convex-backend:latest` and `ghcr.io/get-convex/convex-dashboard:latest`.
 
 ## Description
 - Reconciles a single backend StatefulSet (one replica) and optional dashboard Deployment per `ConvexInstance`.
@@ -26,7 +38,7 @@ metadata:
   namespace: default
 spec:
   environment: dev
-  version: "0.19.0"
+  version: "1.0.0"
   backend:
     db:
       engine: sqlite
@@ -44,16 +56,16 @@ kubectl apply -f convex-sample.yaml
 ```
 
 ### Prerequisites
-- go version v1.25.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- Go 1.26.9, as pinned by the `go` directive in `go.mod`.
+- Docker with Buildx, if you build the image. The Dockerfile builder is `golang:1.27`. Published images are `linux/amd64` and `linux/arm64`.
+- kubectl that can talk to the target cluster.
+- A Kubernetes 1.37 cluster. This operator is built and envtest'd against `k8s.io/*` `v0.37.1`. Other cluster versions are not in this repo's test matrix.
 
 ### CRD Configuration Guide
 
 **Required Fields:**
 - `spec.environment`: Deployment tier (`dev` or `prod`).
-- `spec.version`: Convex image tag (e.g., "0.19.0").
+- `spec.version`: Convex release tag (samples use `"1.0.0"`). That field does not select the image: `spec.backend.image` defaults to `ghcr.io/get-convex/convex-backend:latest` and `spec.dashboard.image` to `ghcr.io/get-convex/convex-dashboard:latest`. Samples pin the backend image to `ghcr.io/get-convex/convex-backend:1.0.0`.
 - `spec.networking.host`: External hostname (e.g., "convex.example.com").
 - `spec.backend.db.engine`: Database type (`postgres`, `mysql`, or `sqlite`).
 
@@ -107,7 +119,7 @@ spec:
 - The operator assumes a `GatewayClass` named `nginx` by default (see `spec.networking.gatewayClassName`). Change it in the ConvexInstance spec to match your installed Gateway implementation.
 - By default the operator creates a Gateway per instance using `spec.networking.gatewayClassName` and annotates it for cert-manager; set `parentRefs` to attach the HTTPRoute to an existing Gateway and skip Gateway reconciliation. TLS on the shared Gateway must then be handled externally.
 - Set `spec.networking.listenerSet.parentGateway` to have the operator manage the instance's listener (hostname + TLS) on a shared Gateway via a Gateway API `ListenerSet`, instead of patching that Gateway or provisioning a dedicated one. The shared Gateway must permit attachment from the instance namespace through its `allowedListeners` field; the operator never mutates the shared Gateway. The HTTPRoute attaches to the operator-managed `ListenerSet`. This requires the standard `gateway.networking.k8s.io/v1` `ListenerSet` CRD (Gateway API 1.5+); the operator reports `GatewayReady=False` with reason `ListenerSetCRDMissing` when it is absent. `listenerSet` takes precedence over `parentRefs`.
-- The controller is built against Gateway API `v1.5.1`. The `Gateway`/`HTTPRoute` modes only use GA `gateway.networking.k8s.io/v1` fields present in the `1.3.x`, `1.4.x`, and `1.5.x` standard CRD bundles, so they keep working on 1.3/1.4 clusters; the optional `ListenerSet` mode additionally requires the `1.5+` standard `ListenerSet` CRD. Use `make test-gateway-api-compat` to run the envtest suite against all three CRD versions (ListenerSet specs skip automatically when the CRD is absent).
+- The controller is built against Gateway API `v1.6.3`. `make test-gateway-api-compat` runs the envtest suite against the standard CRD bundles `v1.3.0`, `v1.4.1`, and `v1.5.1` (ListenerSet specs skip automatically when that CRD is absent). Default `make test` loads CRDs from the linked module (`v1.6.3`). The `Gateway`/`HTTPRoute` modes use GA `gateway.networking.k8s.io/v1` fields; ListenerSet mode requires the standard ListenerSet CRD (Gateway API 1.5+). The compat target does not include a `v1.6.x` bundle.
 - This repository does not install NGINX Gateway Fabric. If you upgrade NGF separately to `v2.4.2`, use the upstream Gateway API `v1.4.x` install and migrate any Helm/config usage of `snippetsFilters` to `snippets`. The `ListenerSet` networking mode additionally requires NGF `v2.6.0+` with the Gateway API `v1.5+` standard CRDs installed.
 - If your cluster lacks the referenced GatewayClass, the `GatewayReady`/`HTTPRouteReady` conditions will stay `False`; install the class or update the spec to a class that exists.
 
@@ -148,15 +160,13 @@ spec:
 - `Normal Ready`: backend became Ready.
 
 ### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+CI publishes `ghcr.io/deicod/convex-operator` on `v*` tags (current release `v0.12.4`, plus the commit SHA). To build and push your own image:
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/convex-operator:tag
+make docker-build docker-push IMG=ghcr.io/deicod/convex-operator:v0.12.4
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+The cluster must be able to pull that image. `make docker-push` needs push permission on the registry in `IMG`.
 
 **Install the CRDs into the cluster:**
 
@@ -167,8 +177,10 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=<some-registry>/convex-operator:tag
+make deploy IMG=ghcr.io/deicod/convex-operator:v0.12.4
 ```
+
+`make deploy` runs `kustomize edit set image controller=${IMG}` and rewrites `config/manager/kustomization.yaml`. Without `IMG`, the Makefile default is `controller:latest`, which overwrites the committed `ghcr.io/deicod/convex-operator:main` pin. Pass `IMG` explicitly.
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
 privileges or be logged in as admin.
@@ -207,25 +219,15 @@ Following the options to release and provide this solution to the users.
 
 ### By providing a bundle with all YAML files
 
-1. Build the installer for the image built and published in the registry:
+Build the installer for a published image:
 
 ```sh
-make build-installer IMG=<some-registry>/convex-operator:tag
+make build-installer IMG=ghcr.io/deicod/convex-operator:v0.12.4
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/convex-operator/<tag or branch>/dist/install.yaml
-```
+**NOTE:** That target writes `dist/install.yaml` locally. The file is not
+published in this repo, so there is no raw GitHub URL to apply. The published
+install path is the GHCR image above (`make deploy IMG=ghcr.io/deicod/convex-operator:v0.12.4`).
 
 ### By providing a Helm Chart
 
