@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Security: bump the `go` directive from `1.26.9` to `1.26.10` and pin `govulncheck` to `v1.9.0`, clearing GO-2026-6809 in `crypto/x509` (CVE-2026-111943). The image builder `golang:1.27` already resolves to `1.27.3`, which includes the same fix.
 - Security: bump the `go` directive from `1.26.7` to `1.26.9` and `golang.org/x/net` from `v0.58.0` to `v0.60.0` (and the `x/mod`, `x/sync`, `x/sys`, `x/term`, `x/text` versions that release requires), clearing the `govulncheck` findings in `net/http`, `net/textproto`, `crypto/tls`, and `html/template`.
 - Security: resolve all Dependabot/`govulncheck` findings by upgrading vulnerable transitive dependencies — `golang.org/x/net` `v0.49.0` -> `v0.58.0`, `golang.org/x/text` `v0.33.0` -> `v0.41.0`, `golang.org/x/mod` `v0.32.0` -> `v0.40.0`, `golang.org/x/sys` `v0.42.0` -> `v0.47.0`, `google.golang.org/grpc` `v1.79.3` -> `v1.83.1`, and `github.com/google/cel-go` `v0.26.0` -> `v0.30.0`.
 - Security: bump the `go` directive from `1.25.6` to `1.25.14`, picking up the Go standard library fixes in `crypto/tls`, `crypto/x509`, `net/http`, `net/url`, `net/textproto`, `mime`, `encoding/asn1`, and `html/template`.
