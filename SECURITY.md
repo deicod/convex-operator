@@ -70,5 +70,5 @@ Rules we hold ourselves to:
 To reproduce the dependency scan locally:
 
 ```sh
-go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 ```

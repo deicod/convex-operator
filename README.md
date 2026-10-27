@@ -1,13 +1,13 @@
 # convex-operator
-Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder v4 (cli 4.13.0), Go 1.26.9, and controller-runtime v0.25.2.
+Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder v4 (cli 4.13.0), Go 1.26.10, and controller-runtime v0.25.2.
 
 Current release: [`v0.12.4`](https://github.com/deicod/convex-operator/releases/tag/v0.12.4). Image: `ghcr.io/deicod/convex-operator:v0.12.4` (`linux/amd64` and `linux/arm64`). `config/manager/kustomization.yaml` pins tag `main`.
 
 ## Versions
 
-Pins on `main` (same commit as `v0.12.4`):
+Pins on `main` (Go pin is ahead of release `v0.12.4`):
 
-- Go `1.26.9` (`go` directive in `go.mod`). The image build uses `golang:1.27`.
+- Go `1.26.10` (`go` directive in `go.mod`). The image build uses `golang:1.27`, which is past the GO-2026-6809 fix (`1.27.3`).
 - Kubernetes client libraries `k8s.io/*` `v0.37.1` (Kubernetes 1.37). Envtest uses 1.37.
 - `sigs.k8s.io/controller-runtime` `v0.25.2`, controller-tools `v0.20.1`, kustomize `v5.8.1`.
 - Gateway API module `sigs.k8s.io/gateway-api` `v1.6.3`. `make test-gateway-api-compat` still runs against standard CRD bundles `v1.3.0`, `v1.4.1`, and `v1.5.1`.
@@ -56,7 +56,7 @@ kubectl apply -f convex-sample.yaml
 ```
 
 ### Prerequisites
-- Go 1.26.9, as pinned by the `go` directive in `go.mod`.
+- Go 1.26.10, as pinned by the `go` directive in `go.mod`.
 - Docker with Buildx, if you build the image. The Dockerfile builder is `golang:1.27`. Published images are `linux/amd64` and `linux/arm64`.
 - kubectl that can talk to the target cluster.
 - A Kubernetes 1.37 cluster. This operator is built and envtest'd against `k8s.io/*` `v0.37.1`. Other cluster versions are not in this repo's test matrix.
