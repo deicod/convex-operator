@@ -1,13 +1,13 @@
 # convex-operator
 Kubernetes operator that manages self-hosted Convex deployments through the `ConvexInstance` CustomResource. Built with Kubebuilder v4 (cli 4.13.0), Go 1.26.10, and controller-runtime v0.25.2.
 
-Current release: [`v0.12.4`](https://github.com/deicod/convex-operator/releases/tag/v0.12.4). Image: `ghcr.io/deicod/convex-operator:v0.12.4` (`linux/amd64` and `linux/arm64`). `config/manager/kustomization.yaml` pins tag `main`.
+Current release: [`v0.12.5`](https://github.com/deicod/convex-operator/releases/tag/v0.12.5). Image: `ghcr.io/deicod/convex-operator:v0.12.5` (`linux/amd64` and `linux/arm64`). `config/manager/kustomization.yaml` pins tag `main`.
 
 ## Versions
 
-Pins on `main` (Go pin is ahead of release `v0.12.4`):
+Pins on `main` (code matches release `v0.12.5`):
 
-- Go `1.26.10` (`go` directive in `go.mod`). The image build uses `golang:1.27`, which is past the GO-2026-6809 fix (`1.27.3`).
+- Go `1.26.10` (`go` directive in `go.mod`). The image build uses `golang:1.27`.
 - Kubernetes client libraries `k8s.io/*` `v0.37.1` (Kubernetes 1.37). Envtest uses 1.37.
 - `sigs.k8s.io/controller-runtime` `v0.25.2`, controller-tools `v0.20.1`, kustomize `v5.8.1`.
 - Gateway API module `sigs.k8s.io/gateway-api` `v1.6.3`. `make test-gateway-api-compat` still runs against standard CRD bundles `v1.3.0`, `v1.4.1`, and `v1.5.1`.
@@ -160,10 +160,10 @@ spec:
 - `Normal Ready`: backend became Ready.
 
 ### To Deploy on the cluster
-CI publishes `ghcr.io/deicod/convex-operator` on `v*` tags (current release `v0.12.4`, plus the commit SHA). To build and push your own image:
+CI publishes `ghcr.io/deicod/convex-operator` on `v*` tags (current release `v0.12.5`, plus the commit SHA). To build and push your own image:
 
 ```sh
-make docker-build docker-push IMG=ghcr.io/deicod/convex-operator:v0.12.4
+make docker-build docker-push IMG=ghcr.io/deicod/convex-operator:v0.12.5
 ```
 
 The cluster must be able to pull that image. `make docker-push` needs push permission on the registry in `IMG`.
@@ -177,7 +177,7 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=ghcr.io/deicod/convex-operator:v0.12.4
+make deploy IMG=ghcr.io/deicod/convex-operator:v0.12.5
 ```
 
 `make deploy` runs `kustomize edit set image controller=${IMG}` and rewrites `config/manager/kustomization.yaml`. Without `IMG`, the Makefile default is `controller:latest`, which overwrites the committed `ghcr.io/deicod/convex-operator:main` pin. Pass `IMG` explicitly.
@@ -222,12 +222,12 @@ Following the options to release and provide this solution to the users.
 Build the installer for a published image:
 
 ```sh
-make build-installer IMG=ghcr.io/deicod/convex-operator:v0.12.4
+make build-installer IMG=ghcr.io/deicod/convex-operator:v0.12.5
 ```
 
 **NOTE:** That target writes `dist/install.yaml` locally. The file is not
 published in this repo, so there is no raw GitHub URL to apply. The published
-install path is the GHCR image above (`make deploy IMG=ghcr.io/deicod/convex-operator:v0.12.4`).
+install path is the GHCR image above (`make deploy IMG=ghcr.io/deicod/convex-operator:v0.12.5`).
 
 ### By providing a Helm Chart
 
