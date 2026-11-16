@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Security: bump `golang.org/x/net` from `v0.60.0` to `v0.62.0`, and the siblings that release requires (`x/sync` `v0.23.0` → `v0.24.0`, `x/sys` `v0.48.0` → `v0.49.0`, `x/term` `v0.46.0` → `v0.47.0`, `x/text` `v0.42.0` → `v0.43.0`, `x/tools` `v0.49.0` → `v0.51.0`; `x/mod` stayed `v0.41.0`), clearing GO-2026-6866 (CVE-2026-97045) and GO-2026-6860 (CVE-2026-78661) in `golang.org/x/net/html`.
 - Security: bump the `go` directive from `1.26.10` to `1.26.11`, clearing GO-2026-6859 in `net/http` (CVE-2026-97054). The image builder `golang:1.27` already resolves to `1.27.4`, which includes the same fix.
 - Security: bump the `go` directive from `1.26.9` to `1.26.10` and pin `govulncheck` to `v1.9.0`, clearing GO-2026-6809 in `crypto/x509` (CVE-2026-111943). The image builder `golang:1.27` already resolves to `1.27.3`, which includes the same fix.
 - Security: bump the `go` directive from `1.26.7` to `1.26.9` and `golang.org/x/net` from `v0.58.0` to `v0.60.0` (and the `x/mod`, `x/sync`, `x/sys`, `x/term`, `x/text` versions that release requires), clearing the `govulncheck` findings in `net/http`, `net/textproto`, `crypto/tls`, and `html/template`.
